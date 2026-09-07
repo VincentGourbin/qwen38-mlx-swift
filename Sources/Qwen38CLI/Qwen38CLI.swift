@@ -530,6 +530,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     )
     var profileLayers = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Mode résident : `asyncEval` sur chaque couche intermédiaire, `eval` bloquant sur la dernière seulement (P2-code (d), à trancher par P1)"
+    )
+    var residentAsync = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -643,7 +650,8 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             directory: directory,
             layerLoadingMode: residentLayers ? .resident : .streamed,
             residentEvaluationInterval: residentEvalInterval,
-            profileLayers: profileLayers)
+            profileLayers: profileLayers,
+            residentAsyncEval: residentAsync)
         profiler.end("Flash globals")
         let generator = Qwen4ExpGreedyGenerator(model: model)
         let stopTokens: Set<Int32> = [
@@ -941,6 +949,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var profileLayers = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Mode résident : `asyncEval` sur chaque couche intermédiaire, `eval` bloquant sur la dernière seulement (P2-code (d), à trancher par P1)"
+    )
+    var residentAsync = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -999,7 +1014,8 @@ struct FlashChatProbe: AsyncParsableCommand {
             directory: directory,
             layerLoadingMode: residentLayers ? .resident : .streamed,
             residentEvaluationInterval: residentEvalInterval,
-            profileLayers: profileLayers)
+            profileLayers: profileLayers,
+            residentAsyncEval: residentAsync)
         profiler.end("Flash globals")
         let generator = Qwen4ExpStreamingGenerator(model: model)
 

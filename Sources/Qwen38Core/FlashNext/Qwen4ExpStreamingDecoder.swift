@@ -53,6 +53,14 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// phases and session metadata (model, prompt tokens, layer visits/load
     /// time…) are unaffected: they live in the generators, not here.
     public let profileLayers: Bool
+    /// P2-code (d) → P1 : in resident mode, dispatch every intermediate layer
+    /// with `asyncEval` (GPU work starts immediately, the host goes on
+    /// building the next layer) and block only on the last layer of the
+    /// visit. Measured on the synthetic bench (Release): −13 to −17 % per
+    /// layer and GPU busy 82 % (ioreg) instead of ~0 %. Off by default until
+    /// P1 has measured it on the real checkpoint; `residentEvaluationInterval`
+    /// keeps its meaning (blocking `eval` checkpoints) when this is false.
+    public let residentAsyncEval: Bool
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -65,7 +73,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         directory: URL,
         layerLoadingMode: Qwen4ExpLayerLoadingMode = .streamed,
         residentEvaluationInterval: Int = 1,
-        profileLayers: Bool = false
+        profileLayers: Bool = false,
+        residentAsyncEval: Bool = false
     ) throws {
         precondition(residentEvaluationInterval > 0)
         self.directory = directory
@@ -75,6 +84,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.layerLoadingMode = layerLoadingMode
         self.residentEvaluationInterval = residentEvaluationInterval
         self.profileLayers = profileLayers
+        self.residentAsyncEval = residentAsyncEval
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -193,6 +203,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                   visitIndex == layerIndices.count - 1))
             if shouldEvaluate {
                 eval(output)
+            } else if layerLoadingMode == .resident, residentAsyncEval {
+                asyncEval(output)
             }
             let forwardDuration = ContinuousClock.now - forwardStart
             hidden = output

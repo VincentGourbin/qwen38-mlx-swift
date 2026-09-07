@@ -3528,3 +3528,45 @@ Conséquences immédiates (remplacent l'ordre R4 pour les points 1-3) :
 | P2-code | Sur le bench P0 (Release, sans checkpoint, boucle de minutes) : (a) compter les ops par pas (nombre d'appels `eval_gpu` via `sample` ou instrumentation) ; (b) `MLX.compile` du forward de couche (entrées : hidden 4 flux, cache) si les formes sont stables en décodage ; (c) supprimer les `concatenated`/`split` des 4 flux hyper-connections (vues sur un seul tenseur) ; (d) `asyncEval` : lancer la couche N+1 pendant que le GPU exécute N, un seul `eval` par token, à re-mesurer en Release (le verdict V54 sur l'intervalle 8 est contaminé par Debug + profiler + mémoire). Jauge : **≤ 2 ms/couche, GPU ≥ 40 %** sur le bench. | tableau avant/après par levier dans `log.md` |
 | P1 | Inchangé (préflight vert obligatoire), mais en **Release** et avec `--profile-layers` désactivé : mesure du reliquat H-A par le sampler (`Decompressions`/`Pageins` par intervalle) et `sample` CPU (part `vm_fault`). | verdict chiffré H-A |
 | Suite | P2-mem seulement si P1 montre > 20 % du temps en fautes de page ; puis H6 en un seul process serveur (Release) ; puis G-8. | — |
+
+### P2-code exécuté — verdict, et protocole P1 définitif — 2026-09-07 (soir, suite)
+
+Leviers mesurés sur le bench P0 en Release (`docs/knowledge/log.md`, entrée
+« P2-code ») : `compile` sans effet (−2 % GDN, +13 % QSA) ; hyper-connections
+déjà écrites sans découpage ; masque QSA superflu supprimé en décodage
+(production, effet marginal) ; **`asyncEval` avec un seul `eval` bloquant
+par groupe : −13 à −17 % par couche et GPU occupé 82 % (`ioreg`) au lieu de
+0 %**. Le comptage des ops montre un coût réparti sur ~100 petits ops par
+couche (copies, binaires, matmuls quantifiés, réductions) : c'est le nombre
+de lancements de noyaux qui plafonne à ~4,5 ms par couche, pas un op
+coupable. Plafond structurel actuel : 48 × 4,5 ≈ 215 ms par token ≈ 4,6
+tok/s, suffisant pour H6 et G-8 ; la fusion d'ops (moins de noyaux par
+couche) est un chantier post-G-8.
+
+**Changement de production ajouté** : option `residentAsyncEval` (défaut
+`false`) sur `Qwen4ExpStreamingDecoder` → `Qwen4ExpStreamingTextModel` →
+`Qwen38FlashNextEngine`, flag `--resident-async` sur `flash-chat-probe` et
+`flash-generate-probe` : en résident, `asyncEval` sur chaque couche
+intermédiaire, `eval` bloquant sur la dernière seulement. 65 tests verts,
+Release construit.
+
+**P1 — protocole définitif (Release, préflight vert obligatoire)** : trois
+runs de 6 tokens sur le prompt de référence, sans `--profile-layers`, avec
+`Scripts/sample-system.sh results/p1-system.tsv &` lancé avant et arrêté
+après, et pendant les tokens 3-6 du run (i) un `sample $(pgrep -x qwen38) 10
+-file results/p1-sample.txt` :
+
+| Run | Commande (binaire `.xcodebuild/Build/Products/Release/qwen38`) | Ce qu'il mesure |
+|---|---|---|
+| (i) | `flash-chat-probe $FLASH --prompt <référence> --max-new-tokens 6 --resident-layers --trace results/p1-i.trace.json` | régime établi de référence, Release, `eval` par couche |
+| (ii) | idem + `--resident-async` | recouvrement CPU/GPU en résidence réelle |
+| (iii) | idem + `--resident-eval-interval 48` (sans `--resident-async`) | un seul `eval` par token, pour clore le verdict V54 en conditions propres |
+
+Verdict attendu, chiffré dans `log.md` : s/token en régime établi (phase
+`Generation` de la trace et horloge du générateur), GPU % (`ioreg` du
+sampler), delta `Decompressions`/`Pageins` par intervalle (part H-A), et pour
+(i) la part noyau dans `p1-sample.txt`. Décision : la variante la plus rapide
+devient le défaut de `Qwen38FlashNextEngine` (GUI, serveur) avant H6. Si le
+sampler montre des décompressions soutenues pendant le décodage, P2-mem
+(wiring MLX + sysctl 88000) passe avant H6 ; sinon on enchaîne H6 en un seul
+process serveur, puis G-8.

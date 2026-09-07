@@ -73,7 +73,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     private var hasConversationHistory = false
     private var turnIndex = 0
 
-    public init(directory: URL, profileLayers: Bool = false) async throws {
+    public init(directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = false) async throws {
         self.directory = directory
         self.configuration = try Qwen4ExpConfiguration.load(from: directory)
         self.tokenizer = try await AutoTokenizer.from(modelFolder: directory)
@@ -83,7 +83,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         // against per-token streaming reload cost.
         self.model = try Qwen4ExpStreamingTextModel(
             directory: directory, layerLoadingMode: .resident, residentEvaluationInterval: 1,
-            profileLayers: profileLayers)
+            profileLayers: profileLayers, residentAsyncEval: residentAsyncEval)
         self.generator = Qwen4ExpStreamingGenerator(model: model)
         self.stopTokenIDs = [
             configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
