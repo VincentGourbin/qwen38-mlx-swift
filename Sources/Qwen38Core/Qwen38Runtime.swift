@@ -291,6 +291,20 @@ public actor Qwen38Runtime {
 
     public var mtpState: Qwen38MTPAvailability { mtpAvailability }
 
+    /// H4.2: whether the resident model currently loaded is Flash-Next —
+    /// callers use this to decide whether `flashNextWarmUp()` is meaningful
+    /// before showing a per-layer loading progress bar.
+    public var isFlashNextLoaded: Bool { flashEngine != nil }
+
+    /// Drives the GUI's Flash-Next loading progress bar (H4.2): forces every
+    /// decoder layer to load from the Lexar up front instead of inside the
+    /// first turn's TTFT, yielding how many of the (typically 48) layers
+    /// have finished loading so far. `nil` when no Flash-Next engine is
+    /// resident.
+    public func flashNextWarmUp() -> AsyncStream<Int>? {
+        flashEngine?.warmUp()
+    }
+
     /// Executes the local M2 loop on one prepared request.
     ///
     /// This diagnostic entry point is intentionally separate from `generate`:

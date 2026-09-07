@@ -47,7 +47,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         positionIDs: MLXArray? = nil,
         visionEmbeddings: MLXArray? = nil,
         imageTokenID: Int32? = nil,
-        materializeLayers: Bool = true
+        materializeLayers: Bool = true,
+        onLayerVisited: (@Sendable (Int) -> Void)? = nil
     ) throws -> (
         logits: MLXArray,
         preMixerHidden: MLXArray,
@@ -75,7 +76,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             inputIDs: inputIDs,
             layerIndices: selectedLayers,
             positionIDs: positions,
-            materializeLayers: materializeLayers)
+            materializeLayers: materializeLayers,
+            onLayerVisited: onLayerVisited)
         let reduced = global.reduceHyperStreams(result.output)
         let output = global.logits(from: reduced)
         eval(output)

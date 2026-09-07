@@ -29,9 +29,42 @@ struct ChatMessage: Identifiable {
     var isStreaming = false
 }
 
+/// One entry of the H4.1 model picker: a directory below `modelPath`'s
+/// parent that `Qwen38ModelValidator` accepts, with its family and size —
+/// discovery is the single source of truth, no hardcoded variant list.
+struct Qwen38DiscoveredModel: Identifiable, Equatable {
+    let id: String
+    let url: URL
+    let family: Qwen38ModelFamily?
+    let sizeBytes: Int64
+
+    var sizeDescription: String {
+        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+
+    var familyDescription: String {
+        switch family {
+        case .qwen35: return "27B"
+        case .qwen4Exp: return "Flash-Next"
+        case nil: return "?"
+        }
+    }
+}
+
 @MainActor
 final class BenchViewModel: ObservableObject {
     @Published var modelPath = "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit"
+    @Published var catalog: [Qwen38DiscoveredModel] = []
+    @Published var flashLoadProgress: (visited: Int, total: Int)?
+    @Published var loadedFamily: Qwen38ModelFamily?
+
+    var loadedFamilyLabel: String {
+        switch loadedFamily {
+        case .qwen35: return "27B"
+        case .qwen4Exp: return "Flash-Next"
+        case nil: return "Qwen3.8"
+        }
+    }
     @Published var prompt = ""
     @Published var output = ""
     @Published var status = "Prêt"
@@ -74,11 +107,29 @@ final class BenchViewModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         status = "Chargement du modèle…"
+        flashLoadProgress = nil
         let path = modelPath
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        // Read family/layer count up front — the H4.2 progress bar's
+        // denominator, and the header's family label. A read failure here
+        // just falls back to defaults instead of blocking the load; the
+        // real error, if any, still surfaces from runtime.load below.
+        let info = try? Qwen38ModelValidator.readInfo(from: directory)
+        let expectedLayers = info?.numHiddenLayers ?? 48
         Task { @MainActor in
             let start = Date()
             do {
-                try await runtime.load(from: URL(fileURLWithPath: path, isDirectory: true))
+                try await runtime.load(from: directory)
+                loadedFamily = info?.family
+                if await runtime.isFlashNextLoaded {
+                    status = "Chargement Flash-Next (résident, ~100 s depuis le Lexar)…"
+                    flashLoadProgress = (0, expectedLayers)
+                    if let progress = await runtime.flashNextWarmUp() {
+                        for await visited in progress {
+                            flashLoadProgress = (visited, expectedLayers)
+                        }
+                    }
+                }
                 mtpAvailability = await runtime.mtpState
                 loadDuration = Date().timeIntervalSince(start)
                 isLoaded = true
@@ -87,8 +138,10 @@ final class BenchViewModel: ObservableObject {
                     : "Modèle VLM chargé — prêt à inférer"
             } catch {
                 isLoaded = false
+                loadedFamily = nil
                 status = "Erreur de chargement : \(error.localizedDescription)"
             }
+            flashLoadProgress = nil
             isBusy = false
         }
     }
@@ -96,6 +149,7 @@ final class BenchViewModel: ObservableObject {
     func unloadModel() {
         guard !isBusy else { return }
         isLoaded = false
+        loadedFamily = nil
         status = "Modèle déchargé"
         Task {
             await runtime.unload()
@@ -127,22 +181,32 @@ final class BenchViewModel: ObservableObject {
         status = "Chemin modifié — recharge nécessaire"
     }
 
-    func selectVariant(_ variant: String) {
+    /// H4.1: discover every valid Qwen3.8 checkpoint below `modelPath`'s
+    /// parent directory — replaces the old hardcoded 27B 4-bit/8-bit/BF16
+    /// button list, and is how Flash-Next becomes selectable at all.
+    func refreshCatalog() {
+        let parent = URL(fileURLWithPath: modelPath, isDirectory: true)
+            .deletingLastPathComponent()
+        let discovered = Qwen38ModelCatalog.discover(in: parent)
+        catalog = discovered.map { id, url in
+            let info = try? Qwen38ModelValidator.readInfo(from: url)
+            return Qwen38DiscoveredModel(
+                id: id, url: url, family: info?.family,
+                sizeBytes: Qwen38ModelCatalog.sizeOnDisk(url))
+        }.sorted { $0.id < $1.id }
+    }
+
+    func selectDiscoveredModel(_ discovered: Qwen38DiscoveredModel) {
         guard !isBusy else { return }
-        let suffix: String
-        switch variant {
-        case "8-bit": suffix = "8bit"
-        case "BF16": suffix = "bf16"
-        default: suffix = "4bit"
-        }
-        modelPath = "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-\(suffix)"
+        modelPath = discovered.url.path
         isLoaded = false
         mtpAvailability = .unavailable
         metrics = nil
         turnHistory = []
         output = ""
         messages = []
-        status = "Variante \(variant) sélectionnée — charge le modèle"
+        flashLoadProgress = nil
+        status = "\(discovered.id) sélectionné — charge le modèle"
     }
 
     func run() {
@@ -442,8 +506,10 @@ struct ContentView: View {
                 Text("Qwen3.8")
                     .font(.headline)
                 Text(model.isLoaded
-                    ? (model.turnHistory.isEmpty ? "27B · prêt" : "27B · session active · cache KV")
-                    : "27B · modèle non chargé")
+                    ? (model.turnHistory.isEmpty
+                        ? "\(model.loadedFamilyLabel) · prêt"
+                        : "\(model.loadedFamilyLabel) · session active · cache KV")
+                    : "Modèle non chargé")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -917,21 +983,53 @@ private struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 TextField("Répertoire du modèle", text: $model.modelPath)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit { model.refreshCatalog() }
             }
 
             HStack {
-                Text("Quantification")
+                Text("Catalogue")
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("4-bit") { model.selectVariant("4-bit") }
+                Button("Rafraîchir") { model.refreshCatalog() }
                     .buttonStyle(.bordered)
                     .disabled(model.isBusy)
-                Button("8-bit") { model.selectVariant("8-bit") }
-                    .buttonStyle(.bordered)
-                    .disabled(model.isBusy)
-                Button("BF16") { model.selectVariant("BF16") }
-                    .buttonStyle(.bordered)
-                    .disabled(model.isBusy)
+            }
+            if model.catalog.isEmpty {
+                Text("Aucun modèle Qwen3.8 valide trouvé à côté du chemin ci-dessus.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.catalog) { discovered in
+                            Button {
+                                model.selectDiscoveredModel(discovered)
+                            } label: {
+                                HStack {
+                                    Text(discovered.id)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text(discovered.familyDescription)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Text(discovered.sizeDescription)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.vertical, 3)
+                            .padding(.horizontal, 6)
+                            .background(
+                                model.modelPath == discovered.url.path
+                                    ? Color.accentColor.opacity(0.18) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 6))
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+                .disabled(model.isBusy)
             }
 
             HStack {
@@ -943,6 +1041,13 @@ private struct SettingsView: View {
                 Button("Décharger") { model.unloadModel() }
                     .buttonStyle(.bordered)
                     .disabled(model.isBusy || !model.isLoaded)
+            }
+            if let progress = model.flashLoadProgress {
+                ProgressView(
+                    value: Double(progress.visited), total: Double(max(progress.total, 1)))
+                Text("Couches Flash-Next chargées : \(progress.visited)/\(progress.total)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
 
             Divider()
@@ -1005,6 +1110,7 @@ private struct SettingsView: View {
         }
         .padding(18)
         .frame(width: 390)
+        .onAppear { model.refreshCatalog() }
     }
 
     private var mtpHelp: String {

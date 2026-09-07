@@ -394,6 +394,7 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func resetConversation() { resetConversationCount += 1 }
     func unload() { unloadCount += 1 }
     func decode(tokenIDs: [Int32]) -> String { "mock" }
+    func warmUp() -> AsyncStream<Int> { AsyncStream { $0.finish() } }
 
     func generate(
         prompt: String, imageURLs: [URL], options: Qwen38GenerationOptions

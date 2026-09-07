@@ -37,6 +37,13 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error>
+    /// H4.2: forces every decoder layer to be loaded from disk once, up
+    /// front, instead of paying that cost inside the first real turn's
+    /// TTFT. Yields the index of each layer as it finishes loading (0-based,
+    /// `numHiddenLayers` values total) so a caller can drive a progress bar.
+    /// A best-effort warm-up: failures surface later, on the first real
+    /// `generate` call, rather than here.
+    func warmUp() -> AsyncStream<Int>
 }
 
 public protocol Qwen38FlashNextEngineFactory: Sendable {
@@ -96,6 +103,24 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
 
     public func decode(tokenIDs: [Int32]) -> String {
         tokenizer.decode(tokens: tokenIDs.map(Int.init), skipSpecialTokens: false)
+    }
+
+    public func warmUp() -> AsyncStream<Int> {
+        AsyncStream { continuation in
+            let task = Task {
+                let dummyToken = Int32(tokenizer.convertTokenToId("<|im_start|>") ?? 0)
+                // Any generate() call right after this resets caches and the
+                // logical M-RoPE offset unconditionally (hasConversationHistory
+                // is still false), so this dummy forward's own state does not
+                // leak into the first real turn — only the now-resident layer
+                // weights do.
+                _ = try? model.forward(
+                    inputIDs: MLXArray([dummyToken]).reshaped([1, 1]),
+                    onLayerVisited: { layerIndex in continuation.yield(layerIndex + 1) })
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     public func generate(

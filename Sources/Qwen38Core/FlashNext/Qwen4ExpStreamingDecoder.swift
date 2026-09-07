@@ -76,7 +76,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         inputIDs: MLXArray,
         layerIndices: [Int],
         positionIDs: MLXArray? = nil,
-        materializeLayers: Bool = true
+        materializeLayers: Bool = true,
+        onLayerVisited: (@Sendable (Int) -> Void)? = nil
     ) throws -> (output: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
         precondition(hiddenStates.ndim == 3)
         precondition(hiddenStates.dim(-1) == configuration.hiddenSize * configuration.hcCount)
@@ -173,6 +174,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     loadDuration: loadDuration.seconds,
                     forwardDuration: forwardDuration.seconds,
                     outputShape: output.shape))
+            onLayerVisited?(layerIndex)
             // `loaded` goes out of scope at the end of this iteration. The
             // cache is intentionally retained for the next conversation turn;
             // the next iteration clears only allocations no longer referenced.

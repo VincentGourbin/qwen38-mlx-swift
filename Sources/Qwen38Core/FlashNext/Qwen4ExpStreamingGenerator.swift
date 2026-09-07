@@ -203,6 +203,7 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
             visionEmbeddings: visionEmbeddings,
             imageTokenID: imageTokenID)
         eval(prefill.logits)
+        recordNGramCacheStats(profiler)
         var layerVisitCount = prefill.reports.count
         var layerLoadTime = prefill.reports.reduce(0) { $0 + $1.loadDuration }
         let prefillEnd = Date()
@@ -236,6 +237,7 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
 
             let step = try model.forward(inputIDs: MLXArray([token]).reshaped([1, 1]))
             eval(step.logits)
+            recordNGramCacheStats(profiler)
             logits = step.logits[0..., -1, 0...]
             layerVisitCount += step.reports.count
             layerLoadTime += step.reports.reduce(0) { $0 + $1.loadDuration }
@@ -257,5 +259,25 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
             peakMemoryBytes: Memory.peakMemory,
             ngramCacheStats: model.ngramCacheStats())
         continuation.yield(.finished(summary))
+    }
+}
+
+extension Qwen4ExpStreamingGenerator {
+    /// Publishes cumulative row-cache counters into the active profiler
+    /// session (H4.4: the GUI's exported trace must show the "Flash n-gram
+    /// cache" counter alongside the per-layer phases the decoder already
+    /// emits). Mirrors `Qwen4ExpGreedyGenerator.recordNGramCacheStats`.
+    fileprivate func recordNGramCacheStats(_ profiler: MLXProfiler) {
+        guard profiler.isEnabled, let session = profiler.activeSession else { return }
+        let stats = model.ngramCacheStats()
+        session.addCounterEvent(
+            name: "Flash n-gram cache",
+            timestampUs: session.currentTimestampUsPublic(),
+            values: [
+                "hits": Double(stats.hits),
+                "misses": Double(stats.misses),
+                "entries": Double(stats.entries),
+                "hit_rate": stats.hitRate ?? 0,
+            ])
     }
 }
