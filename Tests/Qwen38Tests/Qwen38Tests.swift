@@ -384,6 +384,60 @@ func validatorRejectsUnknownQwen3ModelType() throws {
     }
 }
 
+private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @unchecked Sendable {
+    let directory: URL
+    private(set) var resetConversationCount = 0
+    private(set) var unloadCount = 0
+
+    init(directory: URL) { self.directory = directory }
+
+    func resetConversation() { resetConversationCount += 1 }
+    func unload() { unloadCount += 1 }
+    func decode(tokenIDs: [Int32]) -> String { "mock" }
+
+    func generate(
+        prompt: String, imageURLs: [URL], options: Qwen38GenerationOptions
+    ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
+    func generateFromMessages(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+}
+
+private struct MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory {
+    func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol {
+        MockFlashNextEngine(directory: directory)
+    }
+}
+
+@Test("Qwen38Runtime.load() prend la branche Flash-Next via une factory injectée (H3.1, sans charger 80 Go)")
+func runtimeDispatchesToFlashNextEngine() async throws {
+    let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-runtime-dispatch")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let runtime = Qwen38Runtime(flashNextEngineFactory: MockFlashNextEngineFactory())
+    let loadedBefore = await runtime.isLoaded
+    #expect(loadedBefore == false)
+
+    try await runtime.load(from: directory)
+
+    let loadedAfter = await runtime.isLoaded
+    let loadedDirectory = await runtime.loadedDirectory
+    let mtpState = await runtime.mtpState
+    #expect(loadedAfter == true)
+    #expect(loadedDirectory == directory)
+    #expect(mtpState == .fallback("Flash-Next : MTP local en chantier P-MTP"))
+
+    await runtime.resetConversation()
+    await runtime.unload()
+    let loadedAfterUnload = await runtime.isLoaded
+    #expect(loadedAfterUnload == false)
+}
+
 @Test("Le mergeur Flash remplace uniquement les marqueurs image")
 func flashInputMergerReplacesMixedMarkers() throws {
     let ids = MLXArray([Int32(7), 99, 7]).reshaped([1, 3])
@@ -1180,6 +1234,31 @@ func qwen4ExpStreamingGeneratorMatchesGreedyAndStreams() async throws {
     }
     #expect(continuationTokenCount == continuation.tokenIDs.count)
     #expect(continuationTokenCount < built.tokenIDs.count)
+}
+
+@Test("Qwen38Runtime bascule Flash-Next → 27B dans le même process et libère la résidence (H3.3)")
+func runtimeSwitchesFromFlashNextToQwen35ReleasesResidentMemory() async throws {
+    guard let flashPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"],
+          let qwen35Path = ProcessInfo.processInfo.environment["QWEN38_27B_MODEL"] else {
+        return
+    }
+    let runtime = Qwen38Runtime()
+    try await runtime.load(from: URL(fileURLWithPath: flashPath, isDirectory: true))
+    #expect(await runtime.isLoaded == true)
+
+    await runtime.unload()
+    #expect(await runtime.isLoaded == false)
+    #expect(Memory.activeMemory < 2 * 1024 * 1024 * 1024)
+
+    try await runtime.load(
+        from: URL(fileURLWithPath: qwen35Path, isDirectory: true), preloadMTP: false)
+    let stream = try await runtime.generate(
+        prompt: "Bonjour", options: .init(maxTokens: 16, temperature: 0))
+    var sawMetrics = false
+    for try await event in stream {
+        if case .metrics = event { sawMetrics = true }
+    }
+    #expect(sawMetrics)
 }
 
 @Test("La parité vision relit le checkpoint réel quand elle est demandée")

@@ -183,18 +183,25 @@ public actor Qwen38Runtime {
     /// not split between two incompatible cache implementations.
     private var directConversationMode = false
     public private(set) var loadedDirectory: URL?
+    private let flashNextEngineFactory: any Qwen38FlashNextEngineFactory
+    private var flashEngine: (any Qwen38FlashNextEngineProtocol)?
 
-    public init() {}
+    public init(flashNextEngineFactory: any Qwen38FlashNextEngineFactory = Qwen38DefaultFlashNextEngineFactory()) {
+        self.flashNextEngineFactory = flashNextEngineFactory
+    }
 
-    public var isLoaded: Bool { container != nil }
+    public var isLoaded: Bool { container != nil || flashEngine != nil }
 
     public func load(
         from directory: URL,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in },
         preloadMTP: Bool = true
     ) async throws {
-        _ = try Qwen38ModelValidator.validate(directory)
-        if loadedDirectory == directory, container != nil {
+        let info = try Qwen38ModelValidator.validate(directory)
+        guard let family = info.family else {
+            throw Qwen38ModelValidationError.unsupportedModelType(info.modelType)
+        }
+        if loadedDirectory == directory, container != nil || flashEngine != nil {
             return
         }
         chatSession = nil
@@ -205,26 +212,42 @@ public actor Qwen38Runtime {
         m2Conversation = nil
         m2ConversationTurns = []
         directConversationMode = false
-        await Qwen38MTPRegistration.register()
+        flashEngine?.unload()
+        flashEngine = nil
         Memory.clearCache()
         // The local MLXLMCommon overload does not expose a progress callback;
         // progress is available on the remote-loading overload only.
         _ = progressHandler
-        // The generic helper tries registered factories in order. The LLM
-        // factory also accepts qwen3_5 and would silently load the text-only
-        // implementation, dropping vision inputs. Select the VLM factory
-        // explicitly so Qwen35.prepare() receives the processed image.
-        container = try await VLMModelFactory.shared.loadContainer(
-            from: directory,
-            using: Qwen38TokenizerLoader()
-        )
-        // Leave processing overrides empty so the Qwen processor uses the
-        // checkpoint's own min/max pixel contract for each image.
-        chatSession = ChatSession(container!, processing: .init())
-        if preloadMTP {
-            let mtpResult = await mtpProvider.loadIfAvailable(for: directory)
-            mtpAvailability = mtpResult.availability
-            mtpDrafter = mtpResult.box
+
+        switch family {
+        case .qwen4Exp:
+            // Netflix-void pattern (H3.3): bound the Metal buffer cache
+            // while Flash-Next is resident — an unmeasured starting value,
+            // to revisit once P (débit) profiles the resident path.
+            Memory.cacheLimit = 8 * 1024 * 1024 * 1024
+            flashEngine = try await flashNextEngineFactory.makeEngine(directory: directory)
+            // P-MTP (Flash-Next's own MTP) is a separate chantier, opt-in
+            // and not wired into the runtime yet — always report a clear
+            // fallback rather than throwing when a caller requests MTP.
+            mtpAvailability = .fallback("Flash-Next : MTP local en chantier P-MTP")
+        case .qwen35:
+            await Qwen38MTPRegistration.register()
+            // The generic helper tries registered factories in order. The LLM
+            // factory also accepts qwen3_5 and would silently load the text-only
+            // implementation, dropping vision inputs. Select the VLM factory
+            // explicitly so Qwen35.prepare() receives the processed image.
+            container = try await VLMModelFactory.shared.loadContainer(
+                from: directory,
+                using: Qwen38TokenizerLoader()
+            )
+            // Leave processing overrides empty so the Qwen processor uses the
+            // checkpoint's own min/max pixel contract for each image.
+            chatSession = ChatSession(container!, processing: .init())
+            if preloadMTP {
+                let mtpResult = await mtpProvider.loadIfAvailable(for: directory)
+                mtpAvailability = mtpResult.availability
+                mtpDrafter = mtpResult.box
+            }
         }
         conversationTurnCount = 0
         loadedDirectory = directory
@@ -239,6 +262,8 @@ public actor Qwen38Runtime {
         conversationTurns = []
         m2Conversation = nil
         m2ConversationTurns = []
+        flashEngine?.unload()
+        flashEngine = nil
         loadedDirectory = nil
         conversationTurnCount = 0
         directConversationMode = false
@@ -248,6 +273,11 @@ public actor Qwen38Runtime {
     /// Clears the conversation history and KV cache while keeping the model
     /// weights resident for clean repeated benchmarks.
     public func resetConversation() {
+        if let flashEngine {
+            flashEngine.resetConversation()
+            conversationTurnCount = 0
+            return
+        }
         guard let container else { return }
         // Recreating the lightweight session clears its history and KV cache
         // without sending a non-Sendable ChatSession across actor isolation.
@@ -592,6 +622,9 @@ public actor Qwen38Runtime {
     }
 
     public func decode(tokenIDs: [Int32]) async -> String {
+        if let flashEngine {
+            return flashEngine.decode(tokenIDs: tokenIDs)
+        }
         guard let container else { return "" }
         return await container.decode(tokenIds: tokenIDs.map(Int.init))
     }
@@ -605,6 +638,13 @@ public actor Qwen38Runtime {
         messages: [Qwen38ChatMessage],
         options: Qwen38GenerationOptions = .init()
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        if let flashEngine {
+            // Flash-Next has no per-client persistent cache (contrat
+            // §5.1.1, "Stateless v1"): the whole history is rendered as one
+            // turn instead of replaying it through the in-process
+            // conversation state used by the 27B path below.
+            return try flashEngine.generateFromMessages(messages: messages, options: options)
+        }
         guard let lastUserIndex = messages.lastIndex(where: { $0.role == .user }) else {
             throw Qwen38RuntimeError.missingUserMessage
         }
@@ -664,6 +704,11 @@ public actor Qwen38Runtime {
         options: Qwen38GenerationOptions = .init(),
         forceConversationReplay: Bool = false
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        if let flashEngine {
+            conversationTurnCount += 1
+            return try flashEngine.generate(
+                prompt: prompt, imageURLs: imageURLs, options: options)
+        }
         guard let chatSession else { throw Qwen38RuntimeError.modelNotLoaded }
 
         chatSession.generateParameters = options.parameters

@@ -21,7 +21,17 @@ public enum Qwen38VisibleText {
     public static func structuralTokenIDs(
         tokenizer: any Tokenizer
     ) -> Set<Int> {
-        Set(structuralTokens.compactMap(tokenizer.convertTokenToId))
+        structuralTokenIDs(convertTokenToId: tokenizer.convertTokenToId)
+    }
+
+    /// Tokenizer-agnostic variant: Flash-Next builds its prompts through
+    /// `Tokenizers.Tokenizer` (swift-transformers) rather than
+    /// `MLXLMCommon.Tokenizer` — both expose `convertTokenToId`, so the
+    /// structural-token contract stays the single source of truth here.
+    public static func structuralTokenIDs(
+        convertTokenToId: (String) -> Int?
+    ) -> Set<Int> {
+        Set(structuralTokens.compactMap(convertTokenToId))
     }
 
     /// Defensive cleanup for already decoded chunks, including output from
@@ -47,6 +57,10 @@ public struct Qwen38VisibleTokenFilter: Sendable {
 
     public init(tokenizer: any Tokenizer) {
         self.structuralIDs = Qwen38VisibleText.structuralTokenIDs(tokenizer: tokenizer)
+    }
+
+    public init(convertTokenToId: (String) -> Int?) {
+        self.structuralIDs = Qwen38VisibleText.structuralTokenIDs(convertTokenToId: convertTokenToId)
     }
 
     public func shouldEmit(_ tokenID: Int) -> Bool {

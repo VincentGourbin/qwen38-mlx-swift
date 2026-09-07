@@ -98,6 +98,30 @@ public enum Qwen4ExpPromptBuilder {
             imageTokenID: imageToken)
     }
 
+    /// Full-history rendering for stateless callers (H3, the LAN server):
+    /// the whole message list goes through the HF chat template in one
+    /// call, exactly like `buildFirstTurn`'s text-only branch — the
+    /// template itself knows how to render several turns. Text only: a
+    /// stateless multi-turn request carrying an image has no single point
+    /// in the manual ChatML assembly to attach it, so callers should reject
+    /// that case explicitly rather than silently dropping the image.
+    public static func buildFromMessages(
+        tokenizer: any Tokenizer,
+        messages: [Message],
+        thinking: Bool,
+        reasoningEffort: String = "low"
+    ) throws -> Qwen4ExpBuiltPrompt {
+        let tokenIDs = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: nil,
+            additionalContext: [
+                "enable_thinking": thinking,
+                "reasoning_effort": reasoningEffort,
+            ]
+        ).map(Int32.init)
+        return Qwen4ExpBuiltPrompt(tokenIDs: tokenIDs)
+    }
+
     /// Continuation-turn rendering (H2.3): only the new suffix is
     /// tokenized — no system prompt, no history replay — because the
     /// decoder's recurrent/QSA caches already carry the earlier turns.
