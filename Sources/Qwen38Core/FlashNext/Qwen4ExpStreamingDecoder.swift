@@ -148,15 +148,29 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             }
 
             let attentionMask: MLXArray?
-            if configuration.layerTypes[layerIndex] == .fullAttention {
-                attentionMask = Qwen4ExpQSAAttention.causalMask(
-                    batch: inputIDs.dim(0), queryLength: inputIDs.dim(1),
-                    keyLength: cache.offset + inputIDs.dim(1), offset: cache.offset)
-            } else {
+            if configuration.layerTypes[layerIndex] != .fullAttention {
                 // GDN's recurrence is causal by construction.  Its optional
                 // mask has a different [B,S] contract and is reserved for
                 // padded/ragged batches.
                 attentionMask = nil
+            } else if inputIDs.dim(1) == 1 {
+                // P2-code (e): single-token decode has exactly one query
+                // position (`cache.offset`), and every cached key position
+                // is <= cache.offset < cache.offset + 1 — the causal mask
+                // built by `Qwen4ExpQSAAttention.causalMask` is therefore
+                // provably all-true for every step, and an all-true boolean
+                // mask is numerically the same as no mask at all to SDPA.
+                // Skip constructing it: `causalMask` allocates a fresh
+                // `Int32` range array of length `cache.offset + 1` — growing
+                // with every decoded token — purely to compare it against
+                // itself and get back "true" (see docs/knowledge/log.md
+                // P2-code (a)/(e)). Multi-token calls (prefill, MTP
+                // verification) still build the real mask below.
+                attentionMask = nil
+            } else {
+                attentionMask = Qwen4ExpQSAAttention.causalMask(
+                    batch: inputIDs.dim(0), queryLength: inputIDs.dim(1),
+                    keyLength: cache.offset + inputIDs.dim(1), offset: cache.offset)
             }
 
             let forwardStart = ContinuousClock.now

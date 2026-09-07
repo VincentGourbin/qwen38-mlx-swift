@@ -229,12 +229,24 @@ public struct Qwen4ExpLayerBenchComputeMode: Sendable, Equatable {
     /// deferring synchronization helps in Release with no memory pressure
     /// (the bench never approaches the ~80 GB resident checkpoint).
     public var syncEvery: Int
+    /// P2-code (e): the bench always decodes one token at a time
+    /// (`queryLength == 1`), so its QSA causal mask is provably all-true on
+    /// every step (see `Qwen4ExpStreamingDecoder.forward`, which applies
+    /// this unconditionally in production). `false` (default) reproduces
+    /// the bench's original behavior of building that mask anyway, so its
+    /// cost can be measured in isolation; `true` skips it, matching what
+    /// production now does.
+    public var skipTrivialCausalMask: Bool
 
-    public init(compiled: Bool = false, shapeless: Bool = false, syncEvery: Int = 1) {
+    public init(
+        compiled: Bool = false, shapeless: Bool = false, syncEvery: Int = 1,
+        skipTrivialCausalMask: Bool = false
+    ) {
         precondition(syncEvery > 0, "syncEvery doit être positif")
         self.compiled = compiled
         self.shapeless = shapeless
         self.syncEvery = syncEvery
+        self.skipTrivialCausalMask = skipTrivialCausalMask
     }
 
     public static let eager = Qwen4ExpLayerBenchComputeMode()
@@ -354,8 +366,17 @@ public enum Qwen4ExpLayerBench {
                 return layer(hidden, inputIDs: inputIDs, cache: cache)
             }
             let qsaCache = cache as! Qwen4ExpQSAKVCache
+            if computeMode.skipTrivialCausalMask {
+                // P2-code (e): queryLength is always 1 in this bench, so
+                // this mask is provably all-true — skip building it
+                // (matches `Qwen4ExpStreamingDecoder.forward` in
+                // production). Not combined with `--compiled`, whose 2-arg
+                // QSA closure expects a concrete mask array; eager only.
+                return layer(
+                    hidden, inputIDs: inputIDs, mask: nil, cache: cache, positionIDs: nil)
+            }
             // Same causal mask construction as `Qwen4ExpStreamingDecoder.forward`
-            // for a full-attention layer visit.
+            // did before P2-code (e) for a full-attention layer visit.
             let mask = Qwen4ExpQSAAttention.causalMask(
                 batch: 1, queryLength: 1,
                 keyLength: qsaCache.offset + 1, offset: qsaCache.offset)

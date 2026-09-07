@@ -783,6 +783,13 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var asyncInterval = 1
 
+    @Flag(
+        name: .long,
+        help:
+            "P2-code (e) : ne pas construire le masque causal QSA (provablement toujours vrai en décodage à un jeton)"
+    )
+    var skipTrivialMask = false
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -806,6 +813,7 @@ struct FlashLayerBench: AsyncParsableCommand {
             session.metadata["compiled"] = compiled ? "true" : "false"
             session.metadata["shapeless"] = shapeless ? "true" : "false"
             session.metadata["async_interval"] = String(asyncInterval)
+            session.metadata["skip_trivial_mask"] = skipTrivialMask ? "true" : "false"
             profiler.activeSession = session
             profiler.enable()
             profileSession = session
@@ -843,7 +851,8 @@ struct FlashLayerBench: AsyncParsableCommand {
                 measuredSteps: steps,
                 profiler: profiler,
                 computeMode: Qwen4ExpLayerBenchComputeMode(
-                    compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval))
+                    compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval,
+                    skipTrivialCausalMask: skipTrivialMask))
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)

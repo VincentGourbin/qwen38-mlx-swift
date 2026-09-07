@@ -1021,6 +1021,69 @@ func qwen4ExpMoEProducesDenseOutput() {
     #expect(!isNaN(output).any().item(Bool.self))
 }
 
+@Test("P2-code (e) : le masque causal QSA est superflu pour un décodage à un jeton")
+func qwen4ExpQSATrivialMaskMatchesNoMaskOnDecode() {
+    // Same reduced configuration as "La couche Flash-Next assemble branche,
+    // hyper-connections et MoE" just below, layer 3 (full_attention).
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [2], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+
+    // `Qwen4ExpStreamingDecoder.forward` (P2-code (e)) skips building the
+    // causal mask on a single-token decode step: with exactly one query
+    // position (`cache.offset`), every cached key is <= offset < offset+1,
+    // so the mask is provably all-true, and an all-true boolean mask is
+    // numerically identical to no mask for SDPA. This test exercises that
+    // claim directly at the `Qwen4ExpDecoderLayer` level (no checkpoint
+    // needed), because the only test that calls the modified
+    // `Qwen4ExpStreamingDecoder.forward` itself is gated behind
+    // `QWEN38_FLASH_MODEL` and does not run without the real checkpoint.
+    func decodeStep(withExplicitMask: Bool) -> MLXArray {
+        MLXRandom.seed(42)
+        let layer = Qwen4ExpDecoderLayer(configuration: configuration, layerIndex: 3)
+        let cache = Qwen4ExpQSAKVCache()
+        let prefillInput = MLXArray.ones([1, 1, 32], dtype: .float16)
+        let prefillIDs = MLXArray([1]).reshaped([1, 1])
+        _ = layer(
+            prefillInput, inputIDs: prefillIDs, cache: cache,
+            positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 1, offset: 0))
+
+        let decodeInput = MLXArray.ones([1, 1, 32], dtype: .float16) * 0.5
+        let decodeIDs = MLXArray([2]).reshaped([1, 1])
+        let mask: MLXArray? = withExplicitMask
+            ? Qwen4ExpQSAAttention.causalMask(
+                batch: 1, queryLength: 1, keyLength: cache.offset + 1, offset: cache.offset)
+            : nil
+        let output = layer(
+            decodeInput, inputIDs: decodeIDs, mask: mask, cache: cache,
+            positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 1, offset: cache.offset))
+        eval(output)
+        return output
+    }
+
+    let withMask = decodeStep(withExplicitMask: true)
+    let withoutMask = decodeStep(withExplicitMask: false)
+    #expect(withMask.shape == withoutMask.shape)
+    #expect(allClose(withMask, withoutMask, atol: 1e-5).item(Bool.self))
+}
+
 @Test("La couche Flash-Next assemble branche, hyper-connections et MoE")
 func qwen4ExpDecoderLayerAssemblesLinearAndQSA() {
     let json = """

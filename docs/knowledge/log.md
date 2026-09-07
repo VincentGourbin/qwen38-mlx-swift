@@ -1347,3 +1347,61 @@ mémoire, absents ici). Conservé comme **option du bench** uniquement
 dans `Qwen4ExpStreamingDecoder` — c'est P1, sur le vrai checkpoint sous
 pression mémoire, qui tranchera si la production peut se permettre de
 différer la synchronisation.
+
+### (e) Masque causal QSA superflu en décodage à un jeton
+
+(a) ne montre pas de poste isolé évident (Copy/Binaire/Concatenate/Reduce
+sont du même ordre de grandeur), mais relire `Qwen4ExpQSAAttention.causalMask`
+en révèle un : appelé à chaque pas de décodage avec `queryLength == 1`, il
+alloue `keys = MLXArray(Int32(0) ..< Int32(cache.offset + 1))` — un tableau
+qui **grandit d'un élément à chaque token décodé** — pour comparer
+`keys .< [offset + 1]` et obtenir un résultat mathématiquement toujours vrai
+: la seule position de requête (`offset`) est par construction ≥ toute
+position de clé déjà en cache (0..offset), donc `keys < offset + 1` est vrai
+pour tout `keys ≤ offset`. Un masque booléen entièrement vrai est
+numériquement identique à l'absence de masque pour `scaledDotProductAttention`
+(vérifié ci-dessous, pas supposé).
+
+**Correctif appliqué au chemin de production** :
+`Qwen4ExpStreamingDecoder.forward` ne construit plus le masque causal QSA
+quand `inputIDs.dim(1) == 1` (décodage) — il passe `nil`, exactement comme
+GDN le fait déjà pour sa récurrence. Le préremplissage et la vérification
+MTP (`queryLength > 1`) continuent de construire le vrai masque, inchangés.
+
+**Garde-fou** : la seule suite qui appelle réellement
+`Qwen4ExpStreamingDecoder.forward` en décodage multi-pas ("Le générateur
+streamé Flash-Next égale le greedy…", H2) est gardée par
+`QWEN38_FLASH_MODEL` et **n'a pas tourné** dans cet environnement (pas de
+checkpoint, conforme à l'interdiction Lexar de PLAN.md §0). Un nouveau test
+autonome, sans checkpoint, `qwen4ExpQSATrivialMaskMatchesNoMaskOnDecode`
+(P2-code (e)), comble ce trou : deux `Qwen4ExpDecoderLayer` (couche QSA,
+poids identiques via `MLXRandom.seed(42)` avant chacune) subissent un
+préremplissage identique puis un pas de décodage, l'un avec le masque
+explicite, l'autre avec `nil` — `allClose(atol: 1e-5)` confirme
+l'équivalence numérique. 65 tests verts (`Scripts/run-tests.sh`) ; celui-ci
+et `qwen4ExpDecoderLayerAssemblesLinearAndQSA` (`Qwen4ExpDecoderLayer`
+direct, sans checkpoint) ont réellement tourné et touchent ce chemin ; les
+tests de parité contre des fixtures Python (single-layer, couches publiques
+2/3, etc.) exercent des préremplissages multi-tokens, pas le décodage à un
+jeton — non affectés par ce changement, tournés et verts mais pas des
+témoins directs de ce lever spécifique.
+
+**Mesure sur le bench** (option `--skip-trivial-mask`, ajoutée pour isoler ce
+coût — la production, elle, l'applique sans option) :
+
+| `--steps` | QSA ms/pas médiane, masque construit | QSA ms/pas médiane, masque sauté |
+|---|---|---|
+| 200 (× 2) | 5,69 / 5,71 | 5,68 / 5,70 |
+| 3 000 (offset jusqu'à 3 000) | 5,90 | 5,77 |
+
+Effet **négligeable, dans le bruit de mesure** à la fenêtre du départ (200
+pas) ; à peine perceptible (~2 %) même à 3 000 pas — la comparaison booléenne
+et le broadcast sur un tableau de quelques milliers d'éléments restent bon
+marché comparés au matmul quantifié et à SDPA sur un cache qui grandit
+lui-même. Ce n'était donc pas, contrairement à l'intuition initiale, le
+« gros poste » cherché par (a) — mais c'est une correction légitime : une
+allocation par pas dont la taille croît sans borne avec la conversation
+(non simulée par ce bench, borné à quelques milliers de pas), zéro risque
+sémantique (prouvé par test), et cohérente avec le motif déjà utilisé pour
+GDN. **Conservé dans le chemin de production** malgré l'effet marginal sur
+ce bench précis.
