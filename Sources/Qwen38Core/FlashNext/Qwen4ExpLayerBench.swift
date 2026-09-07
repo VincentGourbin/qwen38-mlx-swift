@@ -220,10 +220,21 @@ public struct Qwen4ExpLayerBenchDimensions: Sendable {
 public struct Qwen4ExpLayerBenchComputeMode: Sendable, Equatable {
     public var compiled: Bool
     public var shapeless: Bool
+    /// P2-code (d): number of decode steps between blocking `eval` calls.
+    /// `1` (the default) matches the production decoder's behavior — see
+    /// `Qwen4ExpStreamingDecoder.residentEvaluationInterval` and PLAN.md
+    /// §6.3 piège 11 — and is unaffected by this bench-only knob. Values
+    /// above 1 use `asyncEval` for the steps in between and only block
+    /// (`eval`) on the last step of each group, to measure whether
+    /// deferring synchronization helps in Release with no memory pressure
+    /// (the bench never approaches the ~80 GB resident checkpoint).
+    public var syncEvery: Int
 
-    public init(compiled: Bool = false, shapeless: Bool = false) {
+    public init(compiled: Bool = false, shapeless: Bool = false, syncEvery: Int = 1) {
+        precondition(syncEvery > 0, "syncEvery doit être positif")
         self.compiled = compiled
         self.shapeless = shapeless
+        self.syncEvery = syncEvery
     }
 
     public static let eager = Qwen4ExpLayerBenchComputeMode()
@@ -330,36 +341,36 @@ public enum Qwen4ExpLayerBench {
 
         var lastOutput: MLXArray?
 
-        func decodeOneStep() -> Qwen4ExpLayerBenchStepMetrics {
+        // Builds one step's graph without evaluating it, so both the
+        // per-step (`decodeOneStep`) and the grouped `asyncEval` (P2-code
+        // (d)) paths share exactly the same forward.
+        func buildStep() -> MLXArray {
             let hidden = MLXRandom.uniform(
                 low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+            if kind == .gdn {
+                if let compiledGDNForward {
+                    return compiledGDNForward(hidden)
+                }
+                return layer(hidden, inputIDs: inputIDs, cache: cache)
+            }
+            let qsaCache = cache as! Qwen4ExpQSAKVCache
+            // Same causal mask construction as `Qwen4ExpStreamingDecoder.forward`
+            // for a full-attention layer visit.
+            let mask = Qwen4ExpQSAAttention.causalMask(
+                batch: 1, queryLength: 1,
+                keyLength: qsaCache.offset + 1, offset: qsaCache.offset)
+            if let compiledQSAForward {
+                return compiledQSAForward(hidden, mask)
+            }
+            return layer(hidden, inputIDs: inputIDs, mask: mask, cache: cache, positionIDs: nil)
+        }
 
+        func decodeOneStep() -> Qwen4ExpLayerBenchStepMetrics {
             let gpuBefore = Double(SystemMetrics.gpuUtilization())
             let cpuBefore = SystemMetrics.processCPUTime()
             let start = ContinuousClock.now
 
-            let output: MLXArray
-            if kind == .gdn {
-                if let compiledGDNForward {
-                    output = compiledGDNForward(hidden)
-                } else {
-                    output = layer(hidden, inputIDs: inputIDs, cache: cache)
-                }
-            } else {
-                let qsaCache = cache as! Qwen4ExpQSAKVCache
-                // Same causal mask construction as
-                // `Qwen4ExpStreamingDecoder.forward` for a full-attention
-                // layer visit.
-                let mask = Qwen4ExpQSAAttention.causalMask(
-                    batch: 1, queryLength: 1,
-                    keyLength: qsaCache.offset + 1, offset: qsaCache.offset)
-                if let compiledQSAForward {
-                    output = compiledQSAForward(hidden, mask)
-                } else {
-                    output = layer(
-                        hidden, inputIDs: inputIDs, mask: mask, cache: cache, positionIDs: nil)
-                }
-            }
+            let output = buildStep()
             eval(output)
             lastOutput = output
 
@@ -374,17 +385,65 @@ public enum Qwen4ExpLayerBench {
                 gpuPercent: (gpuBefore + gpuAfter) / 2)
         }
 
+        // P2-code (d): `asyncEval` every step but one in the group, then a
+        // single blocking `eval` on the last step — CPU/GPU are sampled
+        // once around the whole group and the group's wall time is
+        // amortized evenly across its `count` steps so the returned array
+        // still has one entry per measured step (unchanged shape for
+        // existing callers/tests).
+        func decodeStepGroup(_ count: Int) -> [Qwen4ExpLayerBenchStepMetrics] {
+            let gpuBefore = Double(SystemMetrics.gpuUtilization())
+            let cpuBefore = SystemMetrics.processCPUTime()
+            let start = ContinuousClock.now
+
+            var output: MLXArray!
+            for stepInGroup in 0..<count {
+                output = buildStep()
+                if stepInGroup == count - 1 {
+                    eval(output)
+                } else {
+                    asyncEval(output)
+                }
+            }
+            lastOutput = output
+
+            let elapsed = ContinuousClock.now - start
+            let cpuAfter = SystemMetrics.processCPUTime()
+            let gpuAfter = Double(SystemMetrics.gpuUtilization())
+            let wallSeconds = elapsed.seconds
+            let cpuPercent = wallSeconds > 0 ? (cpuAfter - cpuBefore) / wallSeconds * 100 : 0
+            let gpuPercent = (gpuBefore + gpuAfter) / 2
+            let perStepSeconds = wallSeconds / Double(count)
+            return Array(
+                repeating: Qwen4ExpLayerBenchStepMetrics(
+                    durationSeconds: perStepSeconds, cpuPercent: cpuPercent,
+                    gpuPercent: gpuPercent),
+                count: count)
+        }
+
         for _ in 0..<warmupSteps {
             _ = decodeOneStep()
         }
 
         var measured: [Qwen4ExpLayerBenchStepMetrics] = []
         measured.reserveCapacity(measuredSteps)
-        for _ in 0..<measuredSteps {
-            profiler.start(phaseName)
-            let metrics = decodeOneStep()
-            profiler.end(phaseName)
-            measured.append(metrics)
+        if computeMode.syncEvery <= 1 {
+            for _ in 0..<measuredSteps {
+                profiler.start(phaseName)
+                let metrics = decodeOneStep()
+                profiler.end(phaseName)
+                measured.append(metrics)
+            }
+        } else {
+            var remaining = measuredSteps
+            while remaining > 0 {
+                let groupSize = min(computeMode.syncEvery, remaining)
+                profiler.start(phaseName)
+                let groupMetrics = decodeStepGroup(groupSize)
+                profiler.end(phaseName)
+                measured.append(contentsOf: groupMetrics)
+                remaining -= groupSize
+            }
         }
 
         return Qwen4ExpLayerBenchResult(

@@ -776,12 +776,22 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var shapeless = false
 
+    @Option(
+        name: .long,
+        help:
+            "P2-code (d) : asyncEval() pendant N-1 pas puis un eval() bloquant (défaut 1 = eval à chaque pas, comme la production)"
+    )
+    var asyncInterval = 1
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
         }
         guard warmup >= 0 else {
             throw ValidationError("--warmup doit être positif ou nul")
+        }
+        guard asyncInterval > 0 else {
+            throw ValidationError("--async-interval doit être positif")
         }
 
         _ = Device.defaultDevice()
@@ -795,6 +805,7 @@ struct FlashLayerBench: AsyncParsableCommand {
             session.metadata["layer_kind"] = layerKind.rawValue
             session.metadata["compiled"] = compiled ? "true" : "false"
             session.metadata["shapeless"] = shapeless ? "true" : "false"
+            session.metadata["async_interval"] = String(asyncInterval)
             profiler.activeSession = session
             profiler.enable()
             profileSession = session
@@ -832,7 +843,7 @@ struct FlashLayerBench: AsyncParsableCommand {
                 measuredSteps: steps,
                 profiler: profiler,
                 computeMode: Qwen4ExpLayerBenchComputeMode(
-                    compiled: compiled, shapeless: shapeless))
+                    compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval))
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)

@@ -1297,3 +1297,53 @@ que P1 n'a pas tranché ») ; aucun changement au chemin de production
 code du bench (utile pour un futur P1/wrap plus poussé sur GDN
 spécifiquement), non retenu comme optimisation par défaut : le gain GDN est
 trop faible et QSA régresse.
+
+### (d) Pipeline `asyncEval` (option `--async-interval N`)
+
+`Qwen4ExpLayerBenchComputeMode.syncEvery` (défaut 1, comportement inchangé)
++ `flash-layer-bench --async-interval N`. `Qwen4ExpLayerBench.run` construit
+désormais chaque pas via un `buildStep()` partagé (extrait de l'ancien
+`decodeOneStep`, sans en changer le comportement à `syncEvery == 1`) ; avec
+`syncEvery > 1`, `decodeStepGroup` enchaîne `N-1` `asyncEval()` puis un
+`eval()` bloquant sur le Nème pas, échantillonne CPU/GPU une fois pour tout
+le groupe et amortit la durée mesurée sur les `N` pas (le tableau
+`Qwen4ExpLayerBenchResult.steps` garde une entrée par pas mesuré, forme
+inchangée pour les appelants existants). **Pas touché** :
+`Qwen4ExpStreamingDecoder.residentEvaluationInterval` reste à 1 par défaut
+dans le code de production — c'est une option du bench, comme (c).
+
+**Mesure** (Release, `--steps 400`, sans `--trace`, deux runs par intervalle) :
+
+| Intervalle | GDN ms/pas médiane | GDN GPU % (profiler) | QSA ms/pas médiane | QSA GPU % (profiler) |
+|---|---|---|---|---|
+| 1 (référence, eager) | 5,41 / 5,42 | 13,8-15,8 | 5,68 / 5,69 | 27,5-37,8 |
+| 4 | 4,72 | 42,5 | 4,69 | 41,2 |
+| 8 | 4,61-4,72 | 45,9-47,0 | 4,74-4,77 | 44,4-54,6 (CPU) / 44,6-44,9 (GPU) |
+| 48 | 4,52 | 49,0 | 4,46 | 48,2 |
+
+Cross-check indépendant du GPU % pendant un run à `--async-interval 8`,
+`--layer-kind both`, `--steps 3000` : `ioreg -r -c AGXAccelerator`, 25
+échantillons sur 25 s → **médiane 82 %** (alternance nette 0 / 80-92 %,
+cohérente avec l'exécution GPU par rafales entre deux synchronisations),
+contre une médiane de 0 % au départ (entrée ci-dessus). C'est une
+confirmation indépendante, pas seulement la moyenne bruitée du profiler : à
+la différence de (c), **`asyncEval` produit un vrai travail GPU concurrent
+mesurable**, pas un artefact de moyennage.
+
+Verdict : `asyncEval` avec synchronisation différée est le **seul levier
+P2-code qui rapproche significativement la jauge visée** (≤ 2 ms/couche, GPU
+≥ 40 %) — GPU ≥ 40 % est atteint pour les trois intervalles testés (41-49 %
+profiler, 82 % `ioreg` en médiane), et ms/pas baisse de ~13 % (GDN) à ~17 %
+(QSA) par rapport à eager, sans dépendre de `compile`/`shapeless`. Le
+palier ms/pas (~4,5-4,7 ms, encore loin de 2 ms) est cohérent avec (a) :
+l'essentiel du coût restant est le bookkeeping hôte MLX par op (Copy,
+binaire, refcounting), qui reste payé qu'on l'attende ou non — `asyncEval`
+ne le supprime pas, il le recouvre avec le travail GPU d'un pas voisin.
+Aucune différence notable entre N=4/8/48 sur le bench (pas de dégradation à
+48, contrairement au verdict V54 en résidence réelle — cohérent avec la
+lecture de PLAN.md : V54 était contaminé par Debug + profiler + pression
+mémoire, absents ici). Conservé comme **option du bench** uniquement
+(`--async-interval`) ; ne change pas `residentEvaluationInterval` (défaut 1)
+dans `Qwen4ExpStreamingDecoder` — c'est P1, sur le vrai checkpoint sous
+pression mémoire, qui tranchera si la production peut se permettre de
+différer la synchronisation.
