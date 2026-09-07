@@ -1143,3 +1143,91 @@ autre effet. Levier suivant (P2-code, sur ce bench, sans checkpoint) :
 compter les ops par couche, `compile` des sous-graphes stables, éliminer les
 concaténations des 4 flux, et pipeliner (`asyncEval`) au lieu d'un `eval`
 bloquant par couche.
+
+## 2026-09-07 — P2-code : leviers hôte sur le bench P0
+
+Suite de P0-b (`Scripts/build-release.sh`) et P0-c (profiler par couche
+opt-in, `Qwen4ExpStreamingDecoder.profileLayers`). Mesure de départ,
+Release, `flash-layer-bench --steps 200` **sans** `--trace` (horloge interne
+`ContinuousClock`, indépendante du profiler) répétée deux fois, meilleure et
+pire :
+
+| Couche | ms/pas médiane (run 1) | ms/pas médiane (run 2) | GPU % (profiler, moyen) | GPU % (`ioreg`, médiane sur 25 s) |
+|---|---|---|---|---|
+| GDN | 5,42-5,46 | 5,44-5,46 | 13,8-15,8 | 0 (un seul pic isolé à 53 sur 25 échantillons) |
+| QSA | 5,71-5,72 | 5,72-6,24 | 27,5-37,8 | 0 (idem) |
+
+Le « GPU % » du profiler et celui d'`ioreg` mesurent des choses différentes
+(moyenne d'échantillons instantanés autour de chaque pas de ~5 ms, très
+bruitée sur un intervalle aussi court, vs. médiane d'un échantillonnage à 1
+Hz sur toute la durée du run) ; les deux s'accordent sur l'essentiel : le GPU
+est quasiment inactif, cohérent avec l'entrée « P0 rejoué en Release »
+ci-dessus. Jauge P2-code (PLAN.md) : ≤ 2 ms/couche, GPU ≥ 40 % — très loin du
+point de départ.
+
+### (a) Comptage des ops par pas
+
+`sample $(pgrep -x qwen38) 8 -file results/p2-ops-sample.txt` pendant
+`flash-layer-bench --layer-kind qsa --steps 3000` (Release). Le fichier
+« Sort by top of stack » liste d'abord les threads de pool GCD/IOKit **au
+repos** (`__workq_kernreturn`, `mach_msg2_trap`, `__psynch_cvwait`,
+`iokit_user_client_trap`, 3 000+ échantillons chacun — cf. l'échantillon P0
+du 2026-09-07 après-midi) : ce ne sont pas les threads de calcul. Sur le
+thread de calcul (`mlx::core::scheduler::StreamThread::thread_fn`, 5 466
+échantillons sur 10 s), poids cumulés (auto+enfants, donc non strictement
+exclusifs) des 15 nœuds du **call graph** les plus fréquents sous ce thread :
+
+| Rang | Primitive / fonction | Échantillons | Famille |
+|---|---|---|---|
+| 1 | `mlx::core::eval` | 3 887 | ancêtre commun (traversée + eval du graphe) |
+| 2 | `mlx::core::eval_impl` | 786 | ancêtre commun |
+| 3 | `mlx::core::copy_gpu_inplace` | 177 | **Copy** (hyper-connections `inject`, cache) |
+| 4 | `mlx::core::binary_op_gpu` | 143 | **Binaire** (RMSNorm, gating, mix, injection) |
+| 5 | `mlx::core::binary_op_gpu_inplace` | 127 | Binaire |
+| 6 | `mlx::core::copy_gpu` | 83 | Copy |
+| 7 | `std::__function::__func<mlx::core::gpu::eval…>` | 69 | ancêtre commun (dispatch par primitive) |
+| 8 | `mlx::core::concatenate_gpu` | 62 | **Concatenate** (cache KV/indexeur, conv GDN, MRoPE) |
+| 9 | `mlx::core::QuantizedMatmul::eval_gpu` | 41 | **Matmul quantifié** (linéaires, MoE) |
+| 10 | `mlx::core::Reduce::eval_gpu` | 39 | **Reduce** (RMSNorm, softmax, top-k MoE) |
+| 11 | `mlx::core::unary_op_gpu` | 36 | **Unaire** (SiLU, sigmoid, sqrt) |
+| 12 | `mlx::core::qmv` | 36 | Matmul quantifié (matvec) |
+| 13 | `mlx::core::metal::MetalAllocator::malloc` | 36 | bookkeeping hôte (pas un op) |
+| 14 | `mlx::core::array::~array` | 35 | bookkeeping hôte (refcounting) |
+| 15 | `mlx::core::fast::ScaledDotProductAttention::eval_gpu` | 33 | **Attention** (QSA seulement) |
+
+Famille par famille (QuantizedMatmul+qmv ≈ 77, Copy ≈ 260,
+Binaire ≈ 270, Reduce 39, Unaire 36, Concatenate 62, Attention 33) : aucune
+primitive isolée ne domine à elle seule — le coût est réparti sur beaucoup de
+petits ops de familles comparables (copie et opérations binaires en tête,
+juste devant le matmul quantifié qui est le calcul réellement utile), plus
+~36+35 échantillons de bookkeeping hôte pur (allocateur Metal, refcounting
+`array`). C'est la confirmation directe, par comptage, de la lecture
+qualitative du 2026-09-07 après-midi (« bookkeeping hôte de MLX… pas par le
+calcul GPU »). Fichier : `results/p2-ops-sample.txt`. Pas de changement de
+code pour ce levier (mesure seule).
+
+### (b) Hyper-connections sans concaténation
+
+Relecture de `Sources/Qwen38Core/FlashNext/Qwen4ExpHyperConnection.swift` et
+`Sources/Qwen38Core/FlashNext/Qwen4ExpDecoderLayer.swift` : contrairement à
+l'hypothèse de PLAN.md, **les 4 flux ne sont jamais découpés en
+`split`/slices puis recollés par `concatenated`/`stacked`** dans ce chemin.
+`Qwen4ExpGatedResidual.callAsFunction`/`.mixedInput` utilisent déjà
+`reshaped([B, S, hcCount, hiddenSize])` et une réduction sur l'axe -2
+(`.mean(axis: -2)`) ; `Qwen4ExpDecoderLayer.inject` combine la branche et les
+poids d'injection par `expandedDimensions` + multiplication broadcastée +
+`reshaped(hyperInput.shape)`, sans `concatenated` ni `split`. Ce sous-système
+est donc déjà écrit sous la forme demandée par PLAN.md — **rien à changer,
+lever non applicable tel que décrit**. Les `concatenated`/`split` réels vus
+en (a) viennent d'ailleurs : la fenêtre de convolution GDN
+(`Qwen4ExpGatedDeltaNet.swift:107-112`, `concatenated([convState, qkv])` puis
+`MLX.split` — fenêtre de taille constante, coût nécessairement petit et
+borné), la croissance du cache KV/indexeur QSA
+(`Qwen4ExpCache.swift:107-108`, `concatenated` sur l'historique — croît avec
+`offset`, intrinsèque à l'attention causale) et le découpage rope/no-rope de
+QSA (`Qwen4ExpQSAAttention.swift:86`, `split(parts: 2)`, puis recombiné dans
+`Qwen4ExpMRoPE.swift`). Aucun de ces trois points ne correspond au motif «
+4 flux découpés/recollés » ciblé par PLAN.md ; les éliminer changerait la
+sémantique du cache causal ou de MRoPE, hors périmètre d'un levier de pur
+bookkeeping. Pas de changement de code, pas de commit de code pour ce
+levier — seulement cette entrée.
