@@ -762,6 +762,20 @@ struct FlashLayerBench: AsyncParsableCommand {
     @Option(name: .long, help: "Écrire une trace Chrome/Perfetto à ce chemin")
     var trace: String?
 
+    @Flag(
+        name: .long,
+        help:
+            "P2-code (c) : envelopper le forward de couche dans MLX.compile (état de cache comme entrée/sortie)"
+    )
+    var compiled = false
+
+    @Flag(
+        name: .long,
+        help:
+            "Avec --compiled : ne pas recompiler seulement à cause d'un changement de forme (compile(shapeless: true))"
+    )
+    var shapeless = false
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -779,6 +793,8 @@ struct FlashLayerBench: AsyncParsableCommand {
             session.metadata["warmup_steps"] = String(warmup)
             session.metadata["measured_steps"] = String(steps)
             session.metadata["layer_kind"] = layerKind.rawValue
+            session.metadata["compiled"] = compiled ? "true" : "false"
+            session.metadata["shapeless"] = shapeless ? "true" : "false"
             profiler.activeSession = session
             profiler.enable()
             profileSession = session
@@ -814,7 +830,9 @@ struct FlashLayerBench: AsyncParsableCommand {
                 kind: kind,
                 warmupSteps: warmup,
                 measuredSteps: steps,
-                profiler: profiler)
+                profiler: profiler,
+                computeMode: Qwen4ExpLayerBenchComputeMode(
+                    compiled: compiled, shapeless: shapeless))
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)

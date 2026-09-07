@@ -1231,3 +1231,69 @@ QSA (`Qwen4ExpQSAAttention.swift:86`, `split(parts: 2)`, puis recombiné dans
 sémantique du cache causal ou de MRoPE, hors périmètre d'un levier de pur
 bookkeeping. Pas de changement de code, pas de commit de code pour ce
 levier — seulement cette entrée.
+
+### (c) `MLX.compile` dans le bench (option `--compiled` / `--shapeless`)
+
+`Qwen4ExpLayerBench.run` gagne un paramètre `computeMode:
+Qwen4ExpLayerBenchComputeMode` (`compiled`, `shapeless`), exposé par
+`flash-layer-bench --compiled [--shapeless]`. Le cache (`MambaCache` /
+`Qwen4ExpQSAKVCache`) est bouclé dans un petit adaptateur
+`Qwen4ExpLayerBenchCacheBox: Updatable` (`KVCache` et `Updatable`
+partagent la même unique exigence `innerState() -> [MLXArray]` mais Swift
+n'infère pas la conformité entre deux protocoles distincts à partir d'une
+signature identique — l'adaptateur fait juste le pont, en relisant
+`cache.innerState()` à chaud à chaque appel compilé) et passé en
+`inputs`/`outputs` de `MLX.compile(inputs:outputs:shapeless:)`. GDN : forward
+à un seul argument (`hidden -> output`, cache géré par `compile`). QSA :
+forward à deux arguments (`hidden, mask -> output`), le masque restant un
+argument positionnel car il dépend de `cache.offset`, lu côté Swift.
+
+**Correction** : un test unitaire ajouté
+(`qwen4ExpLayerBenchCompiledMatchesEager`) vérifie que le chemin compilé
+produit exactement les mêmes valeurs que le chemin eager. Les poids du bench
+sont des placeholders zéro déterministes (`qwen4ExpLinear`) ; en réamorçant
+`MLXRandom.seed` à l'identique avant les deux runs, seule l'entrée
+synthétique par pas varie — `eager.lastOutput` et `compiled.lastOutput`
+concordent à 1e-4 près pour GDN et QSA (64 tests verts, `Scripts/run-tests.sh`).
+
+**Mesure** (Release, `--steps 200`, deux runs, sans `--trace`) :
+
+| Variante | GDN ms/pas médiane | QSA ms/pas médiane |
+|---|---|---|
+| eager (référence) | 5,41 / 5,42 | 5,68 / 5,69 |
+| `--compiled` | **5,31 / 5,32** (−2 %) | **6,38 / 6,46** (+12-14 %) |
+| `--compiled --shapeless` | crash (voir obstacle) | crash (idem) |
+
+GDN : gain net mais modeste (≈2 %, cohérent avec un cache à forme constante —
+fenêtre de conv et état récurrent de taille fixe, cf. (b) — où `compile`
+évite de retraverser/reconstruire le même petit graphe Swift à chaque pas).
+QSA : **plus lent avec `--compiled`**, confirmant l'hypothèse de PLAN.md : le
+masque causal (`Qwen4ExpQSAAttention.causalMask`, taille `offset + 1`) et
+l'état du cache KV/indexeur (`concatenated` à chaque pas) changent de forme
+à *chaque* appel, donc le graphe compilé sans `shapeless` est retracé/
+recompilé à chaque pas — un coût strictement additionnel par-dessus le
+travail déjà fait par MLX en mode eager.
+
+**Obstacle précis pour `shapeless: true`** (les deux couches) :
+
+```
+MLX/ErrorHandler.swift:345: Fatal error: [Primitive::output_shapes] Split
+cannot infer output shapes. at .../mlx-c/mlx/c/closure.cpp:104
+```
+
+`mlx-swift` 0.31.6 (`Transforms+Compile.swift`) : le mode `shapeless` exige
+que chaque primitive du graphe puisse déduire ses formes de sortie sans
+retracer — la primitive `Split` (utilisée par GDN pour séparer q/k/v après
+la conv, `Qwen4ExpGatedDeltaNet.swift:112`, et par QSA pour séparer
+rope/no-rope, `Qwen4ExpQSAAttention.swift:86`) ne le peut pas dans cette
+version de MLX. `shapeless: true` est donc **inutilisable tel quel** sur ce
+chemin de calcul, pour les deux types de couche, tant que `Split` n'a pas
+cette capacité en amont.
+
+Décision : `--compiled`/`--shapeless` restent des **options du bench**
+(comme prévu par PLAN.md — « (c) et (d) restent des options du bench tant
+que P1 n'a pas tranché ») ; aucun changement au chemin de production
+(`Qwen4ExpStreamingDecoder`, `Qwen4ExpDecoderLayer`). Conservé dans le
+code du bench (utile pour un futur P1/wrap plus poussé sur GDN
+spécifiquement), non retenu comme optimisation par défaut : le gain GDN est
+trop faible et QSA régresse.

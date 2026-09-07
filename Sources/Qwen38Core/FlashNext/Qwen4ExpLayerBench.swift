@@ -41,15 +41,23 @@ public struct Qwen4ExpLayerBenchResult: Sendable {
     public let kind: Qwen4ExpLayerBenchKind
     public let steps: [Qwen4ExpLayerBenchStepMetrics]
     public let materializedBytes: Int64
+    /// Flattened last measured step's output (all bench weights are
+    /// deterministic zero placeholders — see `qwen4ExpLinear` — so with the
+    /// same RNG seed this is reproducible across eager and `compile`d runs;
+    /// used by the P2-code (c) correctness check that `--compiled` does not
+    /// silently change the layer's numerics).
+    public let lastOutput: [Float]
 
     public init(
         kind: Qwen4ExpLayerBenchKind,
         steps: [Qwen4ExpLayerBenchStepMetrics],
-        materializedBytes: Int64
+        materializedBytes: Int64,
+        lastOutput: [Float] = []
     ) {
         self.kind = kind
         self.steps = steps
         self.materializedBytes = materializedBytes
+        self.lastOutput = lastOutput
     }
 }
 
@@ -202,6 +210,40 @@ public struct Qwen4ExpLayerBenchDimensions: Sendable {
     }
 }
 
+/// P2-code (c): whether `flash-layer-bench` runs the layer's forward
+/// eagerly (baseline) or wrapped in `MLX.compile`. `--compiled` alone means
+/// "recompile whenever the traced shapes change" (the QSA mask and cache
+/// grow every step, so this is expected to recompile on every call and
+/// therefore measure worse than eager — see docs/knowledge/log.md P2-code
+/// (c)); `shapeless: true` asks MLX not to recompile purely for a shape
+/// change.
+public struct Qwen4ExpLayerBenchComputeMode: Sendable, Equatable {
+    public var compiled: Bool
+    public var shapeless: Bool
+
+    public init(compiled: Bool = false, shapeless: Bool = false) {
+        self.compiled = compiled
+        self.shapeless = shapeless
+    }
+
+    public static let eager = Qwen4ExpLayerBenchComputeMode()
+}
+
+/// Boxes a `KVCache` behind MLX's `Updatable` protocol so its arrays can be
+/// registered as `compile(inputs:outputs:)` state. `KVCache` and `Updatable`
+/// both require only `innerState() -> [MLXArray]`, but Swift does not infer
+/// cross-protocol conformance from a matching signature, so this forwards
+/// explicitly. `innerState()` is called fresh on every compiled invocation,
+/// so it always reflects whatever arrays the cache holds *right now* (the
+/// layer replaces `cache[0]`/`cache[1]` with new array objects each step —
+/// see `Qwen4ExpGatedDeltaNet.callAsFunction` — rather than mutating them in
+/// place, which this indirection makes transparent to `compile`).
+private final class Qwen4ExpLayerBenchCacheBox: Updatable {
+    let cache: any KVCache
+    init(_ cache: any KVCache) { self.cache = cache }
+    func innerState() -> [MLXArray] { cache.innerState() }
+}
+
 /// Builds one Flash-Next decoder layer with weights created directly in
 /// their packed 4-bit shapes (`qwen4ExpLinear` / `qwen4ExpSwitchLinear`,
 /// see `Qwen4ExpPrequantized.swift` and the test "Les modules Flash-Next
@@ -215,7 +257,8 @@ public enum Qwen4ExpLayerBench {
         warmupSteps: Int = 20,
         measuredSteps: Int = 200,
         quantization: Qwen4ExpQuantizationSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4),
-        profiler: MLXProfiler = .shared
+        profiler: MLXProfiler = .shared,
+        computeMode: Qwen4ExpLayerBenchComputeMode = .eager
     ) -> Qwen4ExpLayerBenchResult {
         precondition(warmupSteps >= 0, "--warmup doit être positif ou nul")
         precondition(measuredSteps > 0, "--steps doit être positif")
@@ -255,6 +298,38 @@ public enum Qwen4ExpLayerBench {
         let inputIDs = MLXArray([Int32(1)]).reshaped([1, 1])
         let phaseName = "Bench couche \(kind.rawValue)"
 
+        // P2-code (c): GDN's cache holds fixed-shape state every step (a
+        // constant-width conv window plus a constant-shape recurrent state,
+        // see `Qwen4ExpGatedDeltaNet`), so its one-argument forward
+        // (hidden -> output) is a plausible `compile` target. QSA's cache
+        // instead concatenates a new key/value onto the KV/indexer history
+        // every step (`Qwen4ExpQSAKVCache`/`KVCacheSimple.update`) and its
+        // causal mask (built in Swift from `cache.offset`) grows with it, so
+        // both a positional argument (the mask) and the traced state shape
+        // change on every single call — compiled without `shapeless` this
+        // recompiles every step; the obstacle and its measured cost are
+        // documented in docs/knowledge/log.md P2-code (c) rather than
+        // skipped.
+        let cacheBox = Qwen4ExpLayerBenchCacheBox(cache)
+        let compiledGDNForward: (@Sendable (MLXArray) -> MLXArray)? = {
+            guard kind == .gdn, computeMode.compiled else { return nil }
+            return compile(
+                inputs: [cacheBox], outputs: [cacheBox], shapeless: computeMode.shapeless
+            ) { hidden in
+                layer(hidden, inputIDs: inputIDs, cache: cache)
+            }
+        }()
+        let compiledQSAForward: (@Sendable (MLXArray, MLXArray) -> MLXArray)? = {
+            guard kind == .qsa, computeMode.compiled else { return nil }
+            return compile(
+                inputs: [cacheBox], outputs: [cacheBox], shapeless: computeMode.shapeless
+            ) { hidden, mask in
+                layer(hidden, inputIDs: inputIDs, mask: mask, cache: cache, positionIDs: nil)
+            }
+        }()
+
+        var lastOutput: MLXArray?
+
         func decodeOneStep() -> Qwen4ExpLayerBenchStepMetrics {
             let hidden = MLXRandom.uniform(
                 low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
@@ -265,7 +340,11 @@ public enum Qwen4ExpLayerBench {
 
             let output: MLXArray
             if kind == .gdn {
-                output = layer(hidden, inputIDs: inputIDs, cache: cache)
+                if let compiledGDNForward {
+                    output = compiledGDNForward(hidden)
+                } else {
+                    output = layer(hidden, inputIDs: inputIDs, cache: cache)
+                }
             } else {
                 let qsaCache = cache as! Qwen4ExpQSAKVCache
                 // Same causal mask construction as
@@ -274,10 +353,15 @@ public enum Qwen4ExpLayerBench {
                 let mask = Qwen4ExpQSAAttention.causalMask(
                     batch: 1, queryLength: 1,
                     keyLength: qsaCache.offset + 1, offset: qsaCache.offset)
-                output = layer(
-                    hidden, inputIDs: inputIDs, mask: mask, cache: cache, positionIDs: nil)
+                if let compiledQSAForward {
+                    output = compiledQSAForward(hidden, mask)
+                } else {
+                    output = layer(
+                        hidden, inputIDs: inputIDs, mask: mask, cache: cache, positionIDs: nil)
+                }
             }
             eval(output)
+            lastOutput = output
 
             let elapsed = ContinuousClock.now - start
             let cpuAfter = SystemMetrics.processCPUTime()
@@ -304,7 +388,8 @@ public enum Qwen4ExpLayerBench {
         }
 
         return Qwen4ExpLayerBenchResult(
-            kind: kind, steps: measured, materializedBytes: materializedBytes)
+            kind: kind, steps: measured, materializedBytes: materializedBytes,
+            lastOutput: lastOutput?.asType(.float32).asArray(Float.self) ?? [])
     }
 }
 

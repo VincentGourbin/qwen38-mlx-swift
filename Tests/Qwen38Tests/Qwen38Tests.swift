@@ -1507,3 +1507,52 @@ func qwen4ExpLayerBenchMeasuresPositiveDurations() {
         #expect(result.materializedBytes > 0)
     }
 }
+
+@Test("P2-code (c) : le forward de couche compilé du bench égale le chemin eager")
+func qwen4ExpLayerBenchCompiledMatchesEager() {
+    // Same reduced dimensions as the P0 bench test above. All bench weights
+    // are deterministic zero placeholders (`qwen4ExpLinear`), so with the
+    // RNG re-seeded identically before each run, the only source of
+    // per-step values is the synthetic hidden-state input — eager and
+    // `compile`d must therefore produce bit-for-bit identical outputs if
+    // `compile(inputs:outputs:)` is correctly threading the KVCache state
+    // (see `Qwen4ExpLayerBenchCacheBox`).
+    let dimensions = Qwen4ExpLayerBenchDimensions(
+        hiddenSize: 256,
+        numAttentionHeads: 4,
+        numKeyValueHeads: 1,
+        headDim: 64,
+        linearNumKeyHeads: 4,
+        linearNumValueHeads: 8,
+        linearKeyHeadDim: 32,
+        linearValueHeadDim: 32,
+        linearConvKernelDim: 4,
+        numExperts: 8,
+        numExpertsPerToken: 2,
+        moeIntermediateSize: 64,
+        sharedExpertIntermediateSize: 64,
+        indexerBudget: 64,
+        indexerCompressRatio: 4,
+        indexerHeadDim: 64,
+        indexerKVHeads: 1,
+        indexerNHeads: 2,
+        hcCount: 4,
+        hcLowrank: 32,
+        vocabSize: 1_000,
+        maxPositionEmbeddings: 4_096)
+
+    for kind in [Qwen4ExpLayerBenchKind.gdn, .qsa] {
+        MLXRandom.seed(1_234)
+        let eager = Qwen4ExpLayerBench.run(
+            kind: kind, dimensions: dimensions, warmupSteps: 2, measuredSteps: 4)
+        MLXRandom.seed(1_234)
+        let compiled = Qwen4ExpLayerBench.run(
+            kind: kind, dimensions: dimensions, warmupSteps: 2, measuredSteps: 4,
+            computeMode: Qwen4ExpLayerBenchComputeMode(compiled: true))
+        #expect(eager.lastOutput.count == compiled.lastOutput.count)
+        #expect(!eager.lastOutput.isEmpty)
+        for (a, b) in zip(eager.lastOutput, compiled.lastOutput) {
+            #expect(abs(a - b) < 1e-4)
+        }
+    }
+}
