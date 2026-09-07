@@ -3236,3 +3236,100 @@ la réorientation :
 **Point de départ pour l'agent d'implémentation** : §6.2, tâche H0.1, puis
 strictement dans l'ordre H0 → H1 → H2 → H3 → H4 → H5 (H6 en parallèle de H4-H5)
 → ⛔ G-8. Ne pas commencer P, P-MTP ni §7 avant G-8.
+
+---
+
+<!-- ASK: perf/mémoire Flash-Next bloque H6.1 — 2026-09-07 après-midi -->
+## ASK — chantier P à prioriser : le GPU semble inactif, et le mode résident sature la mémoire système
+
+À transmettre à l'agent de planification.
+
+### État d'avancement (2026-09-07)
+
+H0 → H6.5 sont faits et commités dans le dépôt git local créé en H0.1
+(`8f4a7ed`…`60cc4a2`) : catalogue double-famille (H1), générateur
+streamé avec sampling/continuation (H2), adaptateur runtime Flash-Next
+dans `Qwen38Runtime` (H3), GUI (catalogue dynamique, warm-up couche par
+couche, MTP/trace génériques — H4), serveur LAN (`family` sur
+`/v1/models`, keep-alive SSE pendant le chargement — H5), garde de
+régression Q-B (H6.5 : la séquence de 29 IDs de V32 rejouée sur le
+checkpoint réel, PASS en 94,6 s, hit-rate et logprob dans les seuils de
+V32). 62 tests verts, dont plusieurs rejoués sur les deux checkpoints
+réels (27B et Flash-Next) dans le même process. Reste avant G-8 :
+H6.1-H6.4 (qualification qualitative élargie), actuellement **bloqués**
+— voir ci-dessous.
+
+### Ce qui bloque H6.1 (prompt de référence, thinking, 200 tokens, résident)
+
+Deux échecs distincts, à ne pas confondre l'un avec l'autre :
+
+1. **Mode streamed** (sans `--resident-layers`) : le process avance mais
+   très lentement — `ps -o etime,time` a montré **1h48m40s de temps réel
+   pour seulement 24m13s de temps CPU cumulé**, avant que je ne l'arrête
+   (aucune chance d'atteindre 200 tokens avant plusieurs heures). Le
+   ratio ETIME/TIME ≈ 4,5 confirme que le process attend l'essentiel du
+   temps plutôt qu'il ne calcule : chaque token recharge les 48 couches
+   depuis le Lexar (I/O disque, pas calcul GPU). Vincent confirme ne pas
+   entendre le ventilateur pendant ces phases, cohérent avec de
+   l'attente I/O.
+2. **Mode résident** (`--resident-layers`) : **tué deux fois de suite par
+   pression mémoire système** (« stopped because the system is running
+   low on memory »), à chaque fois pendant le chargement, avant même
+   d'atteindre le décodage en régime établi. Le compresseur mémoire
+   macOS est monté à 27 Go juste avant le second kill (contre ~600 Mo au
+   repos). Mesure de la mémoire de base **sans** Flash-Next sur cette
+   machine à ce moment : **~66 Go déjà utilisés par le reste (Arc, Teams,
+   ChatGPT/Codex, Xcode…) sur 96 Go**, soit ~30 Go de marge réelle —
+   insuffisant pour le pic résident documenté au §6.0 (« 79-82 Go »).
+   Rien dans les commits H2-H6 ne touche l'allocation mémoire de
+   `Qwen4ExpStreamingDecoder`/`Qwen4ExpCheckpointLayerLoader` (H4.2 n'a
+   ajouté qu'un callback optionnel `onLayerVisited`, sans changer ce qui
+   est chargé) : l'hypothèse la plus probable est un écart entre le pic
+   documenté et la marge réellement disponible en usage courant de la
+   machine, pas une régression introduite aujourd'hui — mais ça reste à
+   vérifier, pas à supposer.
+
+### Le doute de fond que Vincent veut faire trancher
+
+Au-delà du diagnostic I/O du mode streamed (point 1), Vincent n'a perçu
+**aucune activité ventilateur notable** pendant les tentatives, y
+compris quand le process était censé calculer plutôt qu'attendre sur de
+l'I/O. Ça rejoint directement le chantier P déjà scopé au §6.2 (« Rien
+dans l'architecture ne justifie ce ratio : c'est de l'overhead
+d'implémentation ») mais avec un doute plus fort : est-ce que le GPU
+dispatch vraiment du travail Metal en régime établi, ou est-ce qu'il y a
+quelque chose qui sérialise/attend sans réel calcul (boucle CPU sur les
+experts MoE — hypothèse P2(a) déjà notée au §6.2 —, synchronisation
+host/device excessive par couche, appel bloquant) ? Le plan reportait ce
+chantier après G-8 ; Vincent souhaite qu'un agent de planification
+regarde le dossier dès maintenant, avant de relancer d'autres runs
+longs qui risquent de re-consommer du temps machine pour rien.
+
+### Demande
+
+1. Décider si P doit être avancé avant G-8 (dérogation à §6.1 point 1 de
+   la rév. 4), et si oui prioriser **P1** (profilage Perfetto par
+   couche — déjà instrumenté : phases `Flash couche N`, compteur `Flash
+   n-gram cache`, `flash-chat-probe --trace` disponible) sur un run
+   **court** (résident, 4-8 tokens) plutôt qu'un run de qualification de
+   200 tokens, pour obtenir un diagnostic rapidement sans re-déclencher
+   les kills mémoire.
+2. Vérifier si le pic mémoire résident (§6.0, « 79-82 Go ») est toujours
+   exact avec le code actuel (H2-H6 n'y ont normalement pas touché), ou
+   s'il a dérivé — et pourquoi le chargement lui-même (avant tout
+   décodage) suffit à déclencher la pression mémoire aujourd'hui.
+3. Mettre à jour la checklist « avant tout run résident » du §6.0 : la
+   marge réelle sur cette machine en usage courant (~30 Go libres avant
+   Flash-Next) est plus faible que ce que §6.0 supposait ; préciser un
+   seuil chiffré (Go libres minimum) à vérifier avant de lancer, pas
+   seulement une vérification qualitative.
+4. Une fois P1 fait : statuer sur l'ordre — reprendre H6.1-H6.4 avec les
+   paramètres corrigés (résident, RAM libérée au préalable), ou
+   d'abord corriger ce que P2 aura trouvé avant de consommer plus de
+   temps machine sur des runs de qualification lents.
+
+Contrainte : ne pas relancer de run résident sans vérifier la mémoire
+libre au préalable (`top -l 1 | grep PhysMem`) ; viser une marge large
+avant de lancer (la pression peut monter en cours de chargement, pas
+seulement au démarrage) ; rester sur `xcodebuild`/`Scripts/*.sh`, jamais
+`swift build`/`swift test`.
