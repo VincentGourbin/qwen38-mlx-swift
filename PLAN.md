@@ -353,7 +353,7 @@ Conventions : une tâche = un commit = un critère vérifiable. Build : `Scripts
 
 **P — Débit greedy résident (3-5 j, après G-8)**
 
-Constat : 28 s / 8 tokens ≈ 3,5 s par token ≈ 73 ms par couche, pour 6B paramètres actifs, soit > 30× plus lent que le 27B dense 4-bit. Rien dans l'architecture ne justifie ce ratio : c'est de l'overhead d'implémentation. Méthode : profiler d'abord, **une hypothèse à la fois**, chaque correctif mesuré par la même commande (`flash-chat-probe $FLASH --prompt <référence> --max-new-tokens 32 --trace …`) et consigné dans `BENCHMARKS.md`.
+Constat (corrigé le 2026-09-07 par relecture de la trace V54, voir RÉPONSE « chantier P avant G-8 ») : régime établi **1,6 s par token ≈ 25 ms par couche**, CPU 98 % (un cœur), **GPU 0-5 %** ; le premier token décodé coûte 17 s de warm-up (le « 28 s / 8 tokens » mélangeait les deux). Pour 6B paramètres actifs, > 15× plus lent que le 27B dense 4-bit ; hypothèse dominante : pagination/décompression des 77 Go non wirés (H-A), à départager par P0/P1. Méthode : profiler d'abord, **une hypothèse à la fois**, chaque correctif mesuré par la même commande (`flash-chat-probe $FLASH --prompt <référence> --max-new-tokens 32 --trace …`) et consigné dans `BENCHMARKS.md`.
 
 | # | Tâche | Critère |
 |---|---|---|
@@ -3333,3 +3333,163 @@ libre au préalable (`top -l 1 | grep PhysMem`) ; viser une marge large
 avant de lancer (la pression peut monter en cours de chargement, pas
 seulement au démarrage) ; rester sur `xcodebuild`/`Scripts/*.sh`, jamais
 `swift build`/`swift test`.
+
+<!-- ANSWER: chantier P avant G-8 — 2026-09-07 -->
+## RÉPONSE — chantier P avant G-8 : le GPU est bien inactif, la cause première est la mémoire, protocole court (2026-09-07)
+
+Socle de preuve : les quatre traces de la campagne V53/V54 déjà sur disque
+(`qwen38-flash-perf-interval1-8tok`, `-mtp-interval1`, `-wiredlimit85000`,
+`qwen38-flash-quality-thinking-long`), relues avec le nouveau
+`Scripts/trace-layers.py` ; le code de `Sources/Qwen38Core/FlashNext/` et du
+Vendor à `HEAD` (`3c80cae`) ; les sources de mlx-swift 0.31.6 dans
+`.xcodebuild/SourcePackages/checkouts/` ; les en-têtes safetensors du
+checkpoint ; l'état mémoire de la machine ce jour. Aucun run n'a été lancé.
+
+### R0 — Ce que les traces existantes disent déjà (le doute de Vincent est tranché)
+
+Trace greedy résidente, intervalle 1, 8 tokens (celle du « 28 s » de V54) :
+
+| Passe | Contenu | Durée | Médiane / couche | CPU (tous threads) | GPU |
+|---|---|---|---|---|---|
+| 0 | préfill = chargement des 48 couches | 93,4 s | 1 876 ms | 58 % | 14 % |
+| 1 | premier token décodé (warm-up) | 17,4 s | 200 ms (max 3,9 s couche 24) | 94 % | 1 % |
+| 2-7 | **régime établi** | **1,36-1,67 s / token** | **22-28 ms** | **98 %** | **5 % (médiane 0)** |
+
+Le compteur GPU du profiler est `Device Utilization %` lu dans le driver AGX
+(swift-mlx-profiler `SystemMetrics.swift`), le compteur CPU vient de `rusage`.
+Trois faits en découlent :
+
+1. **En régime établi le process sature exactement un cœur CPU (médiane
+   103 %) et le GPU est à 0-5 %.** Vincent a raison : il n'y a pas de calcul
+   GPU pendant le décodage. Le ventilateur silencieux est cohérent.
+2. **Le « 28 s / 8 tokens » de V54 et du §6.2 P mélangeait deux régimes** :
+   17,4 s de warm-up du premier token décodé, puis ~1,6 s par token (≈ 0,6
+   tok/s, 25 ms par couche). Le §6.2 P est corrigé en conséquence ci-dessous.
+3. Les traces en intervalle 8 (`thinking-long`, `wiredlimit85000`) montrent
+   2-3 ms par couche pour les couches **sans** `eval` : c'est le coût CPU de
+   construction du graphe Swift/MLX par couche (≈ 120 ms par token sur 48
+   couches, réel mais secondaire). Le reste du temps (jusqu'à 19 s par token
+   dans ces runs) est passé **dans `eval`, CPU à 93-98 %, GPU à 0-1 %**.
+
+Ce qui est écarté par lecture du code, pas par supposition :
+- P2(a) « boucle Swift sur les experts » : `Qwen4ExpSparseMoE` passe par
+  `SwitchGLU` upstream (`gatherQMM`) ; le patch Vendor de `SwitchLayers.swift`
+  n'ajoute que des initialiseurs empaquetés.
+- GDN : kernel Metal `gatedDeltaUpdate` upstream, l'escape hatch
+  `MLX_GDN_KERNEL=0` du patch Vendor n'est pas activé.
+- Aucun op sur stream CPU hors chargement (`stream: .cpu` uniquement dans
+  `loadArraysAndMetadata`) ; le `dequantize → float32` du loader ne sert qu'à
+  l'oracle E3, pas au chemin résident.
+
+Restent deux hypothèses, non exclusives, qu'un seul run court départage :
+
+- **H-A (dominante, à confirmer) — pagination et décompression.** Le process
+  résident pèse 76,4 Go (MLX actif 75,2 Go, trace V54). MLX **ne wire aucun
+  buffer par défaut** : `wired_limit_{0}` dans `MetalAllocator`
+  (`allocator.h:70`), et rien dans le code n'appelle `mlx_set_wired_limit`.
+  Le `sysctl iogpu.wired_limit_mb=85000` de V54 ne pouvait donc **rien
+  changer** (il relève un plafond que personne n'utilise) : le « aucun effet »
+  observé était attendu. Conséquence : 76 Go de pages anonymes non wirées +
+  la mémoire réelle des autres apps (mesurée ce jour à ~27 Go : 18,3 Go
+  anonymes + 6,7 Go dans le compresseur + 2,3 Go de swap, machine au repos
+  sans Flash-Next) + 4,5 Go wirés par le noyau ≈ 108 Go > 96 Go. macOS
+  compresse donc les pages froides — et 98 % des experts sont froids à chaque
+  token (10 experts routés sur 512 par couche). Chaque token touche des pages
+  compressées → fautes de page + décompression, comptées en temps CPU du
+  thread MLX, mono-thread, GPU en attente. Cette hypothèse explique à elle
+  seule : CPU 100 % un cœur, GPU 0 %, la variance de 89 s à 1 436 s entre
+  runs identiques (elle dépend de l'état du compresseur au moment du run), le
+  warm-up de 17 s au premier token, et les deux kills du 2026-09-07.
+- **H-B — coût CPU intrinsèque du chemin Swift/MLX.** Mesuré : 2-3 ms par
+  couche de graphe + la couche 1 (PLE n-gram) à 59-69 ms par token (lookup
+  hôte `asArray` + lectures mmap sur le Lexar, 52 % de hits, 1 608 misses
+  sur 8 tokens). Réel, mais insuffisant pour expliquer 25 ms par couche sur
+  les 46 autres couches.
+
+### R1 — Point 1 : oui, avancer un P **borné** avant G-8, avec ce protocole
+
+Dérogation à §6.1 point 1 accordée, parce que H6.1 (200 tokens) est de toute
+façon impossible tant que H-A n'est pas neutralisée (kill ou plusieurs heures)
+et que le correctif probable est peu coûteux. Le P complet reste après G-8 ;
+seules les tâches suivantes passent devant, **dans cet ordre, une journée
+machine au plus** :
+
+| # | Tâche | Critère |
+|---|---|---|
+| P0 | **Micro-bench synthétique sans checkpoint** (zéro risque mémoire, zéro Lexar). Nouvelle commande CLI `flash-layer-bench` : construire une couche GDN+MoE et une couche QSA+MoE aux dimensions réelles (hidden 2 560, 512 experts dim 640, 4 flux, 4-bit g32) avec des poids aléatoires **directement empaquetés** (le test « Les modules Flash-Next peuvent naître directement empaquetés » montre comment), 1 token, 20 pas de warm-up puis 200 pas, `eval` à chaque pas, compteurs `Utilization`/`Memory` du profiler activés, `--trace`. Rapporter ms/pas médian par type de couche et CPU/GPU moyens. | Verdict écrit dans `log.md` : **≤ 5 ms/couche et GPU > 30 %** ⇒ le chemin de calcul est sain, H-A domine, passer à P1. **≥ 15 ms/couche et GPU ≈ 0** ⇒ H-B domine : `sample <pid> 10 -file results/p0-sample.txt` pendant le bench, corriger sur le bench (pas de run résident) avant P1 |
+| P1 | **Un seul run résident court** : `flash-chat-probe $FLASH --prompt <référence> --max-new-tokens 6 --trace results/p1.trace.json` (6 tokens : le régime établi commence au 3ᵉ, un run de 200 tokens n'apprendrait rien de plus). Préconditions : `Scripts/preflight-resident.sh` = OK (R3), `Scripts/sample-system.sh results/p1-system.tsv &` lancé avant, et **pendant les tokens 3-6** : `sample $(pgrep -x qwen38) 10 -file results/p1-sample.txt`. Analyse : `Scripts/trace-layers.py results/p1.trace.json`. | Trois chiffres consignés : ms/couche en régime établi, GPU %, et dans `p1-sample.txt` la part des frames `vm_fault`/`_vm_page_decompress`/`kernel` vs `mlx::core`/Swift. **> 50 % noyau ⇒ H-A confirmée**, sinon H-B |
+| P2-mem | Si H-A : (1) wirer les poids résidents après le chargement : `mlx_set_wired_limit` via l'API `WiredMemoryManager`/`Memory` de mlx-swift 0.31.6 (`Source/MLX/WiredMemory.swift`, `Memory.swift:312`) à ~78 Go, dans `Qwen38FlashNextEngine` après `Qwen4ExpStreamingTextModel` ; cela **exige** `sudo sysctl iogpu.wired_limit_mb=88000` au préalable (l'API refuse toute valeur > `max_recommended_working_set_size`, ≈ 72 Go par défaut ; le sysctl retombe à 0 à chaque reboot, il vaut 0 ce jour) ; (2) rejouer P1 tel quel. Wirer 80 Go sans la précondition R3 ne fait que déplacer la pression sur les autres apps (swap, puis jetsam possible du process) — les deux vont ensemble. | P1 rejoué : ms/couche et GPU % avant/après dans `BENCHMARKS.md` ; objectif de jauge : GPU > 30 %, < 10 ms/couche |
+| P2-code | Si H-B (ou en complément, **après G-8** sinon) : (a) couche 1 : préchauffer les lignes n-gram du prompt et agrandir le LRU (1 608 misses / 8 tokens sur USB) ; (b) coût de graphe 2-3 ms/couche : compter les ops par couche, viser `compile` des sous-blocs stables (hyper-connections, gate MoE) ; (c) `.item()`/`asArray` par token dans `Qwen4ExpPLE.lookup` et le générateur. | mesure sur le bench P0 avant/après, puis P1 |
+
+### R2 — Point 2 : le pic n'a pas dérivé ; le chargement atteint le pic par construction
+
+- `git diff 8f4a7ed..HEAD` sur `Qwen4ExpStreamingDecoder.swift` et
+  `Qwen4ExpStreamingTextModel.swift` : uniquement le paramètre
+  `onLayerVisited` (H4.2). `Qwen4ExpCheckpointLayerLoader.swift` et
+  `Qwen4ExpPLE.swift` sont inchangés depuis la baseline. Aucune dérive de code.
+- Pic mesuré (trace V54) : MLX actif **75,2 Go**, process **76,4 Go** — la
+  fourchette « 79-82 Go » du §6.0 est celle des runs thinking/image (caches
+  plus gros). Le chiffre à retenir pour le budget : **~77 Go de process, ~82
+  Go avec image**.
+- Pourquoi le chargement seul tue : en mode résident, les 48 couches sont
+  matérialisées (`eval(residentWeights)`) **pendant la passe 0**, donc le pic
+  est atteint à la fin du chargement, avant le premier token. Le kill « au
+  chargement » est simplement le moment où 77 Go rencontrent le reste. Avec
+  les ~27 Go réels des autres apps ce jour, le total dépasse 96 Go de ~12 Go :
+  le compresseur monte (27 Go observés par Vincent), puis jetsam.
+- Le « 66 Go déjà utilisés » de l'ASK vient de `top` (« PhysMem used »), qui
+  compte le **cache de fichiers** : ce jour, 67 Go « used » pour 68 Go de
+  pages file-backed (le checkpoint lu la veille), `memory_pressure` à 94 %
+  libre, plus gros process 1 Go. Ce chiffre ne mesure pas la marge ; la bonne
+  mesure est celle de R3.
+- Le checkpoint est **uniformément 4-bit g32** (experts `U32 [512, 640, 320]`
+  + scales `[512, 640, 80]`, n-gram `[2 500 012, 20]` + `[.., 5]`) : experts
+  77,1 Go (61,7 packés + 15,4 scales/biases), n-gram 32,0 Go, reste 4,1 Go.
+  Le pic résident de ~77 Go est intrinsèque à ce quant : il n'y a pas de
+  « fuite » à chercher dans le loader. Entrée pour G-4bis : une quant maison
+  4-bit **g64** ne gagnerait que ~11 Go (scales) ; seul un passage des
+  experts en **3-bit g64** (≈ 54 Go d'experts) ramène le pic sous ~60 Go et
+  le checkpoint sous 88 Go, avec un risque qualité à mesurer par Q-B.
+
+### R3 — Point 3 : checklist « avant tout run résident », chiffrée
+
+Remplace la vérification qualitative du §6.0 par `Scripts/preflight-resident.sh`
+(committé avec cette réponse), qui refuse le run tant que :
+
+- **mémoire anonyme + pages stockées dans le compresseur + swap utilisé >
+  9 Go** (dérivation : 96 − 77 process − 4,5 noyau wired − ~5 marge ≈ 9,5 ;
+  seuil ajustable par `QWEN38_PREFLIGHT_LIMIT_GB`, à porter à **5 Go** pour
+  un run avec image, pic 82 Go). Ce jour : 27,3 Go → REFUS, conforme aux deux
+  kills.
+- checkpoint absent (Lexar non monté) ; et il affiche `iogpu.wired_limit_mb`,
+  le GPU % instantané et les process `qwen38`/python déjà actifs.
+
+En pratique, atteindre 9 Go impose de fermer Arc, Teams, ChatGPT/Codex,
+Xcode et toutes les sessions Claude sauf celle qui pilote — le mode résident
+4-bit de ce checkpoint n'est viable que sur une machine dédiée au run. Le
+sampler `Scripts/sample-system.sh` (toutes les 2 s : anonyme, compresseur,
+décompressions, pageins, swap, GPU %, RSS qwen38) doit tourner pendant le
+run : si le compresseur dépasse 4 Go pendant le chargement, arrêter le run
+soi-même (`kill -INT`) avant que macOS ne le fasse. Les deux chiffres
+`Decompressions` et `Pageins` sont cumulatifs ; leur delta par intervalle en
+régime établi est la mesure directe de H-A.
+
+### R4 — Point 4 : ordre après P0/P1
+
+1. **P0 immédiatement** (aucun risque, ~1 h de dev, minutes d'exécution).
+2. **P1 une fois le préflight vert** (un run, ~5 min hors chargement).
+3. Si H-A : **P2-mem**, rejouer P1. Si H-B : **P2-code sur le bench P0**
+   jusqu'à < 10 ms/couche, puis P1.
+4. **H6.1-H6.4 dans un seul process résident** pour ne payer les ~100 s de
+   chargement qu'une fois : `qwen38 serve` (H5) + un script de 5 `curl`
+   (H6.1 thinking 200 tokens, H6.2 × 4, H6.3 image, H6.4 deux tours via
+   `conversation_id`), préflight vert et sampler actif. Même sans P2, à
+   ~1,6 s/token le lot H6 tient en ~15 min si H-A est neutralisée par la
+   seule précondition mémoire.
+5. **G-8.** Puis P2-code, P-MTP et §7 selon la décision.
+
+Interdit d'ici là : tout run de qualification de 200 tokens avant le verdict
+P1 ; tout run résident sans préflight vert ; le mode streamed pour autre
+chose qu'une parité (par construction il relit ~80 Go par token depuis le
+Lexar : le ratio ETIME/TIME de 4,5 observé est attendu, ce n'est pas une
+anomalie à investiguer).

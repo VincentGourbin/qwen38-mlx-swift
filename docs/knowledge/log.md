@@ -988,3 +988,26 @@ GATE G-8 (démo GUI + serveur) et G-4bis (quant maison ≤ 70 Go sur SSD interne
 décidée après les mesures P1). Séquence d'exécution : H0 (git, tests,
 baseline 27B) → H1 catalogue → H2 générateur streamé + sampling → H3
 adaptateur runtime → H4 GUI → H5 serveur → H6 qualification → G-8.
+
+## 2026-09-07 — RÉPONSE chantier P : GPU inactif confirmé par les traces, cause première mémoire
+
+Relecture des traces V53/V54 avec `Scripts/trace-layers.py` (nouveau) : en
+régime établi (tokens 3-8) le décodage résident coûte 1,6 s/token, 25 ms par
+couche, **CPU 98 % (un cœur) et GPU 0-5 %** ; le « 28 s / 8 tokens » de V54
+incluait 17 s de warm-up du premier token. Les traces en intervalle 8 donnent
+2-3 ms/couche de construction de graphe, le reste dans `eval` avec GPU 0-1 %.
+Écarté par lecture : boucle Swift sur les experts (`SwitchGLU` upstream),
+GDN sans kernel, ops sur stream CPU. Hypothèse dominante H-A : le process
+résident (76,4 Go, MLX actif 75,2 Go) n'est **pas wiré** (`wired_limit_{0}`
+par défaut dans MLX, personne n'appelle `mlx_set_wired_limit` — le sysctl
+85000 de V54 ne pouvait rien changer) et cohabite avec ~27 Go réels d'autres
+apps (18,3 Go anonymes + 6,7 Go compresseur + 2,3 Go swap mesurés ce jour au
+repos) → compression des experts froids, fautes de page décompressées sur le
+thread MLX. Le « 66 Go used » de `top` est du cache de fichiers (68 Go
+file-backed), pas de la marge. Le checkpoint est uniformément 4-bit g32
+(experts 77,1 Go, n-gram 32,0 Go, reste 4,1 Go) : le pic ~77 Go est
+intrinsèque. Protocole acté : P0 micro-bench synthétique sans checkpoint →
+P1 un run résident de 6 tokens avec `Scripts/preflight-resident.sh` (seuil
+9 Go anonyme+compresseur+swap ; 27,3 Go ce jour = REFUS),
+`Scripts/sample-system.sh` et `sample` CPU → P2-mem (wired limit MLX +
+sysctl 88000) ou P2-code → H6 dans un seul process serveur → G-8.
