@@ -128,7 +128,7 @@ private struct ChatCompletionDelta: Codable, Sendable {
 }
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
-private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded } }
+private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
 private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
@@ -138,6 +138,65 @@ private actor FIFORequestQueue {
     var queuedCount: Int { waiters.count }
     func acquire() async { if !occupied { occupied = true; return }; await withCheckedContinuation { waiters.append($0) } }
     func release() { if let next = waiters.first { waiters.removeFirst(); next.resume() } else { occupied = false } }
+}
+
+/// Sendable-safe "has the first event arrived yet" signal shared between
+/// the stream consumer and the heartbeat ticker in `mergingHeartbeat`.
+private actor Qwen38SSEProgressFlag {
+    private(set) var hasProgressed = false
+    func markProgress() { hasProgressed = true }
+}
+
+enum Qwen38SSEHeartbeatItem: Sendable {
+    case heartbeat
+    case event(Qwen38GenerationEvent)
+}
+
+extension Qwen38InferenceServer {
+    /// H5.3: Flash-Next's first turn can take ~100 s (layer load) + prefill
+    /// before the first real event arrives. This merges `stream` with a
+    /// repeating heartbeat tick that only fires while no event has arrived
+    /// yet (later per-chunk gaps are well under any realistic idle
+    /// timeout), so a caller can turn ticks into an SSE keep-alive comment
+    /// and keep proxies/clients from treating the connection as dead.
+    ///
+    /// The two internal producer tasks only ever touch `continuation`
+    /// (Sendable) and `stream` itself — never the caller's writer, which in
+    /// `ResponseBody { writer in … }` is an `inout` parameter and therefore
+    /// cannot be captured by an escaping/task closure at all. The merged
+    /// stream keeps all actual writes on the caller's single task.
+    fileprivate static func mergingHeartbeat(
+        _ stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>,
+        interval: Duration = .seconds(10)
+    ) -> AsyncThrowingStream<Qwen38SSEHeartbeatItem, Error> {
+        AsyncThrowingStream { continuation in
+            let flag = Qwen38SSEProgressFlag()
+            let eventTask = Task {
+                do {
+                    for try await event in stream {
+                        await flag.markProgress()
+                        continuation.yield(.event(event))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            let heartbeatTask = Task {
+                while await !flag.hasProgressed {
+                    try? await Task.sleep(for: interval)
+                    if Task.isCancelled { return }
+                    if await !flag.hasProgressed {
+                        continuation.yield(.heartbeat)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in
+                eventTask.cancel()
+                heartbeatTask.cancel()
+            }
+        }
+    }
 }
 
 /// OpenAI-compatible LAN transport. One model stays resident and inference is FIFO.
@@ -190,7 +249,7 @@ public actor Qwen38InferenceServer {
     private func serverDidFail(_ error: String) { lastError = error; serverStatus = .failed }
 
     private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count))) }
-    private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { ModelDescription(id: $0, object: "model", ownedBy: "local", loaded: $0 == current) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
+    private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
     private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
 
     private func chatCompletionsResponse(request: Request) async throws -> Response {
@@ -413,15 +472,17 @@ public actor Qwen38InferenceServer {
             var parser = Qwen38ThinkingStreamParser(primedInside: primedInside)
             var responseContent = ""
             do {
-                for try await event in stream {
-                    switch event {
-                    case .chunk(let chunk):
+                for try await item in Self.mergingHeartbeat(stream) {
+                    switch item {
+                    case .heartbeat:
+                        try await writer.write(ByteBuffer(string: ": loading\n\n"))
+                    case .event(.chunk(let chunk)):
                         await self.updateSessionAsync(sessionID, chunk: chunk)
                         let output = parser.append(chunk)
                         responseContent += output.content
                         if !output.reasoning.isEmpty { try await writeDelta(reasoning: output.reasoning) }
                         if !output.content.isEmpty { try await writeDelta(content: output.content) }
-                    case .metrics(let metrics):
+                    case .event(.metrics(let metrics)):
                         await self.completeSessionAsync(sessionID, metrics: metrics)
                         let tail = parser.finish()
                         responseContent += tail.content

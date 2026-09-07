@@ -72,6 +72,55 @@ func serverModelErrorContainsRequestedID() {
     #expect(Qwen38ServerError.modelNotFound("Qwen3.8-27B-8bit").errorDescription?.contains("Qwen3.8-27B-8bit") == true)
 }
 
+private struct ServerTestModelDescription: Decodable {
+    let id: String
+    let family: String?
+    let loaded: Bool
+}
+private struct ServerTestModelListResponse: Decodable { let data: [ServerTestModelDescription] }
+
+@Test("H5.1/H5.4 : /v1/models publie les deux familles d'un catalogue mixte ; un model inconnu échoue")
+func serverModelsEndpointPublishesBothFamilies() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-server-catalog-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let qwen35 = root.appendingPathComponent("Qwen3.8-27B-4bit", isDirectory: true)
+    try FileManager.default.createDirectory(at: qwen35, withIntermediateDirectories: true)
+    try #"{"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],"hidden_size":5120,"num_hidden_layers":64}"#
+        .data(using: .utf8)!.write(to: qwen35.appendingPathComponent("config.json"))
+
+    let flashNext = root.appendingPathComponent("Qwen3.8-Flash-Next-4bit", isDirectory: true)
+    try FileManager.default.createDirectory(at: flashNext, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashNext.appendingPathComponent("config.json"))
+
+    let port = Int.random(in: 20_000 ..< 40_000)
+    let server = Qwen38InferenceServer(runtime: Qwen38Runtime())
+    try await server.start(port: port, modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let (modelsData, modelsResponse) = try await URLSession.shared.data(
+        from: URL(string: "http://127.0.0.1:\(port)/v1/models")!)
+    #expect((modelsResponse as? HTTPURLResponse)?.statusCode == 200)
+    let decoded = try JSONDecoder().decode(ServerTestModelListResponse.self, from: modelsData)
+    let byID = Dictionary(uniqueKeysWithValues: decoded.data.map { ($0.id, $0) })
+    #expect(Set(byID.keys) == ["Qwen3.8-27B-4bit", "Qwen3.8-Flash-Next-4bit"])
+    #expect(byID["Qwen3.8-27B-4bit"]?.family == "qwen3_5")
+    #expect(byID["Qwen3.8-Flash-Next-4bit"]?.family == "qwen4_exp")
+
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": "does-not-exist",
+        "messages": [["role": "user", "content": "salut"]],
+    ])
+    let (_, unknownModelResponse) = try await URLSession.shared.data(for: request)
+    #expect((unknownModelResponse as? HTTPURLResponse).map { (200 ..< 300).contains($0.statusCode) } == false)
+}
+
 @Test("Les options appliquent le contrat KV cache Qwen")
 func generationParametersUseNativeKVQuantization() {
     let options = Qwen38GenerationOptions()
@@ -397,7 +446,7 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func warmUp() -> AsyncStream<Int> { AsyncStream { $0.finish() } }
 
     func generate(
-        prompt: String, imageURLs: [URL], options: Qwen38GenerationOptions
+        prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         AsyncThrowingStream { $0.finish() }
     }

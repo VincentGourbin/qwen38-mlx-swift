@@ -32,7 +32,7 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     func unload()
     func decode(tokenIDs: [Int32]) -> String
     func generate(
-        prompt: String, imageURLs: [URL], options: Qwen38GenerationOptions
+        prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error>
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
@@ -124,7 +124,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     }
 
     public func generate(
-        prompt: String, imageURLs: [URL], options: Qwen38GenerationOptions
+        prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         guard imageURLs.count <= 1 else {
             throw Qwen38FlashNextEngineError.multipleImagesUnsupported
@@ -142,7 +142,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             built = try Qwen4ExpPromptBuilder.buildFirstTurn(
                 tokenizer: tokenizer, configuration: configuration, directory: directory,
                 prompt: prompt, imageURL: imageURLs.first, thinking: options.enableThinking,
-                reasoningEffort: options.reasoningEffort)
+                reasoningEffort: options.reasoningEffort, systemPrompt: systemPrompt)
         }
         hasConversationHistory = true
 

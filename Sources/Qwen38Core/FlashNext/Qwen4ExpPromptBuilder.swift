@@ -46,10 +46,15 @@ public enum Qwen4ExpPromptBuilder {
         prompt: String,
         imageURL: URL?,
         thinking: Bool,
-        reasoningEffort: String = "low"
+        reasoningEffort: String = "low",
+        systemPrompt: String? = nil
     ) throws -> Qwen4ExpBuiltPrompt {
         guard let imageURL else {
-            let messages: [Message] = [["role": "user", "content": prompt]]
+            var messages: [Message] = []
+            if let systemPrompt {
+                messages.append(["role": "system", "content": systemPrompt])
+            }
+            messages.append(["role": "user", "content": prompt])
             let tokenIDs = try tokenizer.applyChatTemplate(
                 messages: messages,
                 tools: nil,
@@ -78,8 +83,10 @@ public enum Qwen4ExpPromptBuilder {
             tokenizer.encode(text: value, addSpecialTokens: false).map(Int32.init)
         }
         let markerCount = embeddings.dim(1)
+        let systemPrefix = systemPrompt.map { encode("<|im_start|>system\n" + $0 + "\n<|im_end|>\n") } ?? []
         let tokenIDs =
-            encode("<|im_start|>user\n")
+            systemPrefix
+            + encode("<|im_start|>user\n")
             + [visionStart]
             + Array(repeating: imageToken, count: markerCount)
             + [visionEnd]

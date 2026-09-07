@@ -721,7 +721,8 @@ public actor Qwen38Runtime {
         if let flashEngine {
             conversationTurnCount += 1
             return try flashEngine.generate(
-                prompt: prompt, imageURLs: imageURLs, options: options)
+                prompt: prompt, systemPrompt: systemPrompt, imageURLs: imageURLs,
+                options: options)
         }
         guard let chatSession else { throw Qwen38RuntimeError.modelNotLoaded }
 
