@@ -1,0 +1,18 @@
+=== tour 1 ===
+Le président de la Chine est
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725]
+TTFT: 91.384s
+prefill: 91.381s
+decode: 390.742s
+couches: 288 visites · load cumulé 469.755s
+=== tour 2 ===
+Le prédécesseur
+prompt tokens: 21
+generated ids: [2229, 163358, 933, 1547, 323, 322]
+TTFT: 91.009s
+prefill: 91.008s
+decode: 336.795s
+couches: 288 visites · load cumulé 416.102s
+MLX mémoire active: 1,09 GB
+MLX mémoire peak: 3,39 GB

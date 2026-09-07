@@ -3,6 +3,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 import Testing
+import Tokenizers
 @testable import Qwen38Core
 @testable import Qwen38Server
 
@@ -1107,6 +1108,78 @@ func qwen4ExpMRoPEPythonFixtureParity() throws {
     #expect(report.maxAbsoluteError["position_ids"] == 0)
     #expect(report.maxAbsoluteError["cos"]! < 1e-5)
     #expect(report.maxAbsoluteError["sin"]! < 1e-5)
+}
+
+@Test("Le générateur streamé Flash-Next égale le greedy, respecte le contrat de flux et la continuation (H2)")
+func qwen4ExpStreamingGeneratorMatchesGreedyAndStreams() async throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
+        return
+    }
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let configuration = try Qwen4ExpConfiguration.load(from: directory)
+    let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+    let stopTokens: Set<Int32> = [
+        configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
+    ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
+
+    let built = try Qwen4ExpPromptBuilder.buildFirstTurn(
+        tokenizer: tokenizer, configuration: configuration, directory: directory,
+        prompt: "Explique en français qui est le président de la Chine et quel est son rôle.",
+        imageURL: nil, thinking: false)
+
+    let model = try Qwen4ExpStreamingTextModel(directory: directory)
+
+    // H2.1 — température 0 égale le greedy oracle, dans le même process.
+    let greedy = Qwen4ExpGreedyGenerator(model: model)
+    let greedyResult = try greedy.generate(
+        promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+        options: .init(maxNewTokens: 8, stopTokenIDs: stopTokens))
+
+    let streaming = Qwen4ExpStreamingGenerator(model: model)
+    var streamedIDs: [Int32] = []
+    for try await event in streaming.generate(
+        promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+        options: .init(
+            maxNewTokens: 8, stopTokenIDs: stopTokens,
+            preset: .custom(temperature: 0, topP: 1, topK: 0))
+    ) {
+        if case .token(let token) = event { streamedIDs.append(token) }
+    }
+    #expect(streamedIDs == greedyResult.tokenIDs)
+
+    // H2.2 — flux : un `.token` par pas, puis un `.finished` avec un décodage mesuré.
+    var shapeTokens: [Int32] = []
+    var finishedSummary: Qwen4ExpGenerationSummary?
+    for try await event in streaming.generate(
+        promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+        options: .init(maxNewTokens: 3, stopTokenIDs: [], preset: .instruct)
+    ) {
+        switch event {
+        case .token(let token): shapeTokens.append(token)
+        case .finished(let summary): finishedSummary = summary
+        }
+    }
+    #expect(shapeTokens.count == 3)
+    #expect(finishedSummary?.tokenIDs.count == 3)
+    #expect((finishedSummary?.decodeTime ?? 0) > 0)
+
+    // H2.3 — tour de continuation : seul le suffixe est retokenisé, les
+    // caches GDN/QSA et l'horloge M-RoPE ne repartent pas de zéro.
+    let continuation = Qwen4ExpPromptBuilder.buildContinuationTurn(
+        tokenizer: tokenizer, prompt: "Et son prédécesseur ?", thinking: false)
+    var continuationTokenCount = 0
+    for try await event in streaming.generate(
+        promptTokenIDs: continuation.tokenIDs,
+        options: .init(
+            maxNewTokens: 8, stopTokenIDs: stopTokens, preset: .instruct,
+            continueConversation: true)
+    ) {
+        if case .finished(let summary) = event {
+            continuationTokenCount = summary.promptTokenCount
+        }
+    }
+    #expect(continuationTokenCount == continuation.tokenIDs.count)
+    #expect(continuationTokenCount < built.tokenIDs.count)
 }
 
 @Test("La parité vision relit le checkpoint réel quand elle est demandée")

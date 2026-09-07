@@ -32,6 +32,7 @@ struct Qwen38CLI: AsyncParsableCommand {
             FlashNGramParity.self,
             FlashTeacherForcedScore.self,
             FlashMTPProbe.self,
+            FlashChatProbe.self,
             Generate.self, MTPProbe.self, MTPParity.self,
             MTPConversationProbe.self,
             ConversationBenchmark.self,
@@ -721,6 +722,190 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         }
         print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
         if let profileSession {
+            print(profileSession.generateReport())
+            if let trace { print("trace profiler: \(trace)") }
+        }
+    }
+}
+
+struct FlashChatProbe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "flash-chat-probe",
+        abstract:
+            "Discuter avec Flash-Next en streaming (générateur H2 : sampling, multi-tour, mesures)")
+
+    @Argument(help: "Répertoire local du checkpoint qwen4_exp")
+    var modelPath: String
+
+    @Option(name: .long, help: "Prompt utilisateur du premier tour")
+    var prompt: String
+
+    @Option(name: .long, help: "Prompt utilisateur du second tour, en continuation (optionnel)")
+    var secondPrompt: String?
+
+    @Option(name: .long, help: "Image locale optionnelle à joindre au premier tour")
+    var image: String?
+
+    @Option(name: .long, help: "Preset d'échantillonnage : thinking ou instruct")
+    var preset: String = "instruct"
+
+    @Option(name: .long, help: "Température (avec --top-p/--top-k, surcharge le preset)")
+    var temperature: Float?
+
+    @Option(name: .long, help: "Top-p (avec --temperature/--top-k, surcharge le preset)")
+    var topP: Float?
+
+    @Option(name: .long, help: "Top-k (avec --temperature/--top-p, surcharge le preset)")
+    var topK: Int?
+
+    @Flag(name: .long, help: "Insérer le préfixe thinking dans le prompt")
+    var thinking = false
+
+    @Option(name: .long, help: "Nombre maximum de nouveaux tokens par tour")
+    var maxNewTokens: Int = 256
+
+    @Flag(
+        name: .long,
+        help: "Conserver toutes les couches Flash-Next en mémoire entre les tokens (expérimental)")
+    var residentLayers = false
+
+    @Option(
+        name: .long,
+        help: "Évaluer le graphe résident toutes les N couches (défaut: 1)")
+    var residentEvalInterval = 1
+
+    @Option(name: .long, help: "Écrire une trace Chrome/Perfetto à ce chemin")
+    var trace: String?
+
+    func run() async throws {
+        guard maxNewTokens > 0 else {
+            throw ValidationError("--max-new-tokens doit être positif")
+        }
+        guard residentEvalInterval > 0 else {
+            throw ValidationError("--resident-eval-interval doit être positif")
+        }
+        let samplingPreset: Qwen4ExpSamplingPreset
+        if temperature != nil || topP != nil || topK != nil {
+            samplingPreset = .custom(
+                temperature: temperature ?? 0.7, topP: topP ?? 0.80, topK: topK ?? 20)
+        } else {
+            switch preset {
+            case "thinking": samplingPreset = .thinking
+            case "instruct": samplingPreset = .instruct
+            default: throw ValidationError("--preset doit être 'thinking' ou 'instruct'")
+            }
+        }
+
+        let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+        let configuration = try Qwen4ExpConfiguration.load(from: directory)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+        // See FlashGenerateProbe: touch the Metal device before enabling
+        // profiler phases on a fresh CLI process.
+        _ = Device.defaultDevice()
+        let profiler = MLXProfiler.shared
+        let profileSession: ProfilingSession?
+        if trace != nil {
+            let session = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
+            session.title = "QWEN3.8 FLASH-NEXT CHAT PROBE"
+            session.metadata["model"] = directory.lastPathComponent
+            session.metadata["preset"] = preset
+            session.metadata["thinking"] = thinking ? "true" : "false"
+            profiler.activeSession = session
+            profiler.enable()
+            profileSession = session
+        } else {
+            profileSession = nil
+        }
+        defer {
+            if let profileSession {
+                profiler.disable()
+                if let trace {
+                    try? ChromeTraceExporter.export(session: profileSession).write(
+                        to: URL(fileURLWithPath: trace))
+                }
+            }
+        }
+
+        let stopTokens: Set<Int32> = [
+            configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
+        ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
+
+        profiler.start("Flash globals")
+        let model = try Qwen4ExpStreamingTextModel(
+            directory: directory,
+            layerLoadingMode: residentLayers ? .resident : .streamed,
+            residentEvaluationInterval: residentEvalInterval)
+        profiler.end("Flash globals")
+        let generator = Qwen4ExpStreamingGenerator(model: model)
+
+        func runTurn(label: String, promptText: String, imageURL: URL?, continueConversation: Bool)
+            async throws
+        {
+            let built: Qwen4ExpBuiltPrompt
+            if continueConversation {
+                built = Qwen4ExpPromptBuilder.buildContinuationTurn(
+                    tokenizer: tokenizer, prompt: promptText, thinking: thinking)
+            } else {
+                built = try Qwen4ExpPromptBuilder.buildFirstTurn(
+                    tokenizer: tokenizer, configuration: configuration, directory: directory,
+                    prompt: promptText, imageURL: imageURL, thinking: thinking)
+            }
+            print("=== \(label) ===")
+            var generatedIDs: [Int32] = []
+            for try await event in generator.generate(
+                promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+                visionEmbeddings: built.visionEmbeddings, imageTokenID: built.imageTokenID,
+                options: .init(
+                    maxNewTokens: maxNewTokens, stopTokenIDs: stopTokens, preset: samplingPreset,
+                    continueConversation: continueConversation)
+            ) {
+                switch event {
+                case .token(let token):
+                    generatedIDs.append(token)
+                    print(
+                        tokenizer.decode(tokens: [Int(token)], skipSpecialTokens: false),
+                        terminator: "")
+                    fflush(stdout)
+                case .finished(let summary):
+                    print("")
+                    print("prompt tokens: \(summary.promptTokenCount)")
+                    print("generated ids: \(generatedIDs)")
+                    print("TTFT: \(summary.timeToFirstToken.map { String(format: "%.3fs", $0) } ?? "-")")
+                    print("prefill: \(String(format: "%.3fs", summary.prefillTime))")
+                    print("decode: \(String(format: "%.3fs", summary.decodeTime))")
+                    print(
+                        "couches: \(summary.layerVisitCount) visites · load cumulé \(String(format: "%.3fs", summary.layerLoadTime))"
+                    )
+                    if let profileSession {
+                        profileSession.metadata["\(label)_prompt_tokens"] = String(
+                            summary.promptTokenCount)
+                        profileSession.metadata["\(label)_generated_ids"] = generatedIDs.map(
+                            String.init
+                        ).joined(separator: ",")
+                    }
+                }
+            }
+        }
+
+        try await runTurn(
+            label: "tour 1", promptText: prompt,
+            imageURL: image.map { URL(fileURLWithPath: $0) }, continueConversation: false)
+        if let secondPrompt {
+            try await runTurn(
+                label: "tour 2", promptText: secondPrompt, imageURL: nil,
+                continueConversation: true)
+        }
+
+        print("MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))")
+        print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
+        let ngramCacheStats = model.ngramCacheStats()
+        if let profileSession {
+            profileSession.metadata["ngram_cache_hits"] = String(ngramCacheStats.hits)
+            profileSession.metadata["ngram_cache_misses"] = String(ngramCacheStats.misses)
+            profileSession.metadata["ngram_cache_entries"] = String(ngramCacheStats.entries)
+            profileSession.metadata["ngram_cache_hit_rate"] = ngramCacheStats.hitRate.map {
+                String(format: "%.4f", $0)
+            } ?? "n/a"
             print(profileSession.generateReport())
             if let trace { print("trace profiler: \(trace)") }
         }
