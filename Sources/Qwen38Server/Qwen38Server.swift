@@ -72,6 +72,23 @@ public enum Qwen38ModelCatalog {
         }
         return result
     }
+
+    /// Sum of the `*.safetensors` file sizes below `url`, read from file
+    /// attributes only — never opens or parses the weights.
+    public static func sizeOnDisk(_ url: URL) -> Int64 {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]) else { return 0 }
+        var total: Int64 = 0
+        for entry in entries {
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true,
+                  entry.pathExtension == "safetensors" else { continue }
+            let size = (try? entry.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            total += Int64(size)
+        }
+        return total
+    }
 }
 
 private struct ChatCompletionRequest: Codable, Sendable {

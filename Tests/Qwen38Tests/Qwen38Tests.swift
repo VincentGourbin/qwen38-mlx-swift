@@ -37,14 +37,33 @@ func serverModelCatalogFiltersDirectories() throws {
 
     let valid = root.appendingPathComponent("Qwen3.8-27B-4bit", isDirectory: true)
     let invalid = root.appendingPathComponent("not-a-model", isDirectory: true)
+    let flashNext = root.appendingPathComponent("Qwen3.8-Flash-Next-4bit", isDirectory: true)
     try FileManager.default.createDirectory(at: valid, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: invalid, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: flashNext, withIntermediateDirectories: true)
     try #"{"model_type":"qwen3_5"}"#.data(using: .utf8)!.write(to: valid.appendingPathComponent("config.json"))
-    try #"{"model_type":"qwen4_exp"}"#.data(using: .utf8)!.write(to: invalid.appendingPathComponent("config.json"))
+    try #"{"model_type":"not-qwen"}"#.data(using: .utf8)!.write(to: invalid.appendingPathComponent("config.json"))
+    let flashNextData = try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+    try flashNextData.write(to: flashNext.appendingPathComponent("config.json"))
 
     let catalog = Qwen38ModelCatalog.discover(in: root)
-    #expect(Array(catalog.keys) == ["Qwen3.8-27B-4bit"])
+    #expect(Set(catalog.keys) == ["Qwen3.8-27B-4bit", "Qwen3.8-Flash-Next-4bit"])
     #expect(catalog["Qwen3.8-27B-4bit"]?.lastPathComponent == "Qwen3.8-27B-4bit")
+    #expect(catalog["Qwen3.8-Flash-Next-4bit"]?.lastPathComponent == "Qwen3.8-Flash-Next-4bit")
+}
+
+@Test("La taille sur disque somme les fichiers safetensors sans les lire")
+func modelCatalogSizeOnDiskSumsSafetensorsFiles() throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-size-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try Data(count: 1_000).write(to: root.appendingPathComponent("model-00001-of-00002.safetensors"))
+    try Data(count: 2_500).write(to: root.appendingPathComponent("model-00002-of-00002.safetensors"))
+    try Data(count: 42).write(to: root.appendingPathComponent("config.json"))
+
+    #expect(Qwen38ModelCatalog.sizeOnDisk(root) == 3_500)
 }
 
 @Test("L'erreur de modèle conserve l'identifiant demandé")
@@ -263,18 +282,15 @@ func validatesNestedQwen35Config() throws {
     #expect(info.numHiddenLayers == 64)
 }
 
-@Test("Le contrat de configuration Flash-Next lit les invariants qwen4_exp")
-func validatesQwen4ExpConfiguration() throws {
-    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("qwen4-exp-test-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
-
+/// Fixture réutilisée par les tests de configuration et de validateur
+/// Flash-Next : un `config.json` `qwen4_exp` minimal mais complet (tous les
+/// invariants de `Qwen4ExpConfiguration.validate()` satisfaits).
+private func qwen4ExpFixtureConfig() -> [String: Any] {
     let layerTypes = Array(repeating: "linear_attention", count: 3)
         + ["full_attention"]
         + Array(repeating: "linear_attention", count: 3)
         + ["full_attention"]
-    let config: [String: Any] = [
+    return [
         "model_type": "qwen4_exp",
         "architectures": ["Qwen4ExpForConditionalGeneration"],
         "text_config": [
@@ -320,8 +336,21 @@ func validatesQwen4ExpConfiguration() throws {
             "out_hidden_size": 2560
         ]
     ]
-    let data = try JSONSerialization.data(withJSONObject: config)
+}
+
+private func writeQwen4ExpFixtureDirectory(named prefix: String) throws -> URL {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let data = try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
     try data.write(to: directory.appendingPathComponent("config.json"))
+    return directory
+}
+
+@Test("Le contrat de configuration Flash-Next lit les invariants qwen4_exp")
+func validatesQwen4ExpConfiguration() throws {
+    let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-test")
+    defer { try? FileManager.default.removeItem(at: directory) }
 
     let decoded = try Qwen4ExpConfiguration.load(from: directory)
     #expect(decoded.modelType == "qwen4_exp")
@@ -329,6 +358,29 @@ func validatesQwen4ExpConfiguration() throws {
     #expect(decoded.textConfiguration.layerTypes[3] == .fullAttention)
     #expect(decoded.textConfiguration.splitNgramParts == 128)
     #expect(decoded.visionConfiguration.outHiddenSize == 2560)
+}
+
+@Test("Le validator accepte la famille qwen4_exp sur un checkpoint complet")
+func validatesQwen4ExpFamilyThroughModelValidator() throws {
+    let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-validator-test")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let info = try Qwen38ModelValidator.validate(directory)
+    #expect(info.family == .qwen4Exp)
+    #expect(info.modelType == "qwen4_exp")
+}
+
+@Test("Le validator refuse un model_type qwen3 non reconnu")
+func validatorRejectsUnknownQwen3ModelType() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen3-unknown-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try #"{"model_type":"qwen3"}"#.data(using: .utf8)!.write(to: directory.appendingPathComponent("config.json"))
+
+    #expect(throws: Qwen38ModelValidationError.unsupportedModelType("qwen3")) {
+        try Qwen38ModelValidator.validate(directory)
+    }
 }
 
 @Test("Le mergeur Flash remplace uniquement les marqueurs image")

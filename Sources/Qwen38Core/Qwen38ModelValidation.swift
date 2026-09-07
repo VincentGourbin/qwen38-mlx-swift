@@ -15,11 +15,18 @@ public enum Qwen38ModelValidationError: LocalizedError, Equatable {
     }
 }
 
+public enum Qwen38ModelFamily: String, Sendable, Equatable, Codable {
+    case qwen35 = "qwen3_5"
+    case qwen4Exp = "qwen4_exp"
+}
+
 public struct Qwen38ModelInfo: Decodable, Sendable, Equatable {
     public let modelType: String
     public let architecture: String?
     public let hiddenSize: Int?
     public let numHiddenLayers: Int?
+
+    public var family: Qwen38ModelFamily? { Qwen38ModelFamily(rawValue: modelType) }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -68,8 +75,11 @@ public enum Qwen38ModelValidator {
 
     public static func validate(_ directory: URL) throws -> Qwen38ModelInfo {
         let info = try readInfo(from: directory)
-        guard info.modelType == "qwen3_5" else {
+        guard let family = info.family else {
             throw Qwen38ModelValidationError.unsupportedModelType(info.modelType)
+        }
+        if family == .qwen4Exp {
+            try Qwen4ExpConfiguration.load(from: directory).validate()
         }
         return info
     }
