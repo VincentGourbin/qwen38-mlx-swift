@@ -1,0 +1,9 @@
+Chargement de /Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit…
+Drafter MTP local : absent
+The user is asking me to explain in French who is the president of China and
+
+--- Metrics ---
+Prefill: 101 tok/s (57 tok) | Gen: 13.0 tok/s (16 tok)
+TTFT réel: 594.4 ms
+Prefill modèle: 562.0 ms
+Stop: length
