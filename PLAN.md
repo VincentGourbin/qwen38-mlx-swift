@@ -3493,3 +3493,38 @@ P1 ; tout run résident sans préflight vert ; le mode streamed pour autre
 chose qu'une parité (par construction il relit ~80 Go par token depuis le
 Lexar : le ratio ETIME/TIME de 4,5 observé est attendu, ce n'est pas une
 anomalie à investiguer).
+
+### P0 exécuté — verdict et correction de trajectoire — 2026-09-07 (soir)
+
+Bench synthétique livré (`flash-layer-bench`, commit `9ebb35a`) et rejoué en
+**Release** (détail dans `docs/knowledge/log.md`, entrée « P0 rejoué en
+Release ») :
+
+| Couche | Debug, calcul seul | Release, calcul seul | GPU |
+|---|---|---|---|
+| GDN + MoE | 6,5 ms | **5,5 ms** | ~10 % |
+| QSA + MoE | 10,3 ms | **5,8 ms** | ~10 % |
+
+`sample` CPU sur le bench : aucune faute de page, temps passé dans le
+bookkeeping hôte de MLX (`eval_impl`, caches de buffers/pipelines,
+`Concatenate` → `copy_gpu_inplace`, refcounting). Deux faits nouveaux
+changent la lecture de la RÉPONSE ci-dessus :
+
+1. **Tous les runs depuis le 29 août étaient des builds Debug** (défaut de
+   `Scripts/build.sh`) : C++ de MLX non optimisé. Release divise le coût hôte
+   par ~1,2 (GDN) à ~1,8 (QSA).
+2. **Le profiler coûte ≈ 4,7 ms par phase** (IOKit + rusage à chaque
+   `start`/`end`), soit ~225 ms par token dans les traces résidentes qui
+   enveloppent chaque couche. Les « 22-28 ms/couche » de V54 en contiennent
+   ~5 ; le reliquat (Debug) est cohérent avec le bench. **H-B (coût hôte)
+   est majoritaire ; H-A (mémoire) n'est plus qu'un reliquat à mesurer.**
+
+Conséquences immédiates (remplacent l'ordre R4 pour les points 1-3) :
+
+| # | Tâche | Critère |
+|---|---|---|
+| P0-b | `Scripts/build.sh` : le défaut reste Debug pour les tests ; ajouter `Scripts/build-release.sh` (wrapper `QWEN38_CONFIGURATION=Release`) et faire pointer les probes/H6/G-8 sur `.xcodebuild/Build/Products/Release/qwen38`. Documenter dans `PLAN.md` §6.2 conventions et dans le README. | binaire Release à jour, GUI et CLI |
+| P0-c | Profiler par couche **opt-in** : dans `Qwen4ExpStreamingDecoder.forward`, n'appeler `profiler.start/end("Flash couche N")` que si un flag (`Qwen4ExpStreamingDecoder.profileLayers`, défaut `false`, activé par `--profile-layers` en CLI) est levé ; garder les phases `Prefill`/`Generation` et les compteurs n-gram. | bench P0 et trace résidente sans phase par couche : `--trace` ne coûte plus ~225 ms/token |
+| P2-code | Sur le bench P0 (Release, sans checkpoint, boucle de minutes) : (a) compter les ops par pas (nombre d'appels `eval_gpu` via `sample` ou instrumentation) ; (b) `MLX.compile` du forward de couche (entrées : hidden 4 flux, cache) si les formes sont stables en décodage ; (c) supprimer les `concatenated`/`split` des 4 flux hyper-connections (vues sur un seul tenseur) ; (d) `asyncEval` : lancer la couche N+1 pendant que le GPU exécute N, un seul `eval` par token, à re-mesurer en Release (le verdict V54 sur l'intervalle 8 est contaminé par Debug + profiler + mémoire). Jauge : **≤ 2 ms/couche, GPU ≥ 40 %** sur le bench. | tableau avant/après par levier dans `log.md` |
+| P1 | Inchangé (préflight vert obligatoire), mais en **Release** et avec `--profile-layers` désactivé : mesure du reliquat H-A par le sampler (`Decompressions`/`Pageins` par intervalle) et `sample` CPU (part `vm_fault`). | verdict chiffré H-A |
+| Suite | P2-mem seulement si P1 montre > 20 % du temps en fautes de page ; puis H6 en un seul process serveur (Release) ; puis G-8. | — |

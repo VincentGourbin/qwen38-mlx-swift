@@ -1107,3 +1107,39 @@ Fichiers : `Sources/Qwen38Core/FlashNext/Qwen4ExpLayerBench.swift`,
 `qwen4ExpLayerBenchMeasuresPositiveDurations` (dimensions réduites, P0
 `Tests/Qwen38Tests/Qwen38Tests.swift`), traces
 `results/p0-layer-bench.trace.json` et `results/p0-sample.txt`.
+
+## 2026-09-07 — P0 rejoué en Release : le build Debug doublait le coût hôte ; le profiler ajoute ~4,7 ms par phase
+
+Même bench (`flash-layer-bench --trace results/p0-layer-bench-release.trace.json`)
+avec le binaire construit par `QWEN38_CONFIGURATION=Release Scripts/build.sh`
+(`.xcodebuild/Build/Products/Release/qwen38`) :
+
+| Couche | ms/pas (horloge interne) | ms/pas (phase profiler) | CPU % | GPU % (profiler) |
+|---|---|---|---|---|
+| GDN | **5,52** (Debug : 6,46) | 10,20 (Debug : 11,20) | 17 (interne) / 99,8 (phase) | 10,2 |
+| QSA | **5,79** (Debug : 10,33) | 10,43 (Debug : 15,12) | 28 / 99,4 | 10,4 |
+
+Échantillon `ioreg` pendant le run : 0 % sur 22 échantillons sur 40, pics
+isolés à 18-51 %. Deux enseignements :
+
+1. **Tout ce qui a été mesuré depuis le 29 août l'a été en Debug** (défaut
+   de `Scripts/build.sh`, C++ de MLX compilé sans optimisation). En Release,
+   le coût hôte d'une couche QSA passe de 10,3 à 5,8 ms, GDN de 6,5 à 5,5 ms.
+2. **Chaque paire `profiler.start`/`.end` coûte ≈ 4,7 ms** (`beginPhase`
+   → `SystemMetrics.gpuUtilization()` via IOKit + `processCPUTime` + mémoire,
+   à chaque frontière de phase). `Qwen4ExpStreamingDecoder.forward` enveloppe
+   chaque couche : sur 48 couches, **~225 ms par token** de pur profiler dans
+   tous les runs résidents tracés. Les « 22-28 ms/couche » de la trace V54
+   contiennent donc ~5 ms de profiler ; le reste (~17-23 ms, Debug) est
+   cohérent avec les 6,5-10,3 ms de calcul hôte Debug du bench plus la part
+   mémoire/n-gram. **H-B est majoritaire ; H-A n'est plus qu'un reliquat à
+   mesurer en P1, en Release et sans phase par couche.**
+
+Reste, même en Release : 5,5-5,8 ms hôte par couche pour ~0,5 ms de GPU
+(GPU 10 %). C'est le coût MLX par op (refcounting, caches de buffers,
+`Concatenate`/`copy_gpu_inplace`) multiplié par un grand nombre de petits ops
+par couche. Plafond actuel : 48 × 5,6 ≈ 270 ms/token ≈ 3,7 tok/s avant tout
+autre effet. Levier suivant (P2-code, sur ce bench, sans checkpoint) :
+compter les ops par couche, `compile` des sous-graphes stables, éliminer les
+concaténations des 4 flux, et pipeliner (`asyncEval`) au lieu d'un `eval`
+bloquant par couche.
