@@ -1214,6 +1214,35 @@ func qwen4ExpMRoPEPythonFixtureParity() throws {
     #expect(report.maxAbsoluteError["sin"]! < 1e-5)
 }
 
+@Test("H6.5 : garde de régression Q-B teacher-forcée sur la séquence V32")
+func flashTeacherForcedRegressionGuardV32() throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
+        return
+    }
+    // Prompt de référence rendu (thinking désactivé) + suffixe ChatML
+    // assistant, exactement la séquence scorée par
+    // Scripts/qwen4-exp-official-teacher-forced.py --norm-shift -1 en V32
+    // (2026-09-02) : "Explique en français qui est le président de la
+    // Chine et quel est son rôle." → 10/28 hits, logprob moyen -4,426.
+    // Le premier ID sert uniquement de contexte (non scoré), les 28
+    // suivants sont prédits en teacher-forcing — même découpage que le
+    // script Python (predict token i+1 from tokens[0...i]).
+    let sequence: [Int32] = [
+        248_045, 846, 198, 42_498, 2295, 644, 52_543, 7528, 1725, 501, 85_648, 401, 1147,
+        183_085, 1778, 24_232, 1725, 4292, 176_517, 13, 248_046, 198, 248_045, 74_455, 198,
+        248_068, 271, 248_069, 271,
+    ]
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let model = try Qwen4ExpStreamingTextModel(directory: directory)
+    let score = try model.scoreTeacherForced(
+        promptTokenIDs: [sequence[0]],
+        continuationTokenIDs: Array(sequence.dropFirst()))
+    let hits = score.tokens.filter { $0.tokenID == $0.argmaxTokenID }.count
+    #expect(score.continuationTokenCount == 28)
+    #expect(hits >= 10)
+    #expect(score.meanLogProbability >= -4.5)
+}
+
 @Test("Le générateur streamé Flash-Next égale le greedy, respecte le contrat de flux et la continuation (H2)")
 func qwen4ExpStreamingGeneratorMatchesGreedyAndStreams() async throws {
     guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
