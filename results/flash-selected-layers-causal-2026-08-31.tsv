@@ -1,0 +1,2 @@
+fixture	layers	mask	maxRebasedRelativeRMSError	worstRebasedLayer	pythonTopToken	swiftTopToken	tokensMatch	mixerPythonInputRelativeRMSError	logitsPythonInputRelativeRMSError	status
+flash-quality-layers-0-47-causal.safetensors	0-47	causal	0.03848331	31	332	917	false	0.00128178	0.00211275	4-bit-chain-drift-quality-gate-closed

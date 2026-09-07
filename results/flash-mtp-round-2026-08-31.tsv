@@ -1,0 +1,2 @@
+checkpoint	promptTokens	blockSize	draftTokens	targetTokens	accepted	correction	rollback	replayTokens	drafterOffset	durationSeconds	status
+Qwen3.8-Flash-Next-MLX-4bit-MTP	22	2	19	25,15	0	25	yes	1	23	335.491	real-round-completed

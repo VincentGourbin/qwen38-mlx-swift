@@ -1,0 +1,4 @@
+model	mtp_requested	turn	input	prompt_tokens	generated_tokens	ttft_ms	prefill_tok_s	decode_tok_s	active_memory_mb	peak_memory_mb	cache_reused	conversation_replayed	mtp_availability	mtp_block_size	mtp_proposed	mtp_accepted	mtp_rounds	mtp_accept_rate
+Qwen3.8-27B-bf16	0	1	Texte + 1 image	1279	1	10665.9	120.56	2451.38	53222.0	54133.1	0	0	unavailable	0	0	0	0	-
+Qwen3.8-27B-bf16	0	2	Texte	1302	1	10630.5	122.77	9998.34	53223.1	54365.7	1	0	unavailable	0	0	0	0	-
+Qwen3.8-27B-bf16	0	3	Texte	1331	1	10761.9	123.97	6497.76	53224.0	54366.7	1	0	unavailable	0	0	0	0	-

@@ -1,0 +1,4 @@
+mode	promptTokens	maxNewTokens	ttftSeconds	prefillSeconds	decodeSeconds	mlxActiveGB	mlxPeakGB	generated	status
+resident	23	1	136.106	136.089	0.018	111.14	111.56	47106	completed-too-much-memory
+streamed	23	1	121.846	121.844	0.002	0.9772	34.49	47106	completed-baseline
+resident	23	2	na	na	na	na	na	na	aborted-memory-pressure

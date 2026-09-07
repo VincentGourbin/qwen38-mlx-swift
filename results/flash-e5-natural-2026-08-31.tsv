@@ -1,0 +1,4 @@
+prompt	fixtureTokens	pythonMargin	pythonTop	swiftTop	firstSensitiveLayer	mixerRel	logitsRel	status
+president-china-role	29	1.75	11	16	4	0.00121662	0.00194756	chain-different
+transition-energetique	51	0.9375	11	1710	4	0.001785	0.00253786	chain-different
+swift-string-reverse	56	0.6875	16837	258	4	0.00190269	0.00266371	chain-different

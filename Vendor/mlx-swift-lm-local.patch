@@ -1,0 +1,281 @@
+diff --git a/Libraries/MLXLLM/Models/Qwen35MTP.swift b/Libraries/MLXLLM/Models/Qwen35MTP.swift
+index fbee45f..dc2644b 100644
+--- a/Libraries/MLXLLM/Models/Qwen35MTP.swift
++++ b/Libraries/MLXLLM/Models/Qwen35MTP.swift
+@@ -135,6 +135,43 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
+         state.proposalAppended = 0
+     }
+ 
++    /// Advance an existing private MTP cache over a newly appended target
++    /// suffix without replaying the complete prompt.
++    public func appendDrafterState(
++        target: any LanguageModel,
++        suffixTokens: MLXArray,
++        suffixTargetHidden: MLXArray,
++        positionDeltas _: MLXArray?,
++        state: inout MTPDrafterState,
++        sampler: any LogitSampler
++    ) {
++        guard target is Qwen35Model || target is Qwen35TextModel else {
++            fatalError("Qwen35NextNDraftModel requires a Qwen35 target")
++        }
++        let tokens = normalizedMTPTokenBatch(suffixTokens)
++        let hidden = suffixTargetHidden.ndim == 2
++            ? suffixTargetHidden.expandedDimensions(axis: 0)
++            : suffixTargetHidden
++        guard tokens.dim(-1) == hidden.dim(1) else {
++            fatalError("Qwen MTP continuation token/hidden lengths differ")
++        }
++        guard tokens.dim(-1) > 0 else { return }
++
++        state.seedToken = nil
++        state.seedHidden = nil
++        state.proposalAppended = 0
++        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
++        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
++        let mtpHidden = mtp(
++            inputsEmbeds: inputEmbedding(tokens), hiddenStates: hidden,
++            cache: state.cache, positionOffset: state.nextPosition)
++        state.nextPosition += tokens.dim(-1)
++        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
++        state.seedToken = sampleMTPSeed(
++            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
++            lmHead: lmHead, sampler: sampler)
++    }
++
+     public func draftBlock(
+         target: any LanguageModel,
+         lastToken: MLXArray,
+diff --git a/Libraries/MLXLMCommon/GatedDelta.swift b/Libraries/MLXLMCommon/GatedDelta.swift
+index 39d012e..b142e03 100644
+--- a/Libraries/MLXLMCommon/GatedDelta.swift
++++ b/Libraries/MLXLMCommon/GatedDelta.swift
+@@ -315,7 +315,11 @@ public func gatedDeltaUpdate(
+     // Dk = 192 (a multiple of 32), but the value is config-driven, so route any
+     // non-multiple-of-32 Dk to the ops fallback, which handles an arbitrary key
+     // dimension correctly (slower, but never truncating).
+-    if GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
++    // Keep an escape hatch for parity/debugging. It is useful when comparing
++    // a non-zero recurrent state against the reference ops implementation,
++    // and makes a kernel regression diagnosable without changing model code.
++    let kernelEnabled = ProcessInfo.processInfo.environment["MLX_GDN_KERNEL"] != "0"
++    if kernelEnabled, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
+         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+     }
+ 
+diff --git a/Libraries/MLXLMCommon/KVCache.swift b/Libraries/MLXLMCommon/KVCache.swift
+index 6d78b45..4018442 100644
+--- a/Libraries/MLXLMCommon/KVCache.swift
++++ b/Libraries/MLXLMCommon/KVCache.swift
+@@ -1538,7 +1538,13 @@ public class MambaCache: ArraysCache {
+     ) {
+         speculativeCheckpoint = SpeculativeCheckpoint(
+             state: [convState, recurrentState],
+-            offset: offset,
++            // `saveSpeculativeCheckpoint` is called while the verify pass is
++            // still in flight.  The tensors above describe the state after
++            // `tokenCount` committed positions, so the restored timeline must
++            // advance by the same amount.  Keeping the pre-verify offset here
++            // leaves a hybrid cache one position behind its attention sibling
++            // after a rejected MTP draft.
++            offset: offset + tokenCount,
+             leftPadding: leftPadding.map { $0 - tokenCount },
+             lengths: lengths.map { $0 - tokenCount })
+     }
+diff --git a/Libraries/MLXLMCommon/MTPDrafterModel.swift b/Libraries/MLXLMCommon/MTPDrafterModel.swift
+index fdde380..769b4e7 100644
+--- a/Libraries/MLXLMCommon/MTPDrafterModel.swift
++++ b/Libraries/MLXLMCommon/MTPDrafterModel.swift
+@@ -160,6 +160,21 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
+         sampler: any LogitSampler
+     )
+ 
++    /// Append a continuation suffix to an already prepared state.
++    ///
++    /// `suffixTokens` are the tokens newly appended to the target sequence;
++    /// `suffixTargetHidden` contains the target hidden state immediately before
++    /// each of those tokens. Qwen-style drafters use this to advance their
++    /// private MTP cache without replaying the complete conversation.
++    func appendDrafterState(
++        target: any LanguageModel,
++        suffixTokens: MLXArray,
++        suffixTargetHidden: MLXArray,
++        positionDeltas: MLXArray?,
++        state: inout MTPDrafterState,
++        sampler: any LogitSampler
++    )
++
+     /// Stateful variant of ``MTPDrafterModel/draftBlock(target:lastToken:lastHidden:sharedKV:positionDeltas:queryOffset:blockSize:sampler:)``.
+     func draftBlock(
+         target: any LanguageModel,
+@@ -188,6 +203,15 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
+ }
+ 
+ extension StatefulMTPDrafterModel {
++    public func appendDrafterState(
++        target _: any LanguageModel,
++        suffixTokens _: MLXArray,
++        suffixTargetHidden _: MLXArray,
++        positionDeltas _: MLXArray?,
++        state _: inout MTPDrafterState,
++        sampler _: any LogitSampler
++    ) {}
++
+     public func prepareDrafterState(
+         target _: any LanguageModel,
+         promptTokens _: MLXArray,
+diff --git a/Libraries/MLXLMCommon/SwitchLayers.swift b/Libraries/MLXLMCommon/SwitchLayers.swift
+index d6aebec..0ee2874 100644
+--- a/Libraries/MLXLMCommon/SwitchLayers.swift
++++ b/Libraries/MLXLMCommon/SwitchLayers.swift
+@@ -137,6 +137,48 @@ public class SwitchGLU: Module {
+         super.init()
+     }
+ 
++    /// Construct the three expert projections directly in packed form. This
++    /// avoids a floating-point initializer for very large already-quantized
++    /// MoE checkpoints.
++    public init(
++        inputDims: Int,
++        hiddenDims: Int,
++        numExperts: Int,
++        quantization: (groupSize: Int, bits: Int, mode: QuantizationMode),
++        bias: Bool = false
++    ) {
++        self.inputDims = inputDims
++        self.hiddenDims = hiddenDims
++        self.numExperts = numExperts
++        self.activation = MLXNN.silu
++        self.activationProduct = compiledSiluProduct
++
++        func make(_ input: Int, _ output: Int) -> SwitchLinear {
++            precondition(input % quantization.groupSize == 0)
++            let packed = MLXArray.zeros(
++                [numExperts, output, input * quantization.bits / 32], dtype: .uint32)
++            let scales = MLXArray.zeros(
++                [numExperts, output, input / quantization.groupSize], dtype: .bfloat16)
++            let biases = quantization.mode == .affine
++                ? MLXArray.zeros(scales.shape, dtype: .bfloat16) : nil
++            return QuantizedSwitchLinear(
++                inputDims: input,
++                outputDims: output,
++                numExperts: numExperts,
++                weight: packed,
++                scales: scales,
++                biases: biases,
++                groupSize: quantization.groupSize,
++                bits: quantization.bits,
++                mode: quantization.mode)
++        }
++
++        self._gateProj.wrappedValue = make(inputDims, hiddenDims)
++        self._upProj.wrappedValue = make(inputDims, hiddenDims)
++        self._downProj.wrappedValue = make(hiddenDims, inputDims)
++        super.init()
++    }
++
+     public init(
+         inputDims: Int,
+         hiddenDims: Int,
+@@ -451,6 +493,38 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
+         self.freeze()
+     }
+ 
++    /// Initialize directly from an already packed checkpoint.
++    ///
++    /// Large MoE checkpoints cannot safely be constructed as floating-point
++    /// `SwitchLinear` layers and quantized afterwards: doing so materializes
++    /// all expert weights first.  This initializer lets model loaders create
++    /// the quantized module tree before attaching lazy safetensor arrays.
++    public init(
++        inputDims: Int,
++        outputDims: Int,
++        numExperts: Int,
++        weight: MLXArray,
++        bias: MLXArray? = nil,
++        scales: MLXArray,
++        biases: MLXArray?,
++        groupSize: Int,
++        bits: Int,
++        mode: QuantizationMode = .affine
++    ) {
++        self.groupSize = groupSize
++        self.bits = bits
++        self.mode = mode
++        self._scales.wrappedValue = scales
++        self._biases.wrappedValue = biases
++
++        super.init(
++            inputDims: inputDims,
++            outputDims: outputDims,
++            numExperts: numExperts,
++            weight: weight,
++            bias: bias)
++    }
++
+     override public func callAsFunction(
+         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+     ) -> MLXArray {
+diff --git a/Libraries/MLXVLM/Models/Qwen35MTP.swift b/Libraries/MLXVLM/Models/Qwen35MTP.swift
+index d2f9a73..23fe5ac 100644
+--- a/Libraries/MLXVLM/Models/Qwen35MTP.swift
++++ b/Libraries/MLXVLM/Models/Qwen35MTP.swift
+@@ -148,6 +148,46 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
+         state.proposalAppended = 0
+     }
+ 
++    /// Advance an existing private MTP cache over a newly appended target
++    /// suffix. Unlike `prepareDrafterState`, this deliberately preserves the
++    /// cache and its absolute position; it is the primitive required by a
++    /// persistent multi-turn VLM conversation.
++    public func appendDrafterState(
++        target: any LanguageModel,
++        suffixTokens: MLXArray,
++        suffixTargetHidden: MLXArray,
++        positionDeltas: MLXArray?,
++        state: inout MTPDrafterState,
++        sampler: any LogitSampler
++    ) {
++        guard let target = target as? Qwen35 else {
++            fatalError("Qwen35VLMNextNDraftModel requires a Qwen35 VLM target")
++        }
++        let tokens = normalizedMTPTokenBatch(suffixTokens)
++        let hidden = suffixTargetHidden.ndim == 2
++            ? suffixTargetHidden.expandedDimensions(axis: 0)
++            : suffixTargetHidden
++        guard tokens.dim(-1) == hidden.dim(1) else {
++            fatalError("Qwen MTP continuation token/hidden lengths differ")
++        }
++        guard tokens.dim(-1) > 0 else { return }
++
++        state.seedToken = nil
++        state.seedHidden = nil
++        state.proposalAppended = 0
++        let targetEmbedTokens = target.languageModel.model.embedTokens
++        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
++        let mtpHidden = mtp(
++            inputsEmbeds: inputEmbedding(tokens), hiddenStates: hidden,
++            cache: state.cache, positionOffset: state.nextPosition,
++            positionDeltas: positionDeltas)
++        state.nextPosition += tokens.dim(-1)
++        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
++        state.seedToken = sampleMTPSeed(
++            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
++            lmHead: target.languageModel.lmHead, sampler: sampler)
++    }
++
+     public func draftBlock(
+         target: any LanguageModel,
+         lastToken: MLXArray,
+diff --git a/Tests/MLXLMTests/Qwen35MTPTests.swift b/Tests/MLXLMTests/Qwen35MTPTests.swift
+index 8e519be..47ee111 100644
+--- a/Tests/MLXLMTests/Qwen35MTPTests.swift
++++ b/Tests/MLXLMTests/Qwen35MTPTests.swift
+@@ -363,6 +363,7 @@ struct Qwen35MTPMetalTests {
+         let rewound = rewindSpeculativePromptCache([attention, recurrent], numTokens: 1)
+         #expect(rewound == 1)
+         #expect(attention.offset == 2)
++        #expect(recurrent.offset == 1)
+         #expect(!recurrent.hasSpeculativeCheckpoint)
+ 
+         let restored = recurrent.state

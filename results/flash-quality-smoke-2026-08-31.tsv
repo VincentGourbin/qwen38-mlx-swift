@@ -1,0 +1,4 @@
+checkpoint	mode	prompt	image	maxNewTokens	promptTokens	generatedIDs	decoded	TTFTSeconds	generationSeconds	layerVisits	layerLoadSeconds	layerForwardSeconds	peakMemoryGB	status
+Qwen3.8-Flash-Next-MLX-4bit-MTP	Swift streamed	Réponds en une phrase : qui est Xi Jinping ?	none	8	24	917,198,248046	var\\n<|im_end|>	128.457	168.886	144	291.243	5.165	34.66	quality-failed-short-output
+Qwen3.8-Flash-Next-MLX-4bit-MTP	Swift streamed	Décris en une phrase la personne visible sur cette photo.	/Users/vincent/Downloads/licensed-image-2.jpeg	8	978	88,271,17,846,1076,198,248046	y\\n\\n2user...\\n<|im_end|>	91.096	552.082	336	624.940	15.168	37.87	multimodal-input-ok-quality-failed
+Qwen3.8-Flash-Next-MLX-4bit-MTP	Python mlx-vlm 0.6.17	Explique en une phrase qui est Xi Jinping.	none	3	-	-	-	-	-	-	-	-	-	reference-oom-with-native-mtp-checkpoint

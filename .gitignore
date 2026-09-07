@@ -1,0 +1,16 @@
+.xcodebuild/
+.xcodebuild-*/
+.build/
+.swiftpm/
+.swift-cache/
+DerivedData/
+.xcodebuild-tests.log
+*.profraw
+.DS_Store
+*.xcuserstate
+Vendor/mlx-swift-lm/
+*.trace.json
+results/*.trace.json
+
+Scripts/hf-cache/
+venv617/

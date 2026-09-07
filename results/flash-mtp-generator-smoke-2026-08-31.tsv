@@ -1,0 +1,2 @@
+checkpoint	promptTokens	maxNewTokens	blockSize	tokenIDs	proposed	accepted	targetVerified	rollbacks	replayed	TTFTSeconds	generationSeconds	layerVisits	layerLoadSeconds	layerForwardSeconds	status
+Qwen3.8-Flash-Next-MLX-4bit-MTP	22	3	2	17,25,16	2	0	4	2	4	107.419	420.236	240	515.802	9.894	complete-local-mtp
