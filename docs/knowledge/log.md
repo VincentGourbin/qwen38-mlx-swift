@@ -1011,3 +1011,99 @@ P1 un run résident de 6 tokens avec `Scripts/preflight-resident.sh` (seuil
 9 Go anonyme+compresseur+swap ; 27,3 Go ce jour = REFUS),
 `Scripts/sample-system.sh` et `sample` CPU → P2-mem (wired limit MLX +
 sysctl 88000) ou P2-code → H6 dans un seul process serveur → G-8.
+
+## 2026-09-07 — P0 : bench synthétique d'une couche Flash-Next
+
+Nouvelle commande `flash-layer-bench` (`Sources/Qwen38CLI/Qwen38CLI.swift`)
+et logique dans `Sources/Qwen38Core/FlashNext/Qwen4ExpLayerBench.swift` :
+construit une couche GDN+MoE (`.linearAttention`) et une couche QSA+MoE
+(`.fullAttention`) aux dimensions réelles du checkpoint (hidden 2560, 4 flux
+hyper-connections rang 320, 512 experts dim 640 dont 10 routés + 1 partagé
+640, GDN 48/16 têtes head_dim 128 conv 4, QSA 24/2 têtes head_dim 256), poids
+empaquetés 4-bit g32 créés directement via `qwen4ExpLinear`/`qwen4ExpSwitchLinear`
+(comme le test « Les modules Flash-Next peuvent naître directement
+empaquetés »), sans checkpoint ni accès au Lexar. Boucle : 20 pas de warm-up
+puis 200 pas d'un token `[1,1,4·hidden]`, `eval` à chaque pas, cache par
+couche (`MambaCache`/`Qwen4ExpQSAKVCache`, même sélection que
+`Qwen4ExpStreamingDecoder.makeCache(for:)`, qui reste `private` — non
+modifiée), masque causal `Qwen4ExpQSAAttention.causalMask` pour la couche
+QSA. Run : `./.xcodebuild/Build/Products/Debug/qwen38 flash-layer-bench
+--trace results/p0-layer-bench.trace.json`, analysé par le nouveau
+`Scripts/bench-layers.py` (adapté de `trace-layers.py`, mêmes compteurs
+`Utilization`/`Memory`, phases `Bench couche gdn`/`Bench couche qsa`).
+
+**Résultat chiffré** (mesure via la trace du profiler, méthodologie
+identique à `trace-layers.py` sur les runs résidents réels — donc
+directement comparable aux 22-28 ms/couche de la RÉPONSE du 2026-09-07
+ci-dessus) :
+
+| Couche | ms/pas médiane | p10 | p90 | min | max | CPU % | GPU % | Mémoire couche |
+|---|---|---|---|---|---|---|---|---|
+| GDN (`linear_attention`) | 11,20 | 10,97 | 11,87 | 10,85 | 12,78 | 99,9 | 0,3 | 1,63 Go |
+| QSA (`full_attention`) | 15,12 | 14,67 | 15,94 | 14,27 | 19,95 | 99,7 | 1,2 | 1,62 Go |
+
+(mesure du temps de calcul seul, sans le bookkeeping du profiler, obtenue en
+parallèle par `ContinuousClock` autour de chaque pas dans
+`Qwen4ExpLayerBench` : GDN médiane 6,46 ms, QSA médiane 10,33 ms — l'écart
+avec le tableau ci-dessus est le coût des deux `beginPhase`/`endPhase` par
+pas, présent de façon identique dans les traces résidentes réelles puisque
+`Qwen4ExpStreamingDecoder.forward` enveloppe aussi chaque couche d'un
+`profiler.start`/`.end`).
+
+Échantillon GPU pendant le run (`ioreg -r -c AGXAccelerator`, 30 s,
+`Device Utilization %`) : quasi tout à 0, un seul pic isolé à 34 % au tout
+début (warm-up/compilation des premiers noyaux Metal), cohérent avec les
+0,3-1,2 % moyens mesurés par le profiler.
+
+La couche QSA dépasse le seuil de 15 ms avec GPU ≈ 0 : `sample $(pgrep -x
+qwen38) 10 -file results/p0-sample.txt` lancé pendant un second run
+(`--layer-kind qsa --steps 3000`). Sur le thread de calcul (5562
+échantillons sur 10 s), 3576 sont dans `decodeOneStep`, dont 3575 dans
+`eval()` → `mlx_eval` → `mlx::core::eval`/`eval_impl` → `gpu::eval` →
+`UnaryPrimitive::eval_gpu`, avec une fraction notable (383/994) dans
+`Concatenate::eval_gpu` → `copy_gpu_inplace`. Le tableau « Sort by top of
+stack » (hors threads de pool GCD/IOKit idle — `__workq_kernreturn`,
+`mach_msg2_trap`, `__psynch_cvwait`, `iokit_user_client_trap`, tous des
+threads d'attente séparés du thread de calcul) : `std::__tree_sub_invariant`
+(163, arbre rouge-noir du cache de buffers Metal), `_xzm_free` (68),
+`_platform_memset`/`_platform_memmove` (35/31), `std::__hash_table<void
+const*>::__emplace_unique_key_args` (30, cache de ressources/pipelines
+Metal), `__psynch_mutexwait` (28), `mlx::core::eval_impl` (27),
+`SmallVector<int,10>::size()` (26), puis d'autres allocations/hash lookups
+(23, 23, 21…). Aucune trace de fautes de page (`vm_fault`,
+`_vm_page_decompress`) ni de noyau Metal dominant : le CPU est consommé par
+le bookkeeping hôte de MLX (refcounting `array`/`ArrayDesc`, recherches dans
+les caches de buffers/pipelines/streams, copies `SmallVector`) autour de
+nombreuses petites opérations (`concatenate`/`slice`/`copy` — cohérent avec
+les hyper-connections à 4 flux et le routage MoE qui multiplient les petits
+tenseurs), pas par le calcul GPU lui-même ni par la pagination mémoire.
+
+**Verdict selon le critère de PLAN.md R1/P0** : ni l'un ni l'autre des deux
+cas propres. Le GPU ne dépasse jamais 30 % (0,3-1,2 %), donc **le critère
+« chemin sain / H-A domine » est exclu pour les deux couches, y compris sans
+aucune pression mémoire** (P0 n'a ni checkpoint, ni table n-gram, ni 77 Go
+résidents — la RAM active reste sous 2,3 Go). La couche QSA remplit
+strictement le second critère (**≥ 15 ms et GPU ≈ 0 ⇒ H-B domine**) ; la
+couche GDN est juste en dessous (11,20 ms) sur la mesure avec overhead
+profiler, et à 6,46 ms sur la mesure de calcul pur — donc entre les deux
+seuils au sens strict de PLAN.md, mais du même côté que QSA (GPU ≈ 0, pas de
+signe d'un chemin GPU actif). Combiné à l'échantillon CPU (bookkeeping
+hôte MLX, pas de fautes de page), la lecture la plus honnête est : **H-B est
+confirmée comme contributeur substantiel et mesurable** (11-15 ms/couche de
+coût de calcul pur sans aucune mémoire sous pression, contre l'hypothèse du
+2026-09-07 matin qui le jugeait « insuffisant pour expliquer 25 ms par
+couche ») ; cela ne clôt pas H-A pour autant, puisque P0 ne reproduit pas la
+pression mémoire du run résident réel (77 Go, pagination) — seul P1 peut
+trancher la part qui reste. Décision : **passer à P1** tel quel (le
+protocole P0/P1/P2 de la RÉPONSE du 2026-09-07 l'anticipait : « en
+complément, après G-8 sinon » pour P2-code), en gardant les pistes P2-code
+identifiées ici (concaténations/copies redondantes dans les
+hyper-connections et le routage MoE) comme cibles concrètes si P1 confirme
+que H-B pèse aussi en résidence.
+
+Fichiers : `Sources/Qwen38Core/FlashNext/Qwen4ExpLayerBench.swift`,
+`Sources/Qwen38CLI/Qwen38CLI.swift` (commande `flash-layer-bench`),
+`Scripts/bench-layers.py`, test
+`qwen4ExpLayerBenchMeasuresPositiveDurations` (dimensions réduites, P0
+`Tests/Qwen38Tests/Qwen38Tests.swift`), traces
+`results/p0-layer-bench.trace.json` et `results/p0-sample.txt`.

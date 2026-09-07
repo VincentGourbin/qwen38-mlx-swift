@@ -20,7 +20,8 @@ struct Qwen38CLI: AsyncParsableCommand {
         subcommands: [
             Info.self, FlashSliceProbe.self, FlashStreamProbe.self, FlashGlobalProbe.self,
             FlashTextProbe.self, FlashVisionProbe.self, FlashMergeProbe.self,
-            FlashMultimodalProbe.self, FlashGenerateProbe.self, FlashQSAParity.self,
+            FlashMultimodalProbe.self, FlashGenerateProbe.self, FlashLayerBench.self,
+            FlashQSAParity.self,
             FlashMRoPEParity.self,
             FlashVisionParity.self,
             FlashLanguageParity.self,
@@ -720,6 +721,116 @@ struct FlashGenerateProbe: AsyncParsableCommand {
                 String(format: "%.4f", $0)
             } ?? "n/a"
         }
+        print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
+        if let profileSession {
+            print(profileSession.generateReport())
+            if let trace { print("trace profiler: \(trace)") }
+        }
+    }
+}
+
+/// Which Flash-Next layer kind(s) `flash-layer-bench` should run.
+enum FlashLayerBenchKindOption: String, ExpressibleByArgument, CaseIterable {
+    case gdn
+    case qsa
+    case both
+}
+
+struct FlashLayerBench: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "flash-layer-bench",
+        abstract:
+            "P0 : micro-bench synthétique d'une couche Flash-Next (poids empaquetés aléatoires, sans checkpoint)")
+
+    @Option(name: .long, help: "Nombre de pas mesurés par type de couche")
+    var steps: Int = 200
+
+    @Option(name: .long, help: "Nombre de pas de warm-up non mesurés")
+    var warmup: Int = 20
+
+    @Option(name: .long, help: "Type de couche à bencher : gdn, qsa ou both")
+    var layerKind: FlashLayerBenchKindOption = .both
+
+    @Option(name: .long, help: "Écrire une trace Chrome/Perfetto à ce chemin")
+    var trace: String?
+
+    func run() async throws {
+        guard steps > 0 else {
+            throw ValidationError("--steps doit être positif")
+        }
+        guard warmup >= 0 else {
+            throw ValidationError("--warmup doit être positif ou nul")
+        }
+
+        _ = Device.defaultDevice()
+        let profiler = MLXProfiler.shared
+        let profileSession: ProfilingSession?
+        if trace != nil {
+            let session = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
+            session.title = "QWEN3.8 FLASH-NEXT LAYER BENCH (P0)"
+            session.metadata["warmup_steps"] = String(warmup)
+            session.metadata["measured_steps"] = String(steps)
+            session.metadata["layer_kind"] = layerKind.rawValue
+            profiler.activeSession = session
+            profiler.enable()
+            profileSession = session
+        } else {
+            profileSession = nil
+        }
+        defer {
+            if let profileSession {
+                profiler.disable()
+                if let trace {
+                    try? ChromeTraceExporter.export(session: profileSession).write(
+                        to: URL(fileURLWithPath: trace))
+                }
+            }
+        }
+
+        let kinds: [Qwen4ExpLayerBenchKind]
+        switch layerKind {
+        case .both: kinds = [.gdn, .qsa]
+        case .gdn: kinds = [.gdn]
+        case .qsa: kinds = [.qsa]
+        }
+
+        func percentile(_ sortedMs: [Double], _ p: Double) -> Double {
+            guard !sortedMs.isEmpty else { return .nan }
+            let index = Int((Double(sortedMs.count - 1) * p).rounded())
+            return sortedMs[min(max(index, 0), sortedMs.count - 1)]
+        }
+
+        for kind in kinds {
+            print("--- couche \(kind.rawValue) ---")
+            let result = Qwen4ExpLayerBench.run(
+                kind: kind,
+                warmupSteps: warmup,
+                measuredSteps: steps,
+                profiler: profiler)
+            let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
+            let median = percentile(sortedMs, 0.5)
+            let p10 = percentile(sortedMs, 0.1)
+            let p90 = percentile(sortedMs, 0.9)
+            let minMs = sortedMs.first ?? .nan
+            let maxMs = sortedMs.last ?? .nan
+            let meanCPU = result.steps.map(\.cpuPercent).reduce(0, +) / Double(result.steps.count)
+            let meanGPU = result.steps.map(\.gpuPercent).reduce(0, +) / Double(result.steps.count)
+            print("mémoire couche: \(ByteCountFormatter.string(fromByteCount: result.materializedBytes, countStyle: .file))")
+            print("ms/pas — médiane \(String(format: "%.2f", median))  p10 \(String(format: "%.2f", p10))  p90 \(String(format: "%.2f", p90))  min \(String(format: "%.2f", minMs))  max \(String(format: "%.2f", maxMs))")
+            print("CPU moyen: \(String(format: "%.1f", meanCPU)) %   GPU moyen: \(String(format: "%.1f", meanGPU)) %")
+            if let profileSession {
+                let prefix = "bench_\(kind.rawValue)_"
+                profileSession.metadata[prefix + "median_ms"] = String(format: "%.3f", median)
+                profileSession.metadata[prefix + "p10_ms"] = String(format: "%.3f", p10)
+                profileSession.metadata[prefix + "p90_ms"] = String(format: "%.3f", p90)
+                profileSession.metadata[prefix + "min_ms"] = String(format: "%.3f", minMs)
+                profileSession.metadata[prefix + "max_ms"] = String(format: "%.3f", maxMs)
+                profileSession.metadata[prefix + "cpu_percent_mean"] = String(format: "%.1f", meanCPU)
+                profileSession.metadata[prefix + "gpu_percent_mean"] = String(format: "%.1f", meanGPU)
+                profileSession.metadata[prefix + "materialized_bytes"] = String(result.materializedBytes)
+            }
+        }
+        print("MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))")
         print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
         if let profileSession {
             print(profileSession.generateReport())

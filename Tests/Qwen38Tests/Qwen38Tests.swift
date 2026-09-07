@@ -1469,3 +1469,41 @@ func qwen4ExpPrequantizedContainersUsePackedShapes() {
         quantization: spec)
     #expect(switchLinear is QuantizedSwitchLinear)
 }
+
+@Test("Le bench synthétique d'une couche Flash-Next mesure des durées positives (P0)")
+func qwen4ExpLayerBenchMeasuresPositiveDurations() {
+    // Reduced dimensions (real dims are hidden 2560 / 512 experts and would
+    // be far too slow for a unit test); all quantized-linear input
+    // dimensions stay multiples of the 4-bit group size (32).
+    let dimensions = Qwen4ExpLayerBenchDimensions(
+        hiddenSize: 256,
+        numAttentionHeads: 4,
+        numKeyValueHeads: 1,
+        headDim: 64,
+        linearNumKeyHeads: 4,
+        linearNumValueHeads: 8,
+        linearKeyHeadDim: 32,
+        linearValueHeadDim: 32,
+        linearConvKernelDim: 4,
+        numExperts: 8,
+        numExpertsPerToken: 2,
+        moeIntermediateSize: 64,
+        sharedExpertIntermediateSize: 64,
+        indexerBudget: 64,
+        indexerCompressRatio: 4,
+        indexerHeadDim: 64,
+        indexerKVHeads: 1,
+        indexerNHeads: 2,
+        hcCount: 4,
+        hcLowrank: 32,
+        vocabSize: 1_000,
+        maxPositionEmbeddings: 4_096)
+
+    for kind in [Qwen4ExpLayerBenchKind.gdn, .qsa] {
+        let result = Qwen4ExpLayerBench.run(
+            kind: kind, dimensions: dimensions, warmupSteps: 0, measuredSteps: 5)
+        #expect(result.steps.count == 5)
+        #expect(result.steps.allSatisfy { $0.durationSeconds > 0 })
+        #expect(result.materializedBytes > 0)
+    }
+}
