@@ -523,6 +523,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     @Option(name: .long, help: "Écrire une trace Chrome/Perfetto à ce chemin")
     var trace: String?
 
+    @Flag(
+        name: .long,
+        help:
+            "Profiler chaque couche (\"Flash couche N\") au lieu des seules phases Prefill/Generation — coûte ~4,7 ms par frontière de phase (P0-c)"
+    )
+    var profileLayers = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -635,7 +642,8 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         let model = try Qwen4ExpStreamingTextModel(
             directory: directory,
             layerLoadingMode: residentLayers ? .resident : .streamed,
-            residentEvaluationInterval: residentEvalInterval)
+            residentEvaluationInterval: residentEvalInterval,
+            profileLayers: profileLayers)
         profiler.end("Flash globals")
         let generator = Qwen4ExpGreedyGenerator(model: model)
         let stopTokens: Set<Int32> = [
@@ -888,6 +896,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     @Option(name: .long, help: "Écrire une trace Chrome/Perfetto à ce chemin")
     var trace: String?
 
+    @Flag(
+        name: .long,
+        help:
+            "Profiler chaque couche (\"Flash couche N\") au lieu des seules phases Prefill/Generation — coûte ~4,7 ms par frontière de phase (P0-c)"
+    )
+    var profileLayers = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -945,7 +960,8 @@ struct FlashChatProbe: AsyncParsableCommand {
         let model = try Qwen4ExpStreamingTextModel(
             directory: directory,
             layerLoadingMode: residentLayers ? .resident : .streamed,
-            residentEvaluationInterval: residentEvalInterval)
+            residentEvaluationInterval: residentEvalInterval,
+            profileLayers: profileLayers)
         profiler.end("Flash globals")
         let generator = Qwen4ExpStreamingGenerator(model: model)
 

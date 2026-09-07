@@ -43,6 +43,16 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// unless a future measurement on a different checkpoint/machine shows
     /// otherwise; see docs/knowledge/log.md 2026-09-05.
     public let residentEvaluationInterval: Int
+    /// Opt-in per-layer profiling (P0-c). When `false` (the default),
+    /// `forward` skips the `profiler.start`/`.end("Flash couche N")` pair
+    /// and the per-layer n-gram cache bookkeeping (`observeNGramCache`) for
+    /// every decoder layer. Each `start`/`end` pair costs ~4.7 ms (IOKit GPU
+    /// sample + `rusage`, see docs/knowledge/log.md "P0 rejoué en Release"),
+    /// i.e. ~225 ms/token spread over 48 layers when left on unconditionally
+    /// — pure profiler overhead, not decoder cost. The `Prefill`/`Generation`
+    /// phases and session metadata (model, prompt tokens, layer visits/load
+    /// time…) are unaffected: they live in the generators, not here.
+    public let profileLayers: Bool
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -54,7 +64,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     public init(
         directory: URL,
         layerLoadingMode: Qwen4ExpLayerLoadingMode = .streamed,
-        residentEvaluationInterval: Int = 1
+        residentEvaluationInterval: Int = 1,
+        profileLayers: Bool = false
     ) throws {
         precondition(residentEvaluationInterval > 0)
         self.directory = directory
@@ -63,6 +74,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.quantization = Qwen4ExpQuantizationSpec(configuration.quantization)
         self.layerLoadingMode = layerLoadingMode
         self.residentEvaluationInterval = residentEvaluationInterval
+        self.profileLayers = profileLayers
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -92,8 +104,14 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             precondition(configuration.layerTypes.indices.contains(layerIndex))
             let profiler = MLXProfiler.shared
             let profileName = "Flash couche \(layerIndex)"
-            profiler.start(profileName)
-            defer { profiler.end(profileName) }
+            if profileLayers {
+                profiler.start(profileName)
+            }
+            defer {
+                if profileLayers {
+                    profiler.end(profileName)
+                }
+            }
             // In streamed mode the previous layer is released before the next
             // shard group is opened, so clear its now-unused allocations. In
             // resident mode every layer stays live and clearing the allocator
@@ -148,7 +166,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             mask: attentionMask,
             cache: cache,
             positionIDs: positionIDs)
-            if let currentNGramStats = loaded.layer.ngramCacheStats() {
+            if profileLayers, let currentNGramStats = loaded.layer.ngramCacheStats() {
                 observeNGramCache(layerIndex: layerIndex, current: currentNGramStats)
             }
             // Streamed mode must detach the next layer from the previous

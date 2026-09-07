@@ -28,7 +28,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         directory: URL,
         materializeGlobal: Bool = true,
         layerLoadingMode: Qwen4ExpLayerLoadingMode = .streamed,
-        residentEvaluationInterval: Int = 1
+        residentEvaluationInterval: Int = 1,
+        profileLayers: Bool = false
     ) throws {
         let loadedGlobal = try Qwen4ExpGlobalCheckpointLoader.load(
             from: directory, materialize: materializeGlobal)
@@ -37,7 +38,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         self.decoder = try Qwen4ExpStreamingDecoder(
             directory: directory,
             layerLoadingMode: layerLoadingMode,
-            residentEvaluationInterval: residentEvaluationInterval)
+            residentEvaluationInterval: residentEvaluationInterval,
+            profileLayers: profileLayers)
         self.configuration = decoder.configuration
     }
 
