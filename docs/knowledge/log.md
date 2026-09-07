@@ -1405,3 +1405,51 @@ allocation par pas dont la taille croît sans borne avec la conversation
 sémantique (prouvé par test), et cohérente avec le motif déjà utilisé pour
 GDN. **Conservé dans le chemin de production** malgré l'effet marginal sur
 ce bench précis.
+
+### Tableau final — leviers hôte sur le bench P0 (Release, `--steps 200-400`, sans `--trace`)
+
+| Levier | ms/pas GDN | ms/pas QSA | GPU % | Tests verts | Conservé |
+|---|---|---|---|---|---|
+| Départ (eager, référence) | 5,41-5,46 | 5,68-6,24 | 14-38 (profiler) / 0 (`ioreg`) | 64 (tous, aucun n'exerçait ces leviers) | — |
+| (a) comptage des ops (`sample`) | — (mesure seule) | — (mesure seule) | — | 64, aucun changement de code | n/a — investigation |
+| (b) hyper-connections sans concat | — (déjà sans split/concat) | — (idem) | — | 64, aucun changement de code | non — non applicable tel que décrit |
+| (c) `MLX.compile --compiled` | **5,31-5,32** (−2 %) | **6,38-6,46** (+12-14 %) | 14,0 (GDN) / 12,4 (QSA), profiler — inchangé | 64/64 (`qwen4ExpLayerBenchCompiledMatchesEager` ajouté et vert) | option bench uniquement — non par défaut (gain GDN trop faible, QSA régresse) |
+| (c) `--compiled --shapeless` | crash | crash | — | — | non — `Split` incompatible avec `shapeless` (mlx-swift 0.31.6) |
+| (d) `asyncEval --async-interval N` (N=4/8/48) | **4,52-4,72** (−13 à −17 %) | **4,46-4,77** (−16 à −22 %) | 41-49 (profiler), **82 médiane `ioreg`** à N=8 | 64/64 (suite inchangée) | option bench uniquement — `residentEvaluationInterval` reste 1, P1 tranchera |
+| (e) masque causal QSA sauté en décodage | 5,41-5,46 (non concerné) | 5,66-5,77 (−0 à −2 %, dans le bruit à 200 pas) | inchangé | 65/65 (`qwen4ExpQSATrivialMaskMatchesNoMaskOnDecode` ajouté et vert) | **oui — chemin de production modifié** (correction provable, effet marginal sur ce bench) |
+
+Aucun levier, seul ou combiné, n'atteint la jauge complète du P2-code
+(≤ 2 ms/couche **et** GPU ≥ 40 %) : (d) est le seul à franchir GPU ≥ 40 % et
+réduit ms/pas de 13-22 %, mais le palier reste ~4,5-4,7 ms/couche — cohérent
+avec (a), qui montre que le coût restant est réparti sur de nombreuses
+petites opérations hôte (Copy, binaire, matmul quantifié, refcounting) et
+non concentré dans un poste qu'un seul levier ciblé pourrait éliminer.
+
+**Ce qui est retenu par défaut dans le code de production** : seuls (b) et
+(e) pouvaient changer le chemin réel selon la consigne — (b) n'a rien trouvé
+à changer (le motif « split puis concat des 4 flux » n'existe pas dans ce
+code, déjà écrit avec des `reshaped`) ; (e) est appliqué sans option dans
+`Qwen4ExpStreamingDecoder.forward` (masque causal QSA sauté en décodage à un
+jeton, correction provable et sans risque même si son effet mesuré sur ce
+bench est marginal). (c) et (d) restent des options du bench
+(`flash-layer-bench --compiled/--shapeless/--async-interval N`) : (c) n'a
+pas de verdict positif net (GDN marginal, QSA régresse, `shapeless` casse) ;
+(d) est le levier le plus prometteur mais reste hors production tant que P1
+(sur le vrai checkpoint, sous la vraie pression mémoire des 77 Go résidents)
+n'a pas confirmé que différer la synchronisation ne reproduit pas la
+dégradation observée à l'intervalle 8 dans la campagne V54 (elle-même
+possiblement contaminée par Debug + profiler + mémoire, mais seul un run
+réel peut le confirmer sur ce chemin).
+
+**Écarts par rapport à la consigne** : (i) les leviers (a) et (b) n'ont
+donné lieu à aucun changement de code (investigation pure), donc pas de
+« commit de code » séparé pour chacun — ils partagent un commit
+(`216b2fc`), avec la mesure de départ ; c'est un allègement délibéré, pas un
+levier sauté. (ii) Le lever (e) ciblé (« masque recréé à chaque pas ») s'est
+révélé correct mais d'effet marginal sur ce bench, contrairement à
+l'intuition de la consigne qui l'anticipait comme un « gros poste » — le
+tableau et le paragraphe ci-dessus le disent explicitement plutôt que de
+gonfler son impact. (iii) Le garde-fou de parité pour (e) n'a pas pu
+s'appuyer sur la suite gardée par `QWEN38_FLASH_MODEL` (checkpoint absent,
+interdiction Lexar) : un test autonome équivalent, sans checkpoint, a été
+ajouté à la place et documenté comme tel.
