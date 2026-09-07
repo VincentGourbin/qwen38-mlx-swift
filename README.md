@@ -6,12 +6,16 @@ avec CLI, GUI de bench et serveur d'inférence LAN compatible OpenAI.
 ## Build et tests
 
 ```sh
-Scripts/build.sh       # xcodebuild, jamais `swift build` (voir docs/knowledge/)
-Scripts/run-tests.sh   # suite de tests, derived data dédié
+Scripts/build.sh          # Debug, xcodebuild, jamais `swift build` (voir docs/knowledge/)
+Scripts/build-release.sh  # Release (QWEN38_CONFIGURATION=Release), pour les probes/bench/démos
+Scripts/run-tests.sh      # suite de tests, derived data dédié (Debug)
 ```
 
-Binaires : `.xcodebuild/Build/Products/Debug/qwen38` (CLI),
+Binaires Debug : `.xcodebuild/Build/Products/Debug/qwen38` (CLI),
 `.xcodebuild/Build/Products/Debug/qwen38-bench-ui` (GUI).
+
+Binaires Release (probes, bench, H6, démo) : `.xcodebuild/Build/Products/Release/qwen38`,
+`.xcodebuild/Build/Products/Release/qwen38-bench-ui`.
 
 ## Mémoire GPU (wired limit)
 

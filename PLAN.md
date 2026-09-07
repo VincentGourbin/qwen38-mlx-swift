@@ -284,7 +284,7 @@ Ce qui manque pour qu'un utilisateur voie Flash-Next :
 
 ### 6.2 Étapes restantes (ordre strict)
 
-Conventions : une tâche = un commit = un critère vérifiable. Build : `Scripts/build.sh` (xcodebuild, jamais `swift build`). Tests : `Scripts/run-tests.sh`. Binaire : `./.xcodebuild/Build/Products/Debug/qwen38`. Checkpoint : `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, noté `$FLASH` ci-dessous. Prompt de référence : « Explique en français qui est le président de la Chine et quel est son rôle. » Image de référence : `/Users/vincent/Downloads/licensed-image-2.jpeg`. Sortie greedy attendue sur le prompt de référence (8 tokens, sans thinking) : `"Le président de la Chine est Xi Jinping"`.
+Conventions : une tâche = un commit = un critère vérifiable. Build : `Scripts/build.sh` (xcodebuild, jamais `swift build`). Tests : `Scripts/run-tests.sh`. Binaire : `./.xcodebuild/Build/Products/Debug/qwen38`. Checkpoint : `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, noté `$FLASH` ci-dessous. Prompt de référence : « Explique en français qui est le président de la Chine et quel est son rôle. » Image de référence : `/Users/vincent/Downloads/licensed-image-2.jpeg`. Sortie greedy attendue sur le prompt de référence (8 tokens, sans thinking) : `"Le président de la Chine est Xi Jinping"`. Les probes (`flash-generate-probe`, `flash-chat-probe`), le bench `flash-layer-bench`, les runs H6 et la démo G-8 utilisent le binaire **Release** (`Scripts/build-release.sh`, wrapper `QWEN38_CONFIGURATION=Release Scripts/build.sh` ; binaire `.xcodebuild/Build/Products/Release/qwen38`) ; Debug (`Scripts/build.sh` par défaut) reste réservé aux tests (`Scripts/run-tests.sh`).
 
 **H0 — Préalables (0,5 j)**
 
