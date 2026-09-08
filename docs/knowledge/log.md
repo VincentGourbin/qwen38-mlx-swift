@@ -1545,3 +1545,77 @@ Protocole retenu pour H6/G-8 tant que 1 et 2 ne sont pas faits : reboot,
 n'ouvrir que le Terminal, `Scripts/preflight-resident.sh` ≤ 8 Go, puis
 `Scripts/h6-qualification.sh` immédiatement (≈ 12 min). Le filet garde-fou
 n'est utile qu'à 30 Go ; à 9 Go il tue des runs viables.
+
+## 2026-09-08 — Q3.1 : requantification des experts en 3-bit g64
+
+Décision G-4bis (option C) : `Scripts/qwen4-exp-requantize-experts.py`
+(`venv617`, MLX 0.32.2) requantifie uniquement les tenseurs
+`*.mlp.switch_mlp.{gate_proj,up_proj,down_proj}` du checkpoint Vontra
+(4-bit g32) en 3-bit g64, shard par shard, tout le reste (n-gram, attention,
+shared expert, gate, normes, vision, MTP non-expert) recopié à l'identique.
+
+**Découverte utile avant d'écrire le script** : `mx.load` sur un
+`.safetensors` est paresseux — charger un shard de 5,3 Go coûte ~5 ms et 0
+RSS supplémentaire tant que rien n'est évalué. Le script ouvre donc les 22
+shards sélectionnés en paresseux dès le départ (métadonnées seules, quasi
+gratuit) au lieu de les rouvrir un par un ; ça résout proprement le seul
+piège réel de l'opération : **9 des 147 tenseurs d'experts ont leur
+`.weight`/`.scales`/`.biases` répartis sur deux shards adjacents** dans
+l'index source (ex. couche 14 `down_proj` : poids+scales dans le shard 11,
+biais dans le shard 12). Sans accès paresseux à tous les shards, ce cas
+aurait forcé soit à garder un shard supplémentaire ouvert « en avance », soit
+à réordonner l'écriture. Chaque tenseur reste néanmoins évalué et libéré un
+par un (jamais plus d'un shard de données réellement matérialisé à la fois),
+conformément à PLAN.md §6.3 piège 8.
+
+**Test avant la conversion complète** : `--dry-run` (liste 3747 tenseurs
+dont 441 clés d'experts) puis `--limit-shards 1` vers
+`/Volumes/Lexar/models/local/_test-e3bit` (supprimé ensuite — seul dossier
+Lexar que j'ai créé moi-même). Formes vérifiées : poids `[512, 640, 240]`
+(gate/up, entrée 2560) et `[512, 2560, 60]` (down, entrée 640) ; scales
+`[512, 640, 40]` et `[512, 2560, 10]` — `2560/64=40` et `640/64=10` comme
+annoncé dans le plan. Pic mémoire mesuré (`/usr/bin/time -l`) : 7,5 Go pour
+un shard de 4,9 Go, sous le plafond de 15 Go.
+
+**Conversion complète** (`caffeinate -dimsu`, tâche de fond, ≈ 5 min — bien
+plus rapide que les 15-30 min estimées, le Lexar a tenu un débit soutenu) :
+
+| Mesure | Valeur |
+|---|---|
+| Shards traités | 22/22, 147/147 familles d'experts requantifiées |
+| Taille totale (shards) entrée → sortie | 105,43 Go → 83,90 Go |
+| Taille experts (poids+scales+biases) entrée → sortie | 71,78 Go → 50,24 Go |
+| Ratio experts sortie/entrée | 0,700 |
+| Taille du dossier de sortie complet | 84 Go (`du -sh`) |
+| Espace libre Lexar après | 108 Go |
+
+Rapport de reconstruction sur 3 experts choisis (couche 0/expert 0, couche
+24/expert 100, couche 47/expert 511), les trois projections — **attention :
+la référence « 4-bit » est déjà une quantification du poids original, cette
+mesure est l'écart 4-bit→3-bit, pas l'écart au poids plein précision** :
+
+| Couche | Expert | Projection | mean\|Δ\| | max\|Δ\| | RMS relative |
+|---|---|---|---|---|---|
+| 0 | 0 | down_proj | 0,003062 | 0,035156 | 20,03 % |
+| 0 | 0 | gate_proj | 0,003063 | 0,017578 | 20,44 % |
+| 0 | 0 | up_proj | 0,003143 | 0,021118 | 20,20 % |
+| 24 | 100 | down_proj | 0,001980 | 0,011475 | 19,90 % |
+| 24 | 100 | gate_proj | 0,002006 | 0,011230 | 20,02 % |
+| 24 | 100 | up_proj | 0,002044 | 0,010986 | 20,04 % |
+| 47 | 511 | down_proj | 0,002452 | 0,012939 | 19,91 % |
+| 47 | 511 | gate_proj | 0,002242 | 0,019531 | 20,05 % |
+| 47 | 511 | up_proj | 0,002461 | 0,014893 | 20,16 % |
+
+La RMS relative est remarquablement stable (~20 %) sur les trois couches et
+les trois projections — la perte 3-bit g64 est homogène sur ce checkpoint,
+pas concentrée sur une couche ou un expert particulier. Le verdict qualité
+(la génération reste-t-elle acceptable) revient à Q3.3, pas à cette mesure
+tenseur-par-tenseur.
+
+`config.json`/`quantization_config` du nouveau checkpoint portent
+`{"group_size": 32, "bits": 4, "mode": "affine", "experts": {"group_size":
+64, "bits": 3, "mode": "affine"}}` ; tous les autres fichiers non-safetensors
+(tokenizer, chat template, LICENSE, README, `.gitattributes`, etc.) sont
+copiés tels quels. Nouveau checkpoint :
+`/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`.
+
