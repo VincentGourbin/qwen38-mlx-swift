@@ -1,0 +1,30 @@
+23:33:47 démarrage serveur (Qwen3.8-Flash-Next-MLX-e3bit-MTP, port 8848)
+{"status":"running","model_loaded":true,"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","queue":"0"}
+23:33:49 → H6.1 (thinking, 200 tokens)
+   94.0s · finish=length · reasoning=916 chars · 
+23:35:23 → H6.2a (instruct, 48 tokens)
+   10.0s · finish=length · reasoning=0 chars · La photosynthèse est le processus biochimique par lequel les plantes, les algues et certaines bactéries convertissent l'énergie lumineuse, le dioxyde de carbone et l'eau en glucose (source d'énergie) et
+23:35:33 → H6.2b (instruct, 48 tokens)
+   9.7s · finish=length · reasoning=0 chars · # Inverser une chaîne en Swift ⏎  ⏎ Voici une fonction Swift qui inverse une chaîne de caractères : ⏎  ⏎ ```swift ⏎ func inverserChaîne(_ chaîne: String) -> String { ⏎     return String(chaîne.reversed
+23:35:43 → H6.2c (instruct, 48 tokens)
+   9.9s · finish=length · reasoning=0 chars · La capitale de l'Australie est **Canberra**. ⏎  ⏎ ### Pourquoi pas Sydney ? ⏎  ⏎ Sydney n'est pas la capitale pour des raisons historiques et politiques liées à la **rivalité entre les deux plus grandes villes australiennes à
+23:35:53 → H6.2d (instruct, 48 tokens)
+   2.4s · finish=stop · reasoning=0 chars · The cat is sleeping on the couch.
+23:35:56 → H6.3 (image, 48 tokens)
+   0.0s · finish=ERREUR · reasoning=0 chars · 
+23:35:56 → H6.4-t1 (instruct, 48 tokens)
+   9.1s · finish=length · reasoning=0 chars · Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire centrale et le Président de la République populaire de Chine. En tant que dirigeant pr
+23:36:05 → H6.4-t2 (instruct, 48 tokens)
+   10.6s · finish=length · reasoning=0 chars · Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. Avant cela, il
+23:36:16 terminé — results/flash-qualification-rev4.tsv
+id       mode      max_tokens  duree_s  finish  reasoning_chars  content
+H6.1     thinking  200         94.0     length  916
+H6.2a    instruct  48          10.0     length  0                La photosynthèse est le processus biochimique par lequel les plantes, les algues et certaines bactéries convertissent l'énergie lumineuse, le dioxyde de
+H6.2b    instruct  48          9.7      length  0                # Inverser une chaîne en Swift ⏎  ⏎ Voici une fonction Swift qui inverse une chaîne de caractères : ⏎  ⏎ ```swift ⏎ func inverserChaîne(_ cha
+H6.2c    instruct  48          9.9      length  0                La capitale de l'Australie est **Canberra**. ⏎  ⏎ ### Pourquoi pas Sydney ? ⏎  ⏎ Sydney n'est pas la capitale pour des raisons historiques et polit
+H6.2d    instruct  48          2.4      stop    0                The cat is sleeping on the couch.
+H6.3     image     48          0.0      ERREUR  0
+H6.4-t1  instruct  48          9.1      length  0                Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission mi
+H6.4-t2  instruct  48          10.6     length  0                Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. Ava
+23:36:16 arrêt serveur
+exit=0

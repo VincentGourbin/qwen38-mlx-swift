@@ -24,16 +24,21 @@ trap 'echo "$(date +%T) arrêt serveur"; kill -INT $server_pid 2>/dev/null; slee
 for i in $(seq 1 60); do curl -sf "http://127.0.0.1:$port/healthz" > /dev/null && break; sleep 2; done
 curl -s "http://127.0.0.1:$port/healthz"; echo
 
-echo -e "id\tmode\tmax_tokens\tduree_s\tfinish\treasoning_chars\tcontent" > "$out"
+[ -n "${H6_ONLY:-}" ] || echo -e "id\tmode\tmax_tokens\tduree_s\tfinish\treasoning_chars\tcontent" > "$out"
 
 # $1 id, $2 mode label, $3 max_tokens, $4 JSON body (sans model)
+# H6_ONLY="H6.1 H6.3" limite les requêtes rejouées ; H6_1_TOKENS règle le budget thinking.
 ask() {
   local id="$1" mode="$2" max="$3" body="$4" t0 t1 dur resp finish content reasoning
+  if [ -n "${H6_ONLY:-}" ] && ! [[ " ${H6_ONLY} " == *" $id "* ]]; then return 0; fi
   echo "$(date +%T) → $id ($mode, $max tokens)"
+  # Corps JSON via fichier : une image base64 dépasse la taille maximale d'un argument (H6.3, 2026-09-08).
+  printf '{"model":"%s","stream":false,"temperature":0,"max_tokens":%s,"mtp":false,%s}' "$model_id" "$max" "$body" > "results/h6/$id.request.json"
   t0=$(date +%s.%N)
-  resp=$(curl -s --max-time 1800 "http://127.0.0.1:$port/v1/chat/completions" \
+  resp=$(curl -s --max-time 1800 -D "results/h6/$id.headers" "http://127.0.0.1:$port/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$model_id\",\"stream\":false,\"temperature\":0,\"max_tokens\":$max,\"mtp\":false,$body}")
+    -d "@results/h6/$id.request.json")
+  [ -n "$resp" ] || echo "   réponse vide — en-têtes : $(head -1 "results/h6/$id.headers" 2>/dev/null) · curl exit=$?"
   t1=$(date +%s.%N)
   dur=$(python3 -c "print(round($t1-$t0,1))")
   echo "$resp" > "results/h6/$id.json"
@@ -47,7 +52,7 @@ ask() {
 user() { python3 -c "import json,sys; print(json.dumps({'role':'user','content':sys.argv[1]}, ensure_ascii=False))" "$1"; }
 
 # H6.1 — thinking, 200 tokens : </think> doit être fermé (reasoning_content ET content non vides)
-ask H6.1 thinking 200 "\"enable_thinking\":true,\"messages\":[$(user "$ref")]"
+ask H6.1 thinking "${H6_1_TOKENS:-200}" "\"enable_thinking\":true,\"reasoning_effort\":\"${H6_1_EFFORT:-low}\",\"messages\":[$(user "$ref")]"
 # H6.2 — quatre prompts, 48 tokens, sans thinking
 ask H6.2a instruct 48 "\"enable_thinking\":false,\"messages\":[$(user "Explique en une phrase ce qu'est la photosynthèse.")]"
 ask H6.2b instruct 48 "\"enable_thinking\":false,\"messages\":[$(user "Écris une fonction Swift qui inverse une chaîne.")]"

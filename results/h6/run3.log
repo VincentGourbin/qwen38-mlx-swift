@@ -1,0 +1,23 @@
+23:40:32 démarrage serveur (Qwen3.8-Flash-Next-MLX-e3bit-MTP, port 8848)
+{"queue":"0","model_loaded":true,"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","status":"running"}
+23:40:34 → H6.1 (thinking, 600 tokens)
+   158.0s · finish=length · reasoning=2609 chars · Le président actuel de la République populaire de Chine est **Xi Jinping**. Il a été élu pour
+23:43:12 → H6.3 (image, 48 tokens)
+   réponse vide — en-têtes : HTTP/1.1 500 Internal Server Error · curl exit=0
+   0.0s · finish=ERREUR · reasoning=0 chars · 
+23:43:12 terminé — results/flash-qualification-rev4.tsv
+id       mode      max_tokens  duree_s  finish  reasoning_chars  content
+H6.1     thinking  200         94.0     length  916
+H6.2a    instruct  48          10.0     length  0                La photosynthèse est le processus biochimique par lequel les plantes, les algues et certaines bactéries convertissent l'énergie lumineuse, le dioxyde de
+H6.2b    instruct  48          9.7      length  0                # Inverser une chaîne en Swift ⏎  ⏎ Voici une fonction Swift qui inverse une chaîne de caractères : ⏎  ⏎ ```swift ⏎ func inverserChaîne(_ cha
+H6.2c    instruct  48          9.9      length  0                La capitale de l'Australie est **Canberra**. ⏎  ⏎ ### Pourquoi pas Sydney ? ⏎  ⏎ Sydney n'est pas la capitale pour des raisons historiques et polit
+H6.2d    instruct  48          2.4      stop    0                The cat is sleeping on the couch.
+H6.3     image     48          0.0      ERREUR  0
+H6.4-t1  instruct  48          9.1      length  0                Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission mi
+H6.4-t2  instruct  48          10.6     length  0                Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. Ava
+H6.1     thinking  600         149.8    length  2779
+H6.3     image     48          0.0      ERREUR  0
+H6.1     thinking  600         158.0    length  2609             Le président actuel de la République populaire de Chine est **Xi Jinping**. Il a été élu pour
+H6.3     image     48          0.0      ERREUR  0
+23:43:12 arrêt serveur
+exit=0

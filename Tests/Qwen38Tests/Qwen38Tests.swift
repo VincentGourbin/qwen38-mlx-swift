@@ -1375,7 +1375,7 @@ func flashTeacherForcedRegressionGuardV32() throws {
     let minLogProb = ProcessInfo.processInfo.environment["QWEN38_QB_MIN_LOGPROB"]
         .flatMap(Double.init) ?? defaultMinLogProb
     #expect(hits >= 10)
-    #expect(score.meanLogProbability >= minLogProb)
+    #expect(Double(score.meanLogProbability) >= minLogProb)
 }
 
 @Test("Le générateur streamé Flash-Next égale le greedy, respecte le contrat de flux et la continuation (H2)")

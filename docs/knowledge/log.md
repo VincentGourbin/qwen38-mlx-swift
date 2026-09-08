@@ -1692,3 +1692,32 @@ en 4-bit, −5,0 en 3-bit, `QWEN38_QB_MIN_LOGPROB` pour surcharger). Le
 `-only-testing` de xcodebuild pour un test Swift Testing libre s'écrit
 `Qwen38Tests/flashTeacherForcedRegressionGuardV32()` (avec les parenthèses ;
 sans elles, 0 test exécuté et `TEST SUCCEEDED`).
+
+## 2026-09-08 (nuit) — H6 : qualification élargie PASS 8/8 sur le checkpoint 3-bit
+
+`Scripts/h6-qualification.sh` sur `local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`,
+serveur Release, greedy, machine en usage courant. Table finale dans
+`results/flash-qualification-rev4.tsv`, JSON bruts dans `results/h6/`.
+
+| Item | Résultat | Verdict |
+|---|---|---|
+| H6.1 thinking (600 tokens, `reasoning_effort: low`) | 2 609 caractères de raisonnement, `</think>` fermé, réponse visible « Le président actuel de la République populaire de Chine est **Xi Jinping**… » | PASS |
+| H6.2a photosynthèse | définition correcte | PASS |
+| H6.2b fonction Swift | `String(chaîne.reversed())` en bloc de code | PASS |
+| H6.2c capitale Australie | Canberra, rivalité Sydney/Melbourne | PASS |
+| H6.2d traduction | « The cat is sleeping on the couch. » (`stop`, 2,4 s) | PASS |
+| H6.3 image | « Sur cette image, on voit **Emmanuel Macron**, le président de la République française. » | PASS |
+| H6.4 deux tours | tour 2 : « Le prédécesseur de Xi Jinping … est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. » | PASS |
+
+Trois corrections en cours de route : (1) le corps `curl` d'une requête image
+(340 Ko) dépasse la taille maximale d'un argument shell → corps via fichier
+(`-d @`) ; (2) `reasoning_effort` par défaut du serveur est `xhigh` : à 600
+tokens le modèle rédige toute sa réponse dans `<think>` sans le fermer ; avec
+`low` il ferme après ~2 600 caractères ; (3) **le serveur refusait toute image
+pour Flash-Next en mode stateless** (`statelessImagesUnsupported`, HTTP 500
+sans corps, garde laissée par H3.2) : `Qwen38FlashNextEngine.generateFromMessages`
+route désormais « une image sur le dernier message utilisateur, sans tour
+assistant précédent » vers le chemin premier tour ; une image dans
+l'historique d'un tour antérieur reste refusée avec un message explicite.
+Débit observé via le serveur : 48 tokens ≈ 10 s (0,2 s/token), thinking 600
+tokens ≈ 100 s après chargement.

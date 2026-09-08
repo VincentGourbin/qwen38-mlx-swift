@@ -37,3 +37,21 @@ actif (63/78 acceptés), tours 2–3 en fallback standard (0 proposition), car
 M1 ne sait pas transporter la table M-RoPE image vers le cache privé du
 drafter. Ce contrôle valide la sécurité de sortie, mais pas encore le gain
 net multi-tour; celui-ci attend le pipeline M2 persistant.
+
+## Flash-Next (`qwen4_exp`) — mode résident, Release, `asyncEval` par couche — 2026-09-08
+
+Prompt de référence « Explique en français qui est le président de la Chine et
+quel est son rôle. » (29 tokens), greedy, `flash-chat-probe --resident-layers
+--resident-async`, checkpoint streamé depuis le Lexar (USB, ExFAT). TTFT =
+chargement one-shot des 48 couches (payé une fois par process ; GUI et
+serveur le gardent résident). Détails : `docs/knowledge/log.md` (P1, Q3.3, H6).
+
+| Date | Checkpoint | Experts | Taille | TTFT (chargement) | Décodage | Pic MLX | Q-B V32 (hits · logprob) | Notes |
+|---|---|---|---|---:|---:|---:|---|---|
+| 2026-09-08 | Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP | 4-bit g32 | 113 Go | 90,9 s | 0,47 s/token (2,1 tok/s) | 75,2 Go | 10/28 · −4,38 | ne tient qu'avec ≤ ~8 Go d'autres apps ; `eval` par couche : 0,60 s/token ; un `eval` différé par token : 2,05 s/token |
+| 2026-09-08 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP (Q3.1) | **3-bit g64** | 84 Go | 60,2 s | **0,22 s/token (4,6 tok/s)** | **56,6 Go** | 10/28 · −4,80 | sortie greedy identique au 4-bit ; H6 8/8 PASS via le serveur (48 tokens ≈ 10 s, image 24 tokens 4,8 s après vision) |
+
+Bench synthétique d'une couche (`flash-layer-bench`, Release, poids aléatoires,
+sans checkpoint) : GDN+MoE 5,5 ms/pas, QSA+MoE 5,8 ms/pas en eager ; 4,5 ms
+avec `asyncEval` (GPU 82 % `ioreg`). Debug : 6,5 / 10,3 ms. Le profiler par
+couche coûte ~4,7 ms par phase (opt-in `--profile-layers` depuis P0-c).

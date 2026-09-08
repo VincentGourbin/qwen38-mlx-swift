@@ -17,7 +17,7 @@ public enum Qwen38FlashNextEngineError: LocalizedError, Equatable {
             return "Flash-Next n'accepte une image qu'au premier tour d'une conversation."
         case .statelessImagesUnsupported:
             return
-                "Flash-Next : les images ne sont pas encore supportées en mode stateless (LAN)."
+                "Flash-Next (LAN) : une image n'est acceptée que sur le dernier message utilisateur, sans tour assistant précédent."
         }
     }
 }
@@ -179,6 +179,22 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     public func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        // H6.3 (2026-09-08): a single image on the last user message, with
+        // at most a system message before it, is exactly the first-turn case
+        // `generate` already handles — route it there instead of failing the
+        // whole LAN request. An image buried in an earlier turn of a replayed
+        // history still has no manual ChatML rendering and stays rejected.
+        if let last = messages.last, last.role == .user, !last.imageURLs.isEmpty,
+           messages.dropLast().allSatisfy({ $0.role == .system && $0.imageURLs.isEmpty }) {
+            guard last.imageURLs.count == 1 else {
+                throw Qwen38FlashNextEngineError.multipleImagesUnsupported
+            }
+            resetConversation()
+            let systemPrompt = messages.dropLast().map(\.content).joined(separator: "\n")
+            return try generate(
+                prompt: last.content, systemPrompt: systemPrompt.isEmpty ? nil : systemPrompt,
+                imageURLs: last.imageURLs, options: options)
+        }
         guard messages.allSatisfy({ $0.imageURLs.isEmpty }) else {
             throw Qwen38FlashNextEngineError.statelessImagesUnsupported
         }

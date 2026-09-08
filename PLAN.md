@@ -3625,3 +3625,30 @@ réelle est `in × bits % 32 == 0`) ; Lexar : 192 Go libres.
 | Q3.2 | Swift : `Qwen4ExpQuantization` lit l'override `experts` ; `Qwen4ExpQuantizationSpec` relaxe la précondition ; `Qwen4ExpSparseMoE` construit `SwitchGLU` avec le spec experts ; loader résident et `dequantize` (oracle E3) choisissent le spec selon la clé ; `Qwen4ExpLayerBench --expert-bits 3` pour mesurer le débit 3-bit. Tests : parse de l'override, module empaqueté 3-bit, bench réduit. | 65+ tests verts, Release construit |
 | Q3.3 | Validation sur le nouveau checkpoint (machine propre, préflight, `caffeinate`) : (a) `flash-teacher-forced-score` sur la séquence V32 — rapporter hit-rate et logprob face aux 10/28 et −4,4 du 4-bit ; (b) `flash-chat-probe … --temperature 0 --max-new-tokens 8 --resident-layers` sur le prompt de référence ; (c) pic mémoire et s/token via le sampler. | tableau 4-bit vs 3-bit dans `log.md` ; décision « qualité acceptable ? » posée à Vincent |
 | P3 (post-G-8) | Déchargement disque des experts : experts sur SSD interne, mmap, gather des 10 experts routés vers un tenseur `[10, out, in]` par couche et par token, LRU d'experts chauds ; à concevoir après Q3. | étude puis prototype sur le bench |
+
+### H6 PASS sur le 3-bit — fiche de démo ⛔ G-8 — 2026-09-08 (nuit)
+
+H6 : 8/8 PASS (`results/flash-qualification-rev4.tsv`, `log.md` « H6 »),
+`BENCHMARKS.md` section Flash-Next ajoutée. Correctif serveur : image
+acceptée sur le dernier message utilisateur en mode stateless.
+
+**Démo G-8 (Vincent)** — checkpoint `local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`,
+binaire Release (`Scripts/build-release.sh`), machine dans son état normal :
+1. GUI : sélectionner le 3-bit dans le catalogue (`/Volumes/Lexar/models/local`),
+   chargement ~60 s avec progression, puis texte / thinking / image / deux tours.
+2. Serveur : onglet Serveur ou `qwen38 serve --model-path …`, puis depuis
+   l'autre Mac : `curl -N` streaming, SDK `openai`, image en `data:` base64.
+3. Comparer au 4-bit si la machine est propre (reboot) : même sortie greedy,
+   0,47 s/token contre 0,22.
+
+**Questions à trancher à G-8** :
+- (a) H validé ; G-1 et G-3 actées rétroactivement ?
+- (b) Checkpoint de référence pour la suite : 3-bit (tient avec les apps
+  ouvertes, 2× plus rapide, −0,42 nat de logprob) ou 4-bit (qualité maximale,
+  machine dédiée) ?
+- (c) Ordre des chantiers post-G-8 : P3 déchargement disque des experts
+  (retour au 4-bit sans la contrainte mémoire, selon l'intuition de Vincent) ;
+  P2-fusion (moins de noyaux par couche, GPU > 32 %) ; P-MTP ; 3-bit direct
+  depuis BF16 (option B) si le 3-bit devient la référence.
+- (d) Réglage de veille du Mac (`sleep 1` sur secteur) : le moteur pose une
+  assertion, mais les probes CLI et les builds longs restent exposés.

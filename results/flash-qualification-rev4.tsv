@@ -1,0 +1,9 @@
+id	mode	max_tokens	duree_s	finish	reasoning_chars	verdict	content
+H6.1	thinking, effort low	600	158.0	length	2609	PASS (</think> fermé, réponse visible en français, sans balise ChatML)	Le président actuel de la République populaire de Chine est **Xi Jinping**. Il a été élu pour
+H6.2a	instruct	48	10.0	length	0	PASS (cohérent)	La photosynthèse est le processus biochimique par lequel les plantes, les algues et certaines bactéries convertissent l'énergie lumineuse, le dioxyde de carbone
+H6.2b	instruct	48	9.7	length	0	PASS (cohérent)	# Inverser une chaîne en Swift ⏎  ⏎ Voici une fonction Swift qui inverse une chaîne de caractères : ⏎  ⏎ ```swift ⏎ func inverserChaîne(_ chaîne: String) -> Str
+H6.2c	instruct	48	9.9	length	0	PASS (cohérent)	La capitale de l'Australie est **Canberra**. ⏎  ⏎ ### Pourquoi pas Sydney ? ⏎  ⏎ Sydney n'est pas la capitale pour des raisons historiques et politiques liées à
+H6.2d	instruct	48	2.4	stop	0	PASS (cohérent)	The cat is sleeping on the couch.
+H6.3	image	48	60.4	length	0	PASS (Emmanuel Macron + rôle)	Sur cette image, on voit **Emmanuel Macron**, le président de la République française. ⏎  ⏎ ### Rôle : ⏎ Il est **le chef de l’État français**, élu au suffrage 
+H6.4-t1	instruct, tour 1	48	9.1	length	0	PASS (cohérent)	Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire cen
+H6.4-t2	instruct, tour 2	48	10.6	length	0	PASS (nomme Hu Jintao)	Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. Avant cela, il
