@@ -1824,3 +1824,15 @@ mécanisme.
 
 Résultats bruts : `results/p2mem-uncached.tsv`, `results/p2mem-cached.tsv`,
 `results/p2mem-4bit-uncached.tsv`.
+
+## 2026-09-09 (nuit) — P2-mem-a : contrôle final du cache de fichiers
+
+Run de contrôle après les commits P2-mem-a (3-bit, résident, `asyncEval`,
+`uncachedIO` par défaut, 4 tokens, sampler toutes les 2 s) : cache de
+fichiers **42,5 Go au départ, maximum 42,5 Go, 32,0 Go à la fin** — aucune
+croissance pendant la lecture de 84 Go, le noyau a même récupéré 10 Go ;
+RSS max 52,2 Go, anonyme max 56,8 Go, IDs identiques (`2229, 85648, 401,
+1147`), TTFT 34 s. Le critère du plan (« `file_gb` < +3 Go pendant le
+chargement ») est donc vérifié de bout en bout ; la mesure contradictoire de
+l'agent venait du cache préexistant des runs précédents, pas du lecteur.
+`F_NOCACHE` reste le défaut.
