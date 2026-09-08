@@ -704,6 +704,35 @@ func validatesQwen4ExpIndexKeys() throws {
     }
 }
 
+@Test("P2-mem-a : le lecteur F_NOCACHE égale bit à bit loadArrays sur un safetensors de test")
+func uncachedTensorReaderMatchesLoadArrays() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-uncached-reader-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let fileURL = directory.appendingPathComponent("shard.safetensors")
+    let arrays: [String: MLXArray] = [
+        "counts": MLXArray((0 ..< 24).map { UInt32($0) }, [2, 3, 4]),
+        "weight": MLXArray(converting: (0 ..< 30).map { Double($0) * 0.5 - 7.5 }, [5, 6])
+            .asType(.bfloat16),
+        "bias": MLXArray((0 ..< 12).map { Float($0) * 1.5 - 9.0 }, [3, 4])
+    ]
+    eval(Array(arrays.values))
+    try MLX.save(arrays: arrays, url: fileURL)
+
+    let reference = try loadArrays(url: fileURL)
+    let reader = try Qwen4ExpUncachedTensorReader(url: fileURL)
+
+    for key in arrays.keys {
+        let expected = try #require(reference[key])
+        let actual = try reader.array(for: key)
+        #expect(actual.shape == expected.shape)
+        #expect(actual.dtype == expected.dtype)
+        #expect(actual.asData(access: .copy).data == expected.asData(access: .copy).data)
+    }
+}
+
 @Test("Le loader retire le décalage +1 des normes Vontra sans toucher au GDN")
 func correctsQwen4ExpShiftedZeroCenteredNorms() {
     let weights: [String: MLXArray] = [

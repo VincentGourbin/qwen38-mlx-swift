@@ -469,46 +469,27 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         let dtype: String
     }
 
+    /// Adapts the shared `Qwen4ExpSafetensorsHeader` parser to this reader's
+    /// row-wise shape (`dataStart`/`rowBytes`/`rowCount`). Only `U32`/`BF16`
+    /// tensors are kept, matching this type's existing contract — the n-gram
+    /// table's `.ngram_embedding.shard_*` weight/scales/biases tensors are
+    /// the only ones it ever looks up.
     private static func readHeader(url: URL) throws -> [String: HeaderDescriptor] {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        guard let lengthData = try handle.read(upToCount: 8), lengthData.count == 8 else {
-            throw Qwen4ExpCheckpointSliceLoaderError.invalidIndex(url)
-        }
-        let headerLength = lengthData.withUnsafeBytes { raw -> UInt64 in
-            raw.enumerated().reduce(UInt64(0)) { value, item in
-                value | UInt64(item.element) << UInt64(item.offset * 8)
-            }
-        }
-        guard headerLength <= UInt64(Int.max),
-              let headerData = try handle.read(upToCount: Int(headerLength)),
-              let object = try JSONSerialization.jsonObject(with: headerData)
-                    as? [String: Any] else {
-            throw Qwen4ExpCheckpointSliceLoaderError.invalidIndex(url)
-        }
+        let header = try Qwen4ExpSafetensorsHeader.read(url: url)
         var result = [String: HeaderDescriptor]()
-        for (key, value) in object {
-            guard let tensor = value as? [String: Any],
-                  let dtype = tensor["dtype"] as? String,
-                  let shapeValues = tensor["shape"] as? [Any],
-                  let offsetValues = tensor["data_offsets"] as? [Any] else { continue }
-            let shape = shapeValues.compactMap { ($0 as? NSNumber)?.intValue }
-            let offsets = offsetValues.compactMap { ($0 as? NSNumber)?.uint64Value }
-            guard shape.count == shapeValues.count, offsets.count == offsetValues.count,
-                  shape.count >= 1, offsets.count == 2 else { continue }
-            let rowCount = shape[0]
-            let elementCount = shape.dropFirst().reduce(1, *)
-            let elementBytes: Int
-            switch dtype {
-            case "U32": elementBytes = 4
-            case "BF16": elementBytes = 2
+        for (key, descriptor) in header.tensors {
+            guard descriptor.shape.count >= 1 else { continue }
+            switch descriptor.dtype {
+            case .uint32, .bfloat16: break
             default: continue
             }
+            let rowCount = descriptor.shape[0]
+            let elementCount = descriptor.shape.dropFirst().reduce(1, *)
             result[key] = HeaderDescriptor(
-                dataStart: 8 + headerLength + offsets[0],
-                rowBytes: elementCount * elementBytes,
+                dataStart: header.dataSectionStart + descriptor.dataOffsets.start,
+                rowBytes: elementCount * descriptor.dtype.byteWidth,
                 rowCount: rowCount,
-                dtype: dtype)
+                dtype: descriptor.dtype.rawValue)
         }
         return result
     }
