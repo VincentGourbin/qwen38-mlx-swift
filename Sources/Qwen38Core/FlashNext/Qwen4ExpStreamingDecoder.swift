@@ -61,6 +61,14 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// P1 has measured it on the real checkpoint; `residentEvaluationInterval`
     /// keeps its meaning (blocking `eval` checkpoints) when this is false.
     public let residentAsyncEval: Bool
+    /// P2-mem-a: read resident tensors with `pread` behind `fcntl(F_NOCACHE,
+    /// 1)` (`Qwen4ExpUncachedTensorReader`) instead of `loadArraysAndMetadata`,
+    /// so the 50-80 GB read from the Lexar during a resident load never fill
+    /// the kernel's file cache (measured +30-40 GB otherwise; see
+    /// docs/knowledge/log.md "H6 : deux tentatives", 2026-09-08 soir, and the
+    /// P2-mem-a entry). Defaults to `true`: validated bit-exact against the
+    /// old path with unchanged peak MLX/RSS.
+    public let uncachedIO: Bool
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -74,7 +82,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         layerLoadingMode: Qwen4ExpLayerLoadingMode = .streamed,
         residentEvaluationInterval: Int = 1,
         profileLayers: Bool = false,
-        residentAsyncEval: Bool = false
+        residentAsyncEval: Bool = false,
+        uncachedIO: Bool = true
     ) throws {
         precondition(residentEvaluationInterval > 0)
         self.directory = directory
@@ -85,6 +94,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.residentEvaluationInterval = residentEvaluationInterval
         self.profileLayers = profileLayers
         self.residentAsyncEval = residentAsyncEval
+        self.uncachedIO = uncachedIO
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -141,7 +151,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     layerIndex,
                     from: directory,
                     index: checkpointIndex,
-                    materialize: materializeLayers)
+                    materialize: materializeLayers,
+                    uncachedIO: uncachedIO)
                 loadDuration = ContinuousClock.now - start
                 if layerLoadingMode == .resident {
                     residentLayers[layerIndex] = loaded

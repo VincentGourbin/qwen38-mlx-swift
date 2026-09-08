@@ -83,7 +83,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     /// real checkpoint, `asyncEval` per layer decoded 6 tokens in 2.33 s
     /// against 2.98 s with a blocking `eval` per layer (-22 %) and 10.25 s
     /// with a single deferred `eval` per token. Same peak memory (75.2 GB).
-    public init(directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true) async throws {
+    public init(
+        directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true,
+        uncachedIO: Bool = true
+    ) async throws {
         self.sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
             reason: "Qwen3.8 Flash-Next resident model")
@@ -96,7 +99,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         // against per-token streaming reload cost.
         self.model = try Qwen4ExpStreamingTextModel(
             directory: directory, layerLoadingMode: .resident, residentEvaluationInterval: 1,
-            profileLayers: profileLayers, residentAsyncEval: residentAsyncEval)
+            profileLayers: profileLayers, residentAsyncEval: residentAsyncEval,
+            uncachedIO: uncachedIO)
         self.generator = Qwen4ExpStreamingGenerator(model: model)
         self.stopTokenIDs = [
             configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),

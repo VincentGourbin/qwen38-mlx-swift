@@ -31,7 +31,8 @@ public enum Qwen4ExpVisionCheckpointLoader {
 
     public static func load(
         from directory: URL,
-        materialize: Bool = true
+        materialize: Bool = true,
+        uncachedIO: Bool = true
     ) throws -> Qwen4ExpLoadedVisionEncoder {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         let indexURL = directory.appendingPathComponent(indexName)
@@ -48,13 +49,28 @@ public enum Qwen4ExpVisionCheckpointLoader {
         }
         var weights = [String: MLXArray]()
         var shards = Set<String>()
+        // See Qwen4ExpCheckpointLayerLoader (P2-mem-a): F_NOCACHE reads keep
+        // the vision tower's shard reads from filling the file cache too.
         for (shard, keys) in selected.sorted(by: { $0.key < $1.key }) {
-            let arrays = try loadArraysAndMetadata(
-                url: directory.appendingPathComponent(shard), stream: .cpu).0
+            let shardURL = directory.appendingPathComponent(shard)
             shards.insert(shard)
+            let reader: Qwen4ExpUncachedTensorReader? = uncachedIO
+                ? try Qwen4ExpUncachedTensorReader(url: shardURL) : nil
+            let arrays: [String: MLXArray]? = uncachedIO
+                ? nil : try loadArraysAndMetadata(url: shardURL, stream: .cpu).0
             for rawKey in keys.sorted() {
-                guard let value = arrays[rawKey] else {
-                    throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                let value: MLXArray
+                if let reader {
+                    do {
+                        value = try reader.array(for: rawKey)
+                    } catch Qwen4ExpUncachedTensorReaderError.missingTensor {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                } else {
+                    guard let cached = arrays?[rawKey] else {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                    value = cached
                 }
                 guard let local = localKey(rawKey) else { continue }
                 weights[local] = value

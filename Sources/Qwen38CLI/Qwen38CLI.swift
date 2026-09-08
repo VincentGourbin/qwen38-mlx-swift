@@ -537,6 +537,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     )
     var residentAsync = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Revenir à `loadArraysAndMetadata` (cache de fichiers du noyau) au lieu de la lecture F_NOCACHE des tenseurs résidents (P2-mem-a, défaut : F_NOCACHE actif)"
+    )
+    var cachedIO = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -599,7 +606,8 @@ struct FlashGenerateProbe: AsyncParsableCommand {
                 throw Qwen4ExpInputMergeError.missingImageTokenID
             }
             profiler.start("Flash vision")
-            let vision = try Qwen4ExpVisionCheckpointLoader.load(from: directory)
+            let vision = try Qwen4ExpVisionCheckpointLoader.load(
+                from: directory, uncachedIO: !cachedIO)
             let processed = try Qwen4ExpImageProcessor.load(
                 from: URL(fileURLWithPath: image),
                 patchSize: configuration.visionConfiguration.patchSize,
@@ -651,7 +659,8 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             layerLoadingMode: residentLayers ? .resident : .streamed,
             residentEvaluationInterval: residentEvalInterval,
             profileLayers: profileLayers,
-            residentAsyncEval: residentAsync)
+            residentAsyncEval: residentAsync,
+            uncachedIO: !cachedIO)
         profiler.end("Flash globals")
         let generator = Qwen4ExpGreedyGenerator(model: model)
         let stopTokens: Set<Int32> = [
@@ -659,7 +668,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             Int32(248044), Int32(248046)
         ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
         if mtp {
-            let loadedMTP = try Qwen4ExpMTPLoader.load(from: directory)
+            let loadedMTP = try Qwen4ExpMTPLoader.load(from: directory, uncachedIO: !cachedIO)
             let result = try generator.generateMTP(
                 promptTokenIDs: promptIDs,
                 predictor: loadedMTP.model,
@@ -989,6 +998,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var residentAsync = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Revenir à `loadArraysAndMetadata` (cache de fichiers du noyau) au lieu de la lecture F_NOCACHE des tenseurs résidents (P2-mem-a, défaut : F_NOCACHE actif)"
+    )
+    var cachedIO = false
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -1048,7 +1064,8 @@ struct FlashChatProbe: AsyncParsableCommand {
             layerLoadingMode: residentLayers ? .resident : .streamed,
             residentEvaluationInterval: residentEvalInterval,
             profileLayers: profileLayers,
-            residentAsyncEval: residentAsync)
+            residentAsyncEval: residentAsync,
+            uncachedIO: !cachedIO)
         profiler.end("Flash globals")
         let generator = Qwen4ExpStreamingGenerator(model: model)
 

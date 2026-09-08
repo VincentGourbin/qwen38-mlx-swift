@@ -176,7 +176,8 @@ public enum Qwen4ExpMTPLoader {
     public static func load(
         from directory: URL,
         materialize: Bool = true,
-        useCheckpointQuantization: Bool = true
+        useCheckpointQuantization: Bool = true,
+        uncachedIO: Bool = true
     ) throws -> Qwen4ExpLoadedMTPPredictor {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
@@ -196,15 +197,30 @@ public enum Qwen4ExpMTPLoader {
 
         var weights = [String: MLXArray]()
         var shards = Set<String>()
+        // See Qwen4ExpCheckpointLayerLoader (P2-mem-a): F_NOCACHE reads keep
+        // MTP's shard reads from filling the file cache too.
         for shard in Set(selected.values).sorted() {
-            let arrays = try loadArraysAndMetadata(
-                url: directory.appendingPathComponent(shard), stream: .cpu).0
+            let shardURL = directory.appendingPathComponent(shard)
             shards.insert(shard)
+            let reader: Qwen4ExpUncachedTensorReader? = uncachedIO
+                ? try Qwen4ExpUncachedTensorReader(url: shardURL) : nil
+            let arrays: [String: MLXArray]? = uncachedIO
+                ? nil : try loadArraysAndMetadata(url: shardURL, stream: .cpu).0
             for (rawKey, mappedShard) in selected where mappedShard == shard {
-                guard let value = arrays[rawKey] else {
-                    throw Qwen4ExpMTPLoaderError.missingTensor(rawKey)
+                let value: MLXArray
+                if let reader {
+                    do {
+                        value = try reader.array(for: rawKey)
+                    } catch Qwen4ExpUncachedTensorReaderError.missingTensor {
+                        throw Qwen4ExpMTPLoaderError.missingTensor(rawKey)
+                    }
+                } else {
+                    guard let cached = arrays?[rawKey] else {
+                        throw Qwen4ExpMTPLoaderError.missingTensor(rawKey)
+                    }
+                    eval(cached)
+                    value = cached
                 }
-                eval(value)
                 guard let local = localKey(rawKey) else { continue }
                 if weights[local] != nil {
                     throw Qwen4ExpMTPLoaderError.duplicateTensor(local)

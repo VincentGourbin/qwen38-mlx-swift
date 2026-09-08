@@ -87,20 +87,40 @@ public enum Qwen4ExpGlobalCheckpointLoader {
 
     public static func load(
         from directory: URL,
-        materialize: Bool = true
+        materialize: Bool = true,
+        uncachedIO: Bool = true
     ) throws -> Qwen4ExpLoadedGlobalTextModel {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         let selected = try selectedKeys(directory: directory)
         var weights = [String: MLXArray]()
         var loadedShards = Set<String>()
 
+        // See Qwen4ExpCheckpointLayerLoader for why `uncachedIO` reads
+        // through `Qwen4ExpUncachedTensorReader` (F_NOCACHE + pread) rather
+        // than `loadArraysAndMetadata` (P2-mem-a). The global tensors are a
+        // few small tensors, but they still share the same shard files as
+        // the huge resident layers, so reading them the old way would still
+        // touch the page cache before the F_NOCACHE reader gets to them.
         for (shard, rawKeys) in selected.sorted(by: { $0.key < $1.key }) {
-            let arrays = try loadArraysAndMetadata(
-                url: directory.appendingPathComponent(shard), stream: .cpu).0
+            let shardURL = directory.appendingPathComponent(shard)
             loadedShards.insert(shard)
+            let reader: Qwen4ExpUncachedTensorReader? = uncachedIO
+                ? try Qwen4ExpUncachedTensorReader(url: shardURL) : nil
+            let arrays: [String: MLXArray]? = uncachedIO
+                ? nil : try loadArraysAndMetadata(url: shardURL, stream: .cpu).0
             for rawKey in rawKeys {
-                guard let array = arrays[rawKey] else {
-                    throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                let array: MLXArray
+                if let reader {
+                    do {
+                        array = try reader.array(for: rawKey)
+                    } catch Qwen4ExpUncachedTensorReaderError.missingTensor {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                } else {
+                    guard let cached = arrays?[rawKey] else {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                    array = cached
                 }
                 guard let local = localKey(rawKey) else { continue }
                 if weights[local] != nil {

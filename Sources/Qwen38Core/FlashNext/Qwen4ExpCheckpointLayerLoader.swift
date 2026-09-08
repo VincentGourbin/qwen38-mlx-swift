@@ -76,7 +76,8 @@ public enum Qwen4ExpCheckpointLayerLoader {
         from directory: URL,
         index: Qwen4ExpCheckpointLayerIndex? = nil,
         materialize: Bool = true,
-        useCheckpointQuantization: Bool = true
+        useCheckpointQuantization: Bool = true,
+        uncachedIO: Bool = true
     ) throws -> Qwen4ExpLoadedDecoderLayer {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         guard configuration.textConfiguration.layerTypes.indices.contains(layerIndex) else {
@@ -97,13 +98,21 @@ public enum Qwen4ExpCheckpointLayerLoader {
         var loadedShards = Set<String>()
         var loadedTensorCount = 0
         for (shard, rawKeys) in selected.sorted(by: { $0.key < $1.key }) {
-            let arrays = try loadArraysAndMetadata(
-                url: directory.appendingPathComponent(shard), stream: .cpu).0
+            let shardURL = directory.appendingPathComponent(shard)
             loadedShards.insert(shard)
+            // `uncachedIO` reads each tensor with `pread` behind `F_NOCACHE`
+            // (Qwen4ExpUncachedTensorReader) instead of `loadArraysAndMetadata`,
+            // so the 50-80 GB of resident-layer tensors read from the Lexar
+            // never fill the kernel's file cache (P2-mem-a, see
+            // docs/knowledge/log.md "H6 : deux tentatives", 2026-09-08 soir).
+            // Skip the reader entirely for n-gram table keys below: like the
+            // lazy `loadArraysAndMetadata` path, this loader never actually
+            // reads their bytes here, only records their shard location.
+            let reader: Qwen4ExpUncachedTensorReader? = uncachedIO
+                ? try Qwen4ExpUncachedTensorReader(url: shardURL) : nil
+            let arrays: [String: MLXArray]? = uncachedIO
+                ? nil : try loadArraysAndMetadata(url: shardURL, stream: .cpu).0
             for rawKey in rawKeys {
-                guard let array = arrays[rawKey] else {
-                    throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
-                }
                 loadedTensorCount += 1
                 if useCheckpointQuantization && isNGramTableKey(rawKey) {
                     rawNGramKeysByShardFile[shard, default: []].append(rawKey)
@@ -114,7 +123,20 @@ public enum Qwen4ExpCheckpointLayerLoader {
                 // forward. The large n-gram tensors take a separate path:
                 // they are not retained as MLX arrays at all, because a later
                 // gather could materialize the complete safetensors mapping.
-                eval(array)
+                let array: MLXArray
+                if let reader {
+                    do {
+                        array = try reader.array(for: rawKey)
+                    } catch Qwen4ExpUncachedTensorReaderError.missingTensor {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                } else {
+                    guard let cached = arrays?[rawKey] else {
+                        throw Qwen4ExpCheckpointSliceLoaderError.missingTensor(rawKey)
+                    }
+                    eval(cached)
+                    array = cached
+                }
                 guard let local = localKey(rawKey, layerIndex: layerIndex) else { continue }
                 if weights[local] != nil {
                     throw Qwen4ExpCheckpointSliceLoaderError.duplicateTensor(local)
