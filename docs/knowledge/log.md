@@ -1667,3 +1667,28 @@ selected-layers) n'ont pas exécuté leur corps — seuls les probes CLI
 manuels ci-dessus ont exercé le vrai checkpoint e3bit. Non-régression 4-bit
 vérifiée : les tests « loader retire/conserve le décalage +1 des normes
 Vontra » restent verts (logique de normes inchangée, non touchée par Q3.2).
+
+## 2026-09-08 (nuit) — Q3.3 : experts 3-bit g64 validés sur la référence
+
+Checkpoint `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+(Q3.1 : experts 71,8 → 50,2 Go, total 84 Go ; erreur de reconstruction
+4-bit → 3-bit ≈ 20 % RMS relative, uniforme sur les couches 0/24/47).
+Mesures Release, résident, `asyncEval`, machine en usage courant (8 à 22 Go
+d'anonyme pour le reste), sans reboot ni purge :
+
+| Mesure | 4-bit Vontra | experts 3-bit g64 |
+|---|---|---|
+| Greedy prompt de référence, 8 tokens, T=0 | « Le président de la Chine est Xi Jinping » | **identique, mêmes 8 IDs** |
+| Q-B teacher-forced V32 (hits / logprob moyen) | 10/28 · −4,377 | **10/28 · −4,800** |
+| TTFT (chargement Lexar) | 90,9 s | 60,2 s |
+| Décodage | 0,47 s/token | **0,22 s/token** |
+| Pic MLX / RSS max | 75,2 / 73,5 Go | **56,6 / 52,4 Go** |
+| Compression système pendant le run | à la limite (0 octet libre) | aucune (3,2 Go stockés, stables) |
+
+Lecture : même nombre de tokens structurels et lexicaux prédits, logprob
+moyen dégradé de 0,42 nat (≈ 10 %), sortie greedy inchangée sur le prompt de
+référence. Le seuil de la garde H6.5 devient dépendant du checkpoint (−4,5
+en 4-bit, −5,0 en 3-bit, `QWEN38_QB_MIN_LOGPROB` pour surcharger). Le
+`-only-testing` de xcodebuild pour un test Swift Testing libre s'écrit
+`Qwen38Tests/flashTeacherForcedRegressionGuardV32()` (avec les parenthèses ;
+sans elles, 0 test exécuté et `TEST SUCCEEDED`).
