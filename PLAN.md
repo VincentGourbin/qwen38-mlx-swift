@@ -3604,3 +3604,24 @@ compresse 60 Go du modèle en dix secondes, même cache de fichiers purgé.
 | H6 (protocole) | Reboot, Terminal seul, préflight ≤ 8 Go, `Scripts/h6-qualification.sh` sans délai. Filet à 30 Go de compresseur uniquement. | `results/flash-qualification-rev4.tsv` complet, verdict par item |
 | P2-mem-a | `Qwen4ExpCheckpointLayerLoader` (et le loader global/vision) : lire les tenseurs via un `FileHandle` avec `fcntl(F_NOCACHE)` + `pread` à l'offset du header safetensors, puis `MLXArray(buffer, shape, dtype)` ; ne plus passer par `loadArraysAndMetadata` pour les couches résidentes. Garde : parité bit-exacte avec l'ancien chemin sur une couche (test), `flash-teacher-forced-score` inchangé. | sampler : `file_gb` reste < 3 Go pendant tout le chargement ; marge apps mesurée ≈ 16 Go au lieu de ~3 |
 | G-4bis (à G-8) | Choisir la réduction d'empreinte : (B) quant maison 3-bit g64 des experts depuis les shards HF BF16 (streaming, ~54 Go d'experts, process ≈ 60 Go) ou (C) requantification 4-bit → 3-bit du checkpoint Vontra (pas de téléchargement, qualité à valider par Q-B, faisable en heures). | décision Vincent |
+
+### G-4bis levée — décision Vincent du 2026-09-08 : tenter le 3-bit (option C), puis viser le déchargement disque
+
+Décision : requantifier les **experts** du checkpoint Vontra de 4-bit g32 vers
+**3-bit g64** (option C, sans téléchargement HF), valider par Q-B et un greedy
+de référence, mesurer le pic mémoire. Attendu : experts 77 → ~53 Go, process
+résident ≈ 60 Go, ce qui laisse ~30 Go au reste de la machine. Vincent
+anticipe que la solution de fond sera ensuite le **déchargement disque des
+experts** (experts mappés en fichier sur le SSD interne, seuls les 10 experts
+routés par couche et par token copiés vers le GPU) : inscrit comme chantier
+P3 post-G-8. Contraintes techniques vérifiées : MLX 0.32.2 (`venv617`)
+quantifie en 3-bit (`[.., 240]` pour 2560 entrées) ; côté Swift,
+`Qwen4ExpQuantizationSpec` exige `32 % bits == 0` (à relaxer : la contrainte
+réelle est `in × bits % 32 == 0`) ; Lexar : 192 Go libres.
+
+| # | Tâche | Critère |
+|---|---|---|
+| Q3.1 | `Scripts/qwen4-exp-requantize-experts.py` (Python `venv617`) : shard par shard, pour chaque tenseur `*.mlp.switch_mlp.{gate,up,down}_proj.weight` avec ses `.scales`/`.biases` : `mx.dequantize(4, g32)` → `mx.quantize(bits=3, group_size=64)` ; tous les autres tenseurs recopiés tels quels (n-gram, attention, shared expert, gates, normes) ; `mx.eval` par tenseur, un shard en mémoire à la fois ; nouvel index et `config.json` avec `"quantization": {"group_size": 32, "bits": 4, "mode": "affine", "experts": {"group_size": 64, "bits": 3, "mode": "affine"}}`. Sortie : `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`. Rapport : taille totale, taille experts, erreur de reconstruction moyenne/max sur 3 experts (4-bit vs 3-bit vs les deux). | dossier complet, `index.json` cohérent, taille experts ≈ 53 Go |
+| Q3.2 | Swift : `Qwen4ExpQuantization` lit l'override `experts` ; `Qwen4ExpQuantizationSpec` relaxe la précondition ; `Qwen4ExpSparseMoE` construit `SwitchGLU` avec le spec experts ; loader résident et `dequantize` (oracle E3) choisissent le spec selon la clé ; `Qwen4ExpLayerBench --expert-bits 3` pour mesurer le débit 3-bit. Tests : parse de l'override, module empaqueté 3-bit, bench réduit. | 65+ tests verts, Release construit |
+| Q3.3 | Validation sur le nouveau checkpoint (machine propre, préflight, `caffeinate`) : (a) `flash-teacher-forced-score` sur la séquence V32 — rapporter hit-rate et logprob face aux 10/28 et −4,4 du 4-bit ; (b) `flash-chat-probe … --temperature 0 --max-new-tokens 8 --resident-layers` sur le prompt de référence ; (c) pic mémoire et s/token via le sampler. | tableau 4-bit vs 3-bit dans `log.md` ; décision « qualité acceptable ? » posée à Vincent |
+| P3 (post-G-8) | Déchargement disque des experts : experts sur SSD interne, mmap, gather des 10 experts routés vers un tenseur `[10, out, in]` par couche et par token, LRU d'experts chauds ; à concevoir après Q3. | étude puis prototype sur le bench |
