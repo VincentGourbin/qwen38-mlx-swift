@@ -3591,3 +3591,16 @@ Détail dans `docs/knowledge/log.md` (entrée « P1 »). Trois faits :
 
 **Suite immédiate** : H6 en un seul process serveur (`qwen38 serve`,
 Release, machine propre, cinq `curl`), puis ⛔ G-8.
+
+### H6 — deux tentatives arrêtées par la mémoire, protocole et tâches — 2026-09-08 (soir)
+
+Détail dans `log.md` (« H6 : deux tentatives »). Fait établi : **le mode
+résident (76 Go de process) n'a de marge que si les autres applications
+occupent ≤ ~8 Go de mémoire anonyme** ; avec 24 Go (VM UTM comprise) le noyau
+compresse 60 Go du modèle en dix secondes, même cache de fichiers purgé.
+
+| # | Tâche | Critère |
+|---|---|---|
+| H6 (protocole) | Reboot, Terminal seul, préflight ≤ 8 Go, `Scripts/h6-qualification.sh` sans délai. Filet à 30 Go de compresseur uniquement. | `results/flash-qualification-rev4.tsv` complet, verdict par item |
+| P2-mem-a | `Qwen4ExpCheckpointLayerLoader` (et le loader global/vision) : lire les tenseurs via un `FileHandle` avec `fcntl(F_NOCACHE)` + `pread` à l'offset du header safetensors, puis `MLXArray(buffer, shape, dtype)` ; ne plus passer par `loadArraysAndMetadata` pour les couches résidentes. Garde : parité bit-exacte avec l'ancien chemin sur une couche (test), `flash-teacher-forced-score` inchangé. | sampler : `file_gb` reste < 3 Go pendant tout le chargement ; marge apps mesurée ≈ 16 Go au lieu de ~3 |
+| G-4bis (à G-8) | Choisir la réduction d'empreinte : (B) quant maison 3-bit g64 des experts depuis les shards HF BF16 (streaming, ~54 Go d'experts, process ≈ 60 Go) ou (C) requantification 4-bit → 3-bit du checkpoint Vontra (pas de téléchargement, qualité à valider par Q-B, faisable en heures). | décision Vincent |

@@ -1512,3 +1512,36 @@ mémoire mesuré.
 (~100 petits noyaux par couche, cf. P2-code (a)), pas une limite du modèle.
 Le levier suivant est la fusion d'ops (moins de noyaux par couche), chantier
 post-G-8.
+
+## 2026-09-08 (soir) — H6 : deux tentatives en process serveur, plafond mémoire confirmé
+
+Script `Scripts/h6-qualification.sh` (serveur `qwen38 serve` Release + cinq
+requêtes OpenAI greedy, un seul chargement). Deux tentatives, toutes deux
+arrêtées pendant le chargement par compression massive du process :
+
+| Tentative | Anonyme des autres apps au départ | Cache fichiers au départ | RSS quand la compression démarre | Compresseur 10 s plus tard |
+|---|---|---|---|---|
+| 17:30 (machine « propre » depuis 15:12) | 6,4 Go | 17 Go | 69 Go | 21 Go (tué par le garde-fou P1 à 9 Go, resté actif par erreur) |
+| 22:49 (après `sudo purge`, mais UTM 6-9 Go + apps rouvertes) | 24 Go | 1,2 Go | 66 Go | **60 Go** (tué par le filet à 30 Go) |
+
+Lecture : le `purge` a bien supprimé le plancher de cache (1,2 Go au lieu de
+17), mais la RAM occupée par les autres applications (24 Go, dont la VM UTM)
+a annulé le gain. Le run (i) de P1 (15:12, 7,3 Go d'apps, cache 9 Go) reste le
+seul passage sans compression, et il l'a fait avec 0,0-0,3 Go de libre.
+**Le mode résident de ce checkpoint (76 Go de process + ~4 Go noyau) exige
+≤ ~8 Go de mémoire anonyme pour le reste de la machine.** Ce n'est pas un
+bug : c'est 113 Go de checkpoint dont 77 Go d'experts 4-bit sur 96 Go de RAM.
+
+Deux mécanismes distincts, mesurés :
+1. **Cache de fichiers pendant le chargement** : les 80 Go lus sur le Lexar
+   transitent par le cache, que le noyau n'évacue pas sous ~9-16 Go tant
+   que la lecture continue. Correctif à nous : lire les tenseurs avec
+   `F_NOCACHE` dans `Qwen4ExpCheckpointLayerLoader` (tâche P2-mem-a).
+2. **Empreinte résidente de 76 Go** : seule une réduction du checkpoint la
+   change — experts 3-bit (§7 / G-4bis), ou experts mappés en fichier (hors
+   portée MLX actuel).
+
+Protocole retenu pour H6/G-8 tant que 1 et 2 ne sont pas faits : reboot,
+n'ouvrir que le Terminal, `Scripts/preflight-resident.sh` ≤ 8 Go, puis
+`Scripts/h6-qualification.sh` immédiatement (≈ 12 min). Le filet garde-fou
+n'est utile qu'à 30 Go ; à 9 Go il tue des runs viables.
