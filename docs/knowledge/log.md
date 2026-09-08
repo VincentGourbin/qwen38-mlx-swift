@@ -1453,3 +1453,62 @@ gonfler son impact. (iii) Le garde-fou de parité pour (e) n'a pas pu
 s'appuyer sur la suite gardée par `QWEN38_FLASH_MODEL` (checkpoint absent,
 interdiction Lexar) : un test autonome équivalent, sans checkpoint, a été
 ajouté à la place et documenté comme tel.
+
+## 2026-09-08 — P1 : la veille du Mac, le cache de fichiers, et le verdict des trois variantes
+
+Trois tentatives du run (i) avant d'obtenir une mesure propre, chacune
+instrumentée par `Scripts/sample-system.sh` (colonnes ajoutées ce jour :
+wired, file-backed, spéculatif, libre, `kern.memorystatus_level`) :
+
+1. **14:36, sur batterie** : le process a été gelé 12 minutes à 47 Go de RSS.
+   `pmset -g log` : `Entering Sleep state due to 'Idle Sleep'` à 14:37:54,
+   `Wake … HID Activity` à 14:49:51. Le profil d'alimentation a `sleep 1`
+   (1 minute d'inactivité) sur batterie **et** sur secteur. Le journal montre
+   des Idle Sleep pendant toutes les campagnes V53/V54 et les essais H6.1 :
+   c'est la cause du « ventilateur silencieux », des runs de 15-25 min et
+   d'une bonne part de la variance 89 s → 1 436 s.
+2. **14:52, sous `caffeinate`, machine chargée (19 Go d'anonyme au départ)** :
+   pression réelle à 57 Go de RSS. Chronologie : la lecture du checkpoint
+   gonfle le cache de fichiers à 46 Go (+17 Go spéculatif), libre → 0 dès
+   29 Go de RSS ; le noyau évacue le cache jusqu'à un plancher de ~20 Go
+   puis, à 70 Go d'anonyme total, compresse le process (compresseur 4 → 29 Go
+   en 6 s). `footprint` : 46 Go « IOAccelerator (graphics) » propres, rien
+   d'anormal dans le process.
+3. **15:12, après reboot (7,3 Go d'anonyme, 0 compresseur, 0 swap), sous
+   `caffeinate`** : run complet. Cache de fichiers évacué de 42 Go à 13 Go
+   pendant le chargement, libre 0,0-0,3 Go au décodage, compresseur ≤ 0,7 Go,
+   quelques centaines de décompressions seulement.
+
+**Verdict P1** (Release, résident, prompt de référence, 6 tokens, preset
+`instruct`, sans `--profile-layers`) :
+
+| Run | Variante | TTFT (chargement) | decode 5 tokens | s/token | GPU % (phase Generation) | Pic MLX |
+|---|---|---|---|---|---|---|
+| (i) | `eval` bloquant par couche | 90,9 s | 2,98 s | 0,60 | 32 | 75,2 Go |
+| (ii) | **`--resident-async`** | 90,9 s | **2,33 s** | **0,47** | 32 | 75,2 Go |
+| (iii) | `--resident-eval-interval 48` (un `eval` différé par token) | 88,0 s | 10,25 s | 2,05 | 8 | 75,2 Go |
+
+(ii) est retenu : `Qwen38FlashNextEngine` passe `residentAsyncEval` à `true`
+par défaut (le décodeur garde `false`, les probes restent explicites). (iii)
+confirme V54 en conditions propres : différer tout le graphe d'un token est
+4× plus lent, ce n'est pas un artefact Debug. Les sorties diffèrent entre
+runs parce que le preset `instruct` échantillonne à température 0,7 ; la
+comparaison de qualité exige `--temperature 0`.
+
+**Reliquat H-A** : nul sur machine propre. Le plafond est structurel : 76 Go
+de process + ~4 Go wirés + ~13 Go de cache fichiers incompressible par le
+noyau ne laissent que ~3-9 Go aux autres applications. En usage courant
+(19-27 Go d'anonyme), macOS compresse le modèle dès 57 Go de RSS. Deux
+sorties possibles, à décider à G-8/G-4bis : experts en 3-bit (§7) ou experts
+mappés en fichier (pages évacuables au lieu de compressibles).
+
+**Deux correctifs de production** : `Qwen38FlashNextEngine` pose une
+assertion `ProcessInfo.beginActivity(.idleSystemSleepDisabled)` pendant toute
+la résidence (GUI et serveur ne dépendent plus de `caffeinate`) ; le préflight
+vérifie l'alimentation et les assertions anti-veille et documente le budget
+mémoire mesuré.
+
+**GPU à 32 % pendant la génération** : c'est le plafond du chemin actuel
+(~100 petits noyaux par couche, cf. P2-code (a)), pas une limite du modèle.
+Le levier suivant est la fusion d'ops (moins de noyaux par couche), chantier
+post-G-8.

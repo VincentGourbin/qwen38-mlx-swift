@@ -5,9 +5,12 @@
 # La bonne métrique n'est PAS « PhysMem used » de top (qui compte le cache de
 # fichiers, ~68 Go après une lecture du checkpoint) mais la mémoire anonyme
 # réellement occupée par les autres processus : pages anonymes + pages stockées
-# dans le compresseur + swap utilisé. Budget : 96 Go − ~77 Go (process résident
-# mesuré V54) − ~4,5 Go (noyau wired) − ~4 Go de marge ≈ 10 Go.
+# dans le compresseur + swap utilisé. Budget : 96 Go − ~76 Go (process résident
+# mesuré P1) − ~4 Go (noyau wired) − ~13 Go de cache fichiers que le noyau
+# refuse d'évacuer ≈ 3-9 Go. Mesuré : 7,3 Go après reboot ⇒ PASS sans
+# compression ; 19 Go en usage courant ⇒ compression du modèle dès 57 Go de RSS.
 set -euo pipefail
+export LC_ALL=C
 
 limit_gb="${QWEN38_PREFLIGHT_LIMIT_GB:-9}"
 checkpoint="${1:-/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
@@ -30,7 +33,13 @@ echo "total à évincer        : ${total_gb} Go  (seuil ${limit_gb} Go)"
 echo "iogpu.wired_limit_mb   : ${wired_mb}  (0 = défaut ≈ 72 Go de working set)"
 echo "GPU utilisation        : ${gpu_util:-?} %"
 echo "process qwen38/python  : ${other}"
+power=$(pmset -g batt | head -1 | grep -o "'[A-Za-z ]*'" | tr -d "'")
+sleep_min=$(pmset -g | awk '/^ sleep/ {print $2}')
+assert=$(pmset -g assertions | grep -cE 'PreventUserIdleSystemSleep.*(caffeinate|Qwen3.8|Flash)' || true)
+echo "alimentation           : ${power} · veille système après ${sleep_min} min · assertions anti-veille : ${assert}"
 status=0
+if [ "${power}" != "AC Power" ]; then echo "AVERTISSEMENT : sur batterie — brancher le secteur (P1 : veille à 1 min sur batterie)"; fi
+if [ "${assert}" = "0" ]; then echo "AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)"; fi
 if [ ! -f "${checkpoint}/config.json" ]; then
   echo "REFUS : checkpoint absent (Lexar non monté ?) : ${checkpoint}"; status=1
 fi

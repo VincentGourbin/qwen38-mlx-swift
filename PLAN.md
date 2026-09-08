@@ -3570,3 +3570,24 @@ devient le défaut de `Qwen38FlashNextEngine` (GUI, serveur) avant H6. Si le
 sampler montre des décompressions soutenues pendant le décodage, P2-mem
 (wiring MLX + sysctl 88000) passe avant H6 ; sinon on enchaîne H6 en un seul
 process serveur, puis G-8.
+
+### P1 exécuté — 2026-09-08
+
+Détail dans `docs/knowledge/log.md` (entrée « P1 »). Trois faits :
+
+1. **Le Mac s'endormait pendant les runs** (`sleep 1` sur batterie et
+   secteur ; Idle Sleep journalisés pendant V53, V54 et les essais H6.1).
+   Correctif : assertion anti-veille posée par `Qwen38FlashNextEngine`
+   pendant la résidence ; préflight étendu (alimentation, assertions).
+2. **Mémoire** : sur machine propre (7 Go d'anonyme après reboot) le mode
+   résident passe sans compression, pic 75,2 Go. En usage courant (19-27 Go)
+   macOS compresse le modèle dès 57 Go de RSS : c'est le décodage CPU-bound
+   d'hier. Plafond structurel, pas un bug ; sortie par §7 (3-bit) ou experts
+   mappés en fichier — à décider à G-8.
+3. **Variante retenue : `asyncEval` par couche** (0,47 s/token contre 0,60
+   avec `eval` par couche et 2,05 avec un `eval` différé par token), défaut
+   du moteur GUI/serveur. GPU 32 % pendant la génération : plafond du chemin
+   à ~100 noyaux par couche, fusion d'ops = chantier post-G-8.
+
+**Suite immédiate** : H6 en un seul process serveur (`qwen38 serve`,
+Release, machine propre, cinq `curl`), puis ⛔ G-8.

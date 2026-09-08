@@ -73,7 +73,20 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     private var hasConversationHistory = false
     private var turnIndex = 0
 
-    public init(directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = false) async throws {
+    /// Keeps macOS from idle-sleeping while a Flash-Next model is resident:
+    /// P1 (2026-09-08) showed the Mac entering 'Idle Sleep' 73 s into a
+    /// resident load (1-minute idle sleep in the power profile), which
+    /// froze every run of the previous three days. Released in `deinit`.
+    private let sleepActivity: NSObjectProtocol
+
+    /// `residentAsyncEval` defaults to `true` since P1 (2026-09-08): on the
+    /// real checkpoint, `asyncEval` per layer decoded 6 tokens in 2.33 s
+    /// against 2.98 s with a blocking `eval` per layer (-22 %) and 10.25 s
+    /// with a single deferred `eval` per token. Same peak memory (75.2 GB).
+    public init(directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true) async throws {
+        self.sleepActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled, .userInitiated],
+            reason: "Qwen3.8 Flash-Next resident model")
         self.directory = directory
         self.configuration = try Qwen4ExpConfiguration.load(from: directory)
         self.tokenizer = try await AutoTokenizer.from(modelFolder: directory)
@@ -90,6 +103,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
         self.visibleTokenFilter = Qwen38VisibleTokenFilter(
             convertTokenToId: tokenizer.convertTokenToId)
+    }
+
+    deinit {
+        ProcessInfo.processInfo.endActivity(sleepActivity)
     }
 
     public func resetConversation() {
