@@ -23,7 +23,8 @@ public final class Qwen4ExpMTPPredictor: Module {
 
     public init(
         configuration: Qwen4ExpTextConfiguration,
-        quantization: Qwen4ExpQuantizationSpec? = nil
+        quantization: Qwen4ExpQuantizationSpec? = nil,
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil
     ) {
         self.configuration = configuration
         guard let fullAttentionLayerIndex = configuration.layerTypes.firstIndex(
@@ -53,7 +54,8 @@ public final class Qwen4ExpMTPPredictor: Module {
             configuration: configuration,
             layerIndex: fullAttentionLayerIndex,
             pleLayerIndex: nil,
-            quantization: quantization)]
+            quantization: quantization,
+            expertsQuantization: expertsQuantization)]
         _hyperConnectionMixer.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration,
             useCombine: false,
@@ -212,9 +214,11 @@ public enum Qwen4ExpMTPLoader {
         }
 
         let quantization = Qwen4ExpQuantizationSpec(configuration.quantization)
+        let expertsQuantization = Qwen4ExpQuantizationSpec.experts(from: configuration.quantization)
         let model = Qwen4ExpMTPPredictor(
             configuration: configuration.textConfiguration,
-            quantization: useCheckpointQuantization ? quantization : nil)
+            quantization: useCheckpointQuantization ? quantization : nil,
+            expertsQuantization: useCheckpointQuantization ? expertsQuantization : nil)
         try update(model: model, weights: weights)
 
         let bytes: Int64

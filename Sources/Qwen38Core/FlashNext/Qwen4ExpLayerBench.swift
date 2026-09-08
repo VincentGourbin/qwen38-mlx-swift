@@ -280,6 +280,13 @@ public enum Qwen4ExpLayerBench {
         warmupSteps: Int = 20,
         measuredSteps: Int = 200,
         quantization: Qwen4ExpQuantizationSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4),
+        /// P0/Q3.2: independent spec for the routed experts (`switch_mlp`).
+        /// `nil` (the default) means "same as `quantization`" — the bench's
+        /// original, unchanged behavior. Passing a 3-bit/g64 spec here lets
+        /// `flash-layer-bench --expert-bits 3` measure the QSA/GDN layer
+        /// throughput with 3-bit-packed experts without touching the rest
+        /// of the layer's quantization.
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
         profiler: MLXProfiler = .shared,
         computeMode: Qwen4ExpLayerBenchComputeMode = .eager
     ) -> Qwen4ExpLayerBenchResult {
@@ -303,7 +310,8 @@ public enum Qwen4ExpLayerBench {
             configuration: configuration,
             layerIndex: 0,
             pleLayerIndex: nil,
-            quantization: quantization)
+            quantization: quantization,
+            expertsQuantization: expertsQuantization)
         let weightArrays = layer.parameters().flattened().map { $0.1 }
         eval(weightArrays)
         let materializedBytes = weightArrays.reduce(Int64(0)) { $0 + Int64($1.nbytes) }

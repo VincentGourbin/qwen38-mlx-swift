@@ -7,12 +7,22 @@ import MLXNN
 /// `quantize(model:)`: quantizing a freshly constructed 512-expert MoE would
 /// first materialize the enormous floating-point initializer.
 public struct Qwen4ExpQuantizationSpec: Sendable, Equatable {
+    /// MLX's affine quantization packs `bits`-wide codes into 32-bit words;
+    /// these are the widths it (and this codebase's kernels) support. The
+    /// real constraint on a given tensor is not "32 % bits == 0" (which
+    /// rejects the valid 3-bit case used by the Q3 expert requantification,
+    /// since 32 % 3 != 0) but that `inputDimensions * bits % 32 == 0` for
+    /// every quantized tensor shape — checked per-call in
+    /// `qwen4ExpPackedInput` below.
+    private static let supportedBitWidths: Set<Int> = [2, 3, 4, 5, 6, 8]
+
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
 
     public init(groupSize: Int, bits: Int, mode: QuantizationMode = .affine) {
-        precondition(groupSize > 0 && bits > 0 && 32 % bits == 0)
+        precondition(groupSize > 0 && Self.supportedBitWidths.contains(bits),
+                     "bits doit appartenir à \(Self.supportedBitWidths)")
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
@@ -28,10 +38,27 @@ public struct Qwen4ExpQuantizationSpec: Sendable, Equatable {
             bits: configuration.bits,
             mode: parsedMode)
     }
+
+    /// Resolves the spec that packs routed-expert (`switch_mlp`) weights.
+    /// A checkpoint's `quantization.experts` override wins when present
+    /// (the Q3 3-bit-g64 expert requantification); otherwise the experts
+    /// share the outer/global spec, which is the Vontra checkpoint's
+    /// current (unchanged) shape.
+    public static func experts(from configuration: Qwen4ExpQuantization?) -> Qwen4ExpQuantizationSpec? {
+        guard let configuration else { return nil }
+        if let override = configuration.experts {
+            guard let mode = override.mode,
+                  let parsedMode = QuantizationMode(rawValue: mode)
+            else { return nil }
+            return Qwen4ExpQuantizationSpec(
+                groupSize: override.groupSize, bits: override.bits, mode: parsedMode)
+        }
+        return Qwen4ExpQuantizationSpec(configuration)
+    }
 }
 
 private func qwen4ExpPackedInput(_ inputDimensions: Int, bits: Int) -> Int {
-    precondition(inputDimensions % 32 == 0 || bits == 8,
+    precondition((inputDimensions * bits) % 32 == 0,
                  "Les dimensions quantifiées Flash-Next doivent être compatibles avec 32 bits")
     return inputDimensions * bits / 32
 }

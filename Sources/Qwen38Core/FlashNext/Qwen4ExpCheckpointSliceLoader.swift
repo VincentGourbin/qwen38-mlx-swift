@@ -100,13 +100,15 @@ public enum Qwen4ExpCheckpointSliceLoader {
         }
 
         let quantization = Qwen4ExpQuantizationSpec(configuration.quantization)
+        let expertsQuantization = Qwen4ExpQuantizationSpec.experts(from: configuration.quantization)
         let normCorrection = Qwen4ExpWeightSanitizer
             .correctShiftedZeroCenteredNormWeights(weights)
         weights = normCorrection.weights
         let model = Qwen4ExpTextModel(
             configuration: configuration.textConfiguration,
             layerIndices: [layerIndex],
-            quantization: quantization)
+            quantization: quantization,
+            expertsQuantization: expertsQuantization)
         try model.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
 

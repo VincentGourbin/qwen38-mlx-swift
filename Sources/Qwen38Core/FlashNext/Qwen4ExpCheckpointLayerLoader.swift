@@ -124,13 +124,16 @@ public enum Qwen4ExpCheckpointLayerLoader {
         }
 
         let checkpointQuantization = Qwen4ExpQuantizationSpec(configuration.quantization)
+        let checkpointExpertsQuantization = Qwen4ExpQuantizationSpec.experts(
+            from: configuration.quantization)
         if !useCheckpointQuantization {
             guard let checkpointQuantization else {
                 throw Qwen4ExpCheckpointSliceLoaderError.invalidIndex(
                     directory.appendingPathComponent("config.json"))
             }
             weights = try dequantize(
-                weights, specification: checkpointQuantization)
+                weights, specification: checkpointQuantization,
+                expertsSpecification: checkpointExpertsQuantization ?? checkpointQuantization)
         }
 
         let normCorrection = Qwen4ExpWeightSanitizer
@@ -161,6 +164,7 @@ public enum Qwen4ExpCheckpointLayerLoader {
             pleLayerIndex: configuration.textConfiguration.pleLayerIDs.firstIndex(
                 of: layerIndex + 1),
             quantization: useCheckpointQuantization ? checkpointQuantization : nil,
+            expertsQuantization: useCheckpointQuantization ? checkpointExpertsQuantization : nil,
             lazyNGramStorage: useCheckpointQuantization ? lazyNGramStorage : nil)
         try layer.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
@@ -224,9 +228,17 @@ public enum Qwen4ExpCheckpointLayerLoader {
     /// Convert a checkpoint-shaped layer to floating-point weights without
     /// instantiating the huge PLE table. E3 uses this only for layers without
     /// PLE; the caller must keep PLE layers on the checkpoint quantization path.
+    ///
+    /// Routed-expert tensors (`switch_mlp` in the key) use
+    /// `expertsSpecification`; every other quantized tensor (attention,
+    /// shared expert, gates, embeddings) uses `specification`. On the
+    /// unmodified Vontra checkpoint the two are equal, so this is a no-op
+    /// change; on a Q3 requantified checkpoint they differ (4-bit g32
+    /// outside the experts, 3-bit g64 inside).
     private static func dequantize(
         _ weights: [String: MLXArray],
-        specification: Qwen4ExpQuantizationSpec
+        specification: Qwen4ExpQuantizationSpec,
+        expertsSpecification: Qwen4ExpQuantizationSpec
     ) throws -> [String: MLXArray] {
         var result = [String: MLXArray]()
         for (key, value) in weights {
@@ -242,13 +254,14 @@ public enum Qwen4ExpCheckpointLayerLoader {
                 result[key] = value
                 continue
             }
+            let spec = key.contains("switch_mlp") ? expertsSpecification : specification
             result[key] = MLX.dequantized(
                 value,
                 scales: scales,
                 biases: weights[base + ".biases"],
-                groupSize: specification.groupSize,
-                bits: specification.bits,
-                mode: specification.mode).asType(.float32)
+                groupSize: spec.groupSize,
+                bits: spec.bits,
+                mode: spec.mode).asType(.float32)
         }
         return result
     }

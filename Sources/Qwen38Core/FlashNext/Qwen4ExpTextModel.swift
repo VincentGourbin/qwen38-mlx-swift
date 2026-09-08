@@ -12,6 +12,7 @@ public final class Qwen4ExpTextModel: Module {
     public let configuration: Qwen4ExpTextConfiguration
     public let layerIndices: [Int]
     public let quantization: Qwen4ExpQuantizationSpec?
+    public let expertsQuantization: Qwen4ExpQuantizationSpec?
 
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     @ModuleInfo(key: "layers") public var layers: [Qwen4ExpDecoderLayer]
@@ -20,10 +21,12 @@ public final class Qwen4ExpTextModel: Module {
     public init(
         configuration: Qwen4ExpTextConfiguration,
         layerIndices: [Int]? = nil,
-        quantization: Qwen4ExpQuantizationSpec? = nil
+        quantization: Qwen4ExpQuantizationSpec? = nil,
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil
     ) {
         self.configuration = configuration
         self.quantization = quantization
+        self.expertsQuantization = expertsQuantization
         let selected = layerIndices ?? Array(0 ..< configuration.numHiddenLayers)
         precondition(!selected.isEmpty)
         precondition(selected.allSatisfy(configuration.layerTypes.indices.contains))
@@ -45,7 +48,8 @@ public final class Qwen4ExpTextModel: Module {
                 configuration: configuration,
                 layerIndex: layerIndex,
                 pleLayerIndex: pleLayerIndex,
-                quantization: quantization)
+                quantization: quantization,
+                expertsQuantization: expertsQuantization)
         }
         _hyperConnectionMixer.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, useCombine: false,

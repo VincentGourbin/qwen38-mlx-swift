@@ -55,7 +55,8 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
     public init(
         configuration: Qwen4ExpTextConfiguration,
         normalizeTopK: Bool = true,
-        quantization: Qwen4ExpQuantizationSpec? = nil
+        quantization: Qwen4ExpQuantizationSpec? = nil,
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil
     ) {
         numExperts = configuration.numExperts
         topK = configuration.numExpertsPerToken
@@ -70,15 +71,21 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         _gate.wrappedValue = qwen4ExpLinear(
             inputDimensions: configuration.hiddenSize, outputDimensions: numExperts,
             quantization: nil)
-        if let quantization {
+        // The routed experts (`switch_mlp`) get their own quantization spec
+        // when the checkpoint declares `quantization.experts` (Q3: 3-bit
+        // g64 experts while attention/shared_expert/gate stay 4-bit g32).
+        // Absent an override, they fall back to the global spec, matching
+        // the unchanged Vontra checkpoint's behavior.
+        let switchMLPQuantization = expertsQuantization ?? quantization
+        if let switchMLPQuantization {
             _switchMLP.wrappedValue = SwitchGLU(
                 inputDims: configuration.hiddenSize,
                 hiddenDims: configuration.moeIntermediateSize,
                 numExperts: numExperts,
                 quantization: (
-                    groupSize: quantization.groupSize,
-                    bits: quantization.bits,
-                    mode: quantization.mode))
+                    groupSize: switchMLPQuantization.groupSize,
+                    bits: switchMLPQuantization.bits,
+                    mode: switchMLPQuantization.mode))
         } else {
             _switchMLP.wrappedValue = SwitchGLU(
                 inputDims: configuration.hiddenSize,

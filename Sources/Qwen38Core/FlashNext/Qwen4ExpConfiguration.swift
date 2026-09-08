@@ -277,11 +277,59 @@ public struct Qwen4ExpQuantization: Decodable, Sendable, Equatable {
     public let groupSize: Int
     public let bits: Int
     public let mode: String?
+    /// Optional per-checkpoint override for the routed-expert
+    /// (`*.mlp.switch_mlp.*`) weights. Absent (the Vontra checkpoint's
+    /// current shape) means the experts share this same spec; a Q3
+    /// requantified checkpoint sets this to `{group_size: 64, bits: 3,
+    /// mode: "affine"}` while attention/shared-expert/gate/norms stay on
+    /// the outer spec.
+    ///
+    /// This is a distinct (non-recursive) type rather than
+    /// `Qwen4ExpQuantization?` again: a struct cannot store a property of
+    /// its own type (Swift rejects it as an infinite-size value type), and
+    /// an experts-of-experts override has no meaning anyway.
+    public let experts: Qwen4ExpQuantizationOverride?
 
     enum CodingKeys: String, CodingKey {
         case groupSize = "group_size"
         case bits
         case mode
+        case experts
+    }
+
+    public init(groupSize: Int, bits: Int, mode: String?, experts: Qwen4ExpQuantizationOverride? = nil) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.experts = experts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        groupSize = try values.decode(Int.self, forKey: .groupSize)
+        bits = try values.decode(Int.self, forKey: .bits)
+        mode = try values.decodeIfPresent(String.self, forKey: .mode)
+        experts = try values.decodeIfPresent(Qwen4ExpQuantizationOverride.self, forKey: .experts)
+    }
+}
+
+/// The `quantization.experts` override block: same shape as
+/// `Qwen4ExpQuantization` minus the (meaningless) nested `experts` field.
+public struct Qwen4ExpQuantizationOverride: Decodable, Sendable, Equatable {
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case groupSize = "group_size"
+        case bits
+        case mode
+    }
+
+    public init(groupSize: Int, bits: Int, mode: String?) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
     }
 }
 

@@ -410,6 +410,69 @@ func validatesQwen4ExpConfiguration() throws {
     #expect(decoded.visionConfiguration.outHiddenSize == 2560)
 }
 
+/// Writes a `qwen4ExpFixtureConfig()`-based directory with an extra
+/// top-level `quantization` block (Q3.2: `experts` override parsing).
+private func writeQwen4ExpFixtureDirectory(
+    named prefix: String, quantization: [String: Any]
+) throws -> URL {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    var config = qwen4ExpFixtureConfig()
+    config["quantization"] = quantization
+    let data = try JSONSerialization.data(withJSONObject: config)
+    try data.write(to: directory.appendingPathComponent("config.json"))
+    return directory
+}
+
+@Test("La configuration Flash-Next lit l'override experts de quantization")
+func qwen4ExpConfigurationParsesExpertsQuantizationOverride() throws {
+    let directory = try writeQwen4ExpFixtureDirectory(
+        named: "qwen4-exp-quant-override-test",
+        quantization: [
+            "group_size": 32, "bits": 4, "mode": "affine",
+            "experts": ["group_size": 64, "bits": 3, "mode": "affine"],
+        ])
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let decoded = try Qwen4ExpConfiguration.load(from: directory)
+    #expect(decoded.quantization?.groupSize == 32)
+    #expect(decoded.quantization?.bits == 4)
+    #expect(decoded.quantization?.experts?.groupSize == 64)
+    #expect(decoded.quantization?.experts?.bits == 3)
+
+    let globalSpec = Qwen4ExpQuantizationSpec(decoded.quantization)
+    let expertsSpec = Qwen4ExpQuantizationSpec.experts(from: decoded.quantization)
+    #expect(globalSpec == Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4))
+    #expect(expertsSpec == Qwen4ExpQuantizationSpec(groupSize: 64, bits: 3))
+    #expect(globalSpec != expertsSpec)
+}
+
+@Test("Sans override, le spec experts est identique au spec global (checkpoint Vontra inchangé)")
+func qwen4ExpConfigurationExpertsSpecFallsBackToGlobalWithoutOverride() throws {
+    let directory = try writeQwen4ExpFixtureDirectory(
+        named: "qwen4-exp-quant-no-override-test",
+        quantization: ["group_size": 32, "bits": 4, "mode": "affine"])
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let decoded = try Qwen4ExpConfiguration.load(from: directory)
+    #expect(decoded.quantization?.experts == nil)
+
+    let globalSpec = Qwen4ExpQuantizationSpec(decoded.quantization)
+    let expertsSpec = Qwen4ExpQuantizationSpec.experts(from: decoded.quantization)
+    #expect(expertsSpec == globalSpec)
+}
+
+@Test("Sans quantization du tout, le spec experts reste nil")
+func qwen4ExpConfigurationExpertsSpecNilWithoutQuantization() throws {
+    let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-quant-absent-test")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let decoded = try Qwen4ExpConfiguration.load(from: directory)
+    #expect(decoded.quantization == nil)
+    #expect(Qwen4ExpQuantizationSpec.experts(from: decoded.quantization) == nil)
+}
+
 @Test("Le validator accepte la famille qwen4_exp sur un checkpoint complet")
 func validatesQwen4ExpFamilyThroughModelValidator() throws {
     let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-validator-test")
@@ -1533,6 +1596,57 @@ func qwen4ExpPrequantizedContainersUsePackedShapes() {
     #expect(switchLinear is QuantizedSwitchLinear)
 }
 
+@Test("Qwen4ExpQuantizationSpec accepte les largeurs de bits non-diviseurs de 32 (3, 5, 6)")
+func qwen4ExpQuantizationSpecAcceptsAllSupportedBitWidths() {
+    for bits in [2, 3, 4, 5, 6, 8] {
+        let spec = Qwen4ExpQuantizationSpec(groupSize: 64, bits: bits)
+        #expect(spec.bits == bits)
+    }
+}
+
+/// Q3.2: the routed experts (`switch_mlp`) can be packed at 3-bit/group_size
+/// 64 while the rest of the layer (shared expert, gate) stays on a
+/// different, independent spec — the shape of a Q3-requantified checkpoint.
+@Test("Le module MoE Flash-Next empaquette les experts en 3-bit g64 avec un spec dédié")
+func qwen4ExpSparseMoEUsesDedicatedExpertsQuantizationSpec() {
+    let configuration = Qwen4ExpTextConfiguration(
+        hiddenSize: 256, numHiddenLayers: 1, numAttentionHeads: 4, numKeyValueHeads: 1,
+        headDim: 64, layerTypes: [.fullAttention], fullAttentionInterval: 1,
+        linearNumKeyHeads: 4, linearNumValueHeads: 8, linearKeyHeadDim: 32,
+        linearValueHeadDim: 32, linearConvKernelDim: 4, numExperts: 8, numExpertsPerToken: 2,
+        moeIntermediateSize: 128, sharedExpertIntermediateSize: 128, indexerBudget: 64,
+        indexerCompressRatio: 4, indexerHeadDim: 64, indexerKVHeads: 1, indexerNHeads: 2,
+        hcCount: 4, hcLowrank: 32, ngramSize: 3, ngramVocabSizeBase: 20_000_000,
+        splitNgramParts: 128, pleLayerIDs: [], pleConvKernelSize: 4, vocabSize: 1_000,
+        maxPositionEmbeddings: 4_096)
+
+    let globalSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4)
+    let expertsSpec = Qwen4ExpQuantizationSpec(groupSize: 64, bits: 3)
+
+    let moe = Qwen4ExpSparseMoE(
+        configuration: configuration, quantization: globalSpec,
+        expertsQuantization: expertsSpec)
+    let parameters = Dictionary(uniqueKeysWithValues: moe.parameters().flattened())
+
+    // hiddenSize=256, bits=3, group_size=64 -> packed = 256*3/32 = 24, scale width = 4.
+    #expect(parameters["switch_mlp.gate_proj.weight"]?.shape == [8, 128, 24])
+    #expect(parameters["switch_mlp.gate_proj.scales"]?.shape == [8, 128, 4])
+    #expect(parameters["switch_mlp.up_proj.weight"]?.shape == [8, 128, 24])
+    // moeIntermediateSize=128, bits=3, group_size=64 -> packed = 128*3/32 = 12, scale width = 2.
+    #expect(parameters["switch_mlp.down_proj.weight"]?.shape == [8, 256, 12])
+    #expect(parameters["switch_mlp.down_proj.scales"]?.shape == [8, 256, 2])
+    // The shared expert and gate stay on the global 4-bit/g32 spec:
+    // hiddenSize=256, bits=4, group_size=32 -> packed = 32.
+    #expect(parameters["shared_expert.gate_proj.weight"]?.shape == [128, 32])
+    #expect(parameters["shared_expert_gate.weight"]?.shape != nil)
+
+    // Without an override, the experts fall back to the global spec —
+    // unchanged behavior for the current Vontra checkpoint.
+    let defaultMoE = Qwen4ExpSparseMoE(configuration: configuration, quantization: globalSpec)
+    let defaultParameters = Dictionary(uniqueKeysWithValues: defaultMoE.parameters().flattened())
+    #expect(defaultParameters["switch_mlp.gate_proj.weight"]?.shape == [8, 128, 32])
+}
+
 @Test("Le bench synthétique d'une couche Flash-Next mesure des durées positives (P0)")
 func qwen4ExpLayerBenchMeasuresPositiveDurations() {
     // Reduced dimensions (real dims are hidden 2560 / 512 experts and would
@@ -1568,6 +1682,50 @@ func qwen4ExpLayerBenchMeasuresPositiveDurations() {
         #expect(result.steps.count == 5)
         #expect(result.steps.allSatisfy { $0.durationSeconds > 0 })
         #expect(result.materializedBytes > 0)
+    }
+}
+
+/// Q3.2: `flash-layer-bench --expert-bits 3` — same dimensions as the P0
+/// bench above, but the routed experts are packed at 3-bit/g64 while the
+/// rest of the layer keeps the default 4-bit/g32 spec. The bench must still
+/// run, and the smaller experts must measurably reduce the layer's
+/// materialized byte count.
+@Test("Le bench de couche Flash-Next accepte un spec experts 3-bit distinct")
+func qwen4ExpLayerBenchAcceptsDedicatedExpertsQuantization() {
+    let dimensions = Qwen4ExpLayerBenchDimensions(
+        hiddenSize: 256,
+        numAttentionHeads: 4,
+        numKeyValueHeads: 1,
+        headDim: 64,
+        linearNumKeyHeads: 4,
+        linearNumValueHeads: 8,
+        linearKeyHeadDim: 32,
+        linearValueHeadDim: 32,
+        linearConvKernelDim: 4,
+        numExperts: 8,
+        numExpertsPerToken: 2,
+        moeIntermediateSize: 64,
+        sharedExpertIntermediateSize: 64,
+        indexerBudget: 64,
+        indexerCompressRatio: 4,
+        indexerHeadDim: 64,
+        indexerKVHeads: 1,
+        indexerNHeads: 2,
+        hcCount: 4,
+        hcLowrank: 32,
+        vocabSize: 1_000,
+        maxPositionEmbeddings: 4_096)
+
+    for kind in [Qwen4ExpLayerBenchKind.gdn, .qsa] {
+        let fourBitExperts = Qwen4ExpLayerBench.run(
+            kind: kind, dimensions: dimensions, warmupSteps: 0, measuredSteps: 3)
+        let threeBitExperts = Qwen4ExpLayerBench.run(
+            kind: kind, dimensions: dimensions, warmupSteps: 0, measuredSteps: 3,
+            expertsQuantization: Qwen4ExpQuantizationSpec(groupSize: 64, bits: 3))
+        #expect(threeBitExperts.steps.count == 3)
+        #expect(threeBitExperts.steps.allSatisfy { $0.durationSeconds > 0 })
+        #expect(threeBitExperts.materializedBytes > 0)
+        #expect(threeBitExperts.materializedBytes < fourBitExperts.materializedBytes)
     }
 }
 

@@ -26,6 +26,7 @@ public final class Qwen4ExpDecoderLayer: Module {
         pleLayerIndex: Int? = nil,
         rmsNormEps: Float = 1e-6,
         quantization: Qwen4ExpQuantizationSpec? = nil,
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
         lazyNGramStorage: Qwen4ExpLazyNGramStorage? = nil
     ) {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
@@ -43,7 +44,8 @@ public final class Qwen4ExpDecoderLayer: Module {
         }
 
         _mlp.wrappedValue = Qwen4ExpSparseMoE(
-            configuration: configuration, quantization: quantization)
+            configuration: configuration, quantization: quantization,
+            expertsQuantization: expertsQuantization)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
             quantization: quantization, parityPrefix: "attn_")

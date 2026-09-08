@@ -1619,3 +1619,51 @@ tenseur-par-tenseur.
 copiés tels quels. Nouveau checkpoint :
 `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`.
 
+## 2026-09-08 — Q3.2 : support Swift du spec experts distinct
+
+`Qwen4ExpQuantization` gagne un champ `experts` optionnel (type distinct
+`Qwen4ExpQuantizationOverride` — un struct ne peut pas contenir un stored
+property de son propre type ; Swift a refusé la première version avec
+« value type has infinite size »). `Qwen4ExpQuantizationSpec.experts(from:)`
+résout le spec effectif des experts : l'override du checkpoint s'il est
+présent, sinon le spec global (comportement inchangé pour Vontra). La
+précondition `32 % bits == 0` de `Qwen4ExpQuantizationSpec.init` était fausse
+pour bits=3 (32 % 3 ≠ 0 alors que 3-bit est un mode MLX valide) ; remplacée
+par une validation contre `{2,3,4,5,6,8}` (largeurs affines supportées par
+MLX/`KVCacheConfiguration`). `qwen4ExpPackedInput` calculait
+`inputDimensions % 32 == 0 || bits == 8` ; la vraie contrainte est
+`(inputDimensions * bits) % 32 == 0`, généralisée pour tout bits valide.
+
+`Qwen4ExpSparseMoE` construit `SwitchGLU` avec le spec experts (fallback sur
+le spec global si absent) ; `sharedExpert`/`sharedExpertGate` restent sur le
+spec global. Le spec experts est remonté à travers
+`Qwen4ExpDecoderLayer` → `Qwen4ExpTextModel`, `Qwen4ExpMTPPredictor`,
+`Qwen4ExpCheckpointLayerLoader` (loader résident et l'oracle E3 `dequantize`,
+qui choisit le spec par clé — `switch_mlp` ⇒ experts), `Qwen4ExpCheckpointSliceLoader`,
+`Qwen4ExpMTPLoader`, et `Qwen4ExpLayerBench` (nouvelles options CLI
+`flash-layer-bench --expert-bits`/`--expert-group-size`).
+`Qwen4ExpGlobalTextModel` n'a pas de MoE, inchangé.
+
+**Validation sur le vrai checkpoint e3bit** (au-delà des tests unitaires,
+sans toucher à Q3.3) : `flash-slice-probe` avec `--run-forward` sur les
+couches 0 (linear_attention), 3 (full_attention), 24 (celle dont un tenseur
+d'expert est splitté source-shard) et 47 (dernière couche) — chargement
+strict (`Module.update(verify: .all)`) et forward réels, tous verts, sortie
+`[1, 4, 2560]`. `flash-mtp-probe --forward` charge le predictor MTP (dont le
+MoE est aussi en 3-bit sur ce checkpoint) et produit un état `[1, 1, 10240]`
+/ logits hidden `[1, 1, 2560]`. Ces probes confirment que le spec experts se
+propage correctement de bout en bout sans exécuter de génération réelle
+(réservée à Q3.3).
+
+**Tests** : 71 tests verts (65 précédents + 6 nouveaux : parse de l'override
+`experts`, fallback au spec global sans override, spec nil sans
+`quantization`, formes du module MoE empaqueté 3-bit g64 avec spec dédié,
+acceptation des bits {2,3,4,5,6,8}, bench réduit avec
+`expertsQuantization`). `Scripts/run-tests.sh` et `Scripts/build-release.sh`
+verts. `QWEN38_FLASH_MODEL` n'était pas défini pendant ce run : les 9 tests
+de parité sur checkpoint réel qui en dépendent (H6.5, générateur streamé,
+bascule 27B↔Flash-Next, parités vision/globaux/single-layer/public-layer/
+selected-layers) n'ont pas exécuté leur corps — seuls les probes CLI
+manuels ci-dessus ont exercé le vrai checkpoint e3bit. Non-régression 4-bit
+vérifiée : les tests « loader retire/conserve le décalage +1 des normes
+Vontra » restent verts (logique de normes inchangée, non touchée par Q3.2).

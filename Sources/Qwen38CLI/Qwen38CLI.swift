@@ -798,6 +798,20 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var skipTrivialMask = false
 
+    @Option(
+        name: .long,
+        help:
+            "Q3.2 : bits des experts routés (switch_mlp) pour ce bench ; défaut = même valeur que la quantification globale (4)"
+    )
+    var expertBits: Int?
+
+    @Option(
+        name: .long,
+        help:
+            "Q3.2 : group_size des experts routés (switch_mlp) pour ce bench ; défaut = même valeur que la quantification globale (32)"
+    )
+    var expertGroupSize: Int?
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -808,6 +822,21 @@ struct FlashLayerBench: AsyncParsableCommand {
         guard asyncInterval > 0 else {
             throw ValidationError("--async-interval doit être positif")
         }
+        if let expertBits {
+            guard [2, 3, 4, 5, 6, 8].contains(expertBits) else {
+                throw ValidationError("--expert-bits doit appartenir à {2,3,4,5,6,8}")
+            }
+        }
+        if let expertGroupSize {
+            guard expertGroupSize > 0 else {
+                throw ValidationError("--expert-group-size doit être positif")
+            }
+        }
+        let expertsQuantization: Qwen4ExpQuantizationSpec? =
+            (expertBits != nil || expertGroupSize != nil)
+            ? Qwen4ExpQuantizationSpec(
+                groupSize: expertGroupSize ?? 32, bits: expertBits ?? 4)
+            : nil
 
         _ = Device.defaultDevice()
         let profiler = MLXProfiler.shared
@@ -851,12 +880,16 @@ struct FlashLayerBench: AsyncParsableCommand {
             return sortedMs[min(max(index, 0), sortedMs.count - 1)]
         }
 
+        if let expertsQuantization {
+            print("experts (switch_mlp): bits=\(expertsQuantization.bits) group_size=\(expertsQuantization.groupSize)")
+        }
         for kind in kinds {
             print("--- couche \(kind.rawValue) ---")
             let result = Qwen4ExpLayerBench.run(
                 kind: kind,
                 warmupSteps: warmup,
                 measuredSteps: steps,
+                expertsQuantization: expertsQuantization,
                 profiler: profiler,
                 computeMode: Qwen4ExpLayerBenchComputeMode(
                     compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval,
