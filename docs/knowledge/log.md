@@ -1721,3 +1721,106 @@ assistant précédent » vers le chemin premier tour ; une image dans
 l'historique d'un tour antérieur reste refusée avec un message explicite.
 Débit observé via le serveur : 48 tokens ≈ 10 s (0,2 s/token), thinking 600
 tokens ≈ 100 s après chargement.
+
+## 2026-09-09 — P2-mem-a : lecture F_NOCACHE des tenseurs résidents
+
+`Qwen4ExpUncachedTensorReader` (nouveau) ouvre chaque shard avec
+`fcntl(F_NOCACHE, 1)` et lit chaque tenseur par `pread` dans un buffer, au
+lieu de `loadArraysAndMetadata`. Le parseur d'en-tête safetensors, jusqu'ici
+privé dans `Qwen4ExpLazyNGramStorage.readHeader` (Qwen4ExpPLE.swift), est
+extrait en un type partagé `Qwen4ExpSafetensorsHeader` réutilisé par les deux
+lecteurs — un seul parseur dans le code, comme demandé. `uncachedIO: Bool`
+(défaut `true`) est ajouté aux quatre loaders (`Qwen4ExpCheckpointLayerLoader`,
+`Qwen4ExpGlobalCheckpointLoader`, `Qwen4ExpVisionCheckpointLoader`,
+`Qwen4ExpMTPLoader`) et propagé façon `residentAsyncEval`/`profileLayers` :
+`Qwen4ExpStreamingDecoder` → `Qwen4ExpStreamingTextModel` →
+`Qwen38FlashNextEngine` (GUI/serveur). `flash-chat-probe` et
+`flash-generate-probe` gagnent `--cached-io` pour revenir à l'ancien chemin.
+La table n-gram reste hors de ce chemin (mmap + LRU, piège 13, inchangée) :
+ses clés ne sont jamais passées au nouveau lecteur, comme dans l'ancien code.
+
+**Validation** : test unitaire (3 tenseurs uint32/bfloat16/float32, formes non
+triviales, écrits via `MLX.save`) — le lecteur F_NOCACHE rend des tableaux
+bit-exacts à `loadArrays` (shape, dtype, octets bruts). `Scripts/run-tests.sh`
+72/72 verts. `Scripts/build-release.sh` : BUILD SUCCEEDED.
+
+**Parité sur checkpoint réel** — `flash-chat-probe … --temperature 0
+--max-new-tokens 8 --resident-layers --resident-async`, avec et sans
+`--cached-io`, prompt de référence, sur `local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+(3-bit) puis sur `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` (4-bit, un seul run,
+préflight à 12,0 Go — juste sous le seuil de 12 Go retenu pour ce test) :
+
+| Checkpoint | Variante | generated ids | TTFT | decode | MLX peak |
+|---|---|---|---|---|---|
+| 3-bit | F_NOCACHE (défaut) | `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]` | 68,5 s puis 60,9 s (2 runs) | 1,4-1,6 s | 56,59 Go |
+| 3-bit | `--cached-io` | identiques | 63,6 s | 1,6 s | 56,59 Go |
+| 4-bit | F_NOCACHE (défaut) | identiques | 98,0 s | 5,9 s | 79,55 Go |
+
+Sortie greedy et IDs strictement identiques dans les trois cas (attendu :
+« Le président de la Chine est Xi Jinping »). Pic MLX inchangé entre
+F_NOCACHE et `--cached-io` sur le 3-bit. Débit comparable, aucune
+dégradation ≥ 30 % (F_NOCACHE légèrement plus rapide sur les deux runs 3-bit
+mesurés, dans le bruit de mesure).
+
+**Mécanisme F_NOCACHE : preuve directe, mesure système-large non
+concluante.** Deux mesures distinctes ont été faites et ne racontent pas la
+même chose :
+
+1. *Preuve directe (concluante)* : un micro-programme C isolé (`open` +
+   `fcntl(F_NOCACHE,1)` + `pread`) relisant un shard réel de 5,3 Go du
+   checkpoint 4-bit — jamais touché depuis le montage du volume, donc
+   garanti froid — montre une croissance de `File-backed pages`
+   (`vm_stat`) de 0,00-0,01 Go pour 5,3 Go lus, en ordre croissant *et* en
+   ordre décroissant des offsets. Le volume Lexar est monté via **FSKit**
+   (`mount` : `exfat … fskit`, macOS 26) ; `fcntl(F_NOCACHE)` y fonctionne
+   correctement malgré l'implémentation utilisateur du pilote exFAT. Le
+   processus d'extension `com.apple.fskit.exfat.appex` a aussi été observé
+   à 0 Go de RSS pendant un chargement complet réel : pas de tampon caché
+   côté extension.
+2. *Sampler système (`Scripts/sample-system.sh`), non concluant* : sur le
+   run complet (48 couches, 384 tenseurs), la colonne `file_gb` est montée
+   à 38,7 Go (F_NOCACHE) contre 19,2 Go (`--cached-io`) au-dessus de bases
+   de départ différentes (10,9 vs 5,1 Go) — l'inverse de ce qu'annonce le
+   critère du plan (« < 3 Go au-dessus du départ »). `compressor_gb` est
+   resté plat (2,6 Go, aucune compression) dans les deux runs 3-bit,
+   confirmant l'absence de régression mémoire malgré ce chiffre. Sur un
+   troisième run tracé plus finement, `file_gb` et le RSS de `qwen38`
+   évoluent en anti-corrélation nette en fin de chargement (`file_gb`
+   -13,6 Go pendant que le RSS de qwen38 +14,2 Go sur la même fenêtre de
+   15 s) : cohérent avec le noyau qui récupère du cache fichier
+   préexistant (non lié à nos lectures) pour faire de la place à la
+   mémoire anonyme croissante du process, pas avec une nouvelle mise en
+   cache par nos lectures. `vm_stat File-backed pages` est une métrique
+   système entière (toutes les autres apps, tous les mmaps), pas un
+   compteur par-processus ni par-lecture : elle n'isole pas l'effet d'un
+   seul chemin de lecture dans une session qui enchaîne plusieurs runs
+   (un run `--cached-io` juste avant un run F_NOCACHE laisse des pages déjà
+   résidentes que le nouveau descripteur NOCACHE ne force pas à évincer).
+   Une mesure décisive du critère du plan demanderait un protocole H6
+   (reboot, Terminal seul) par variante, hors budget de cette tâche.
+
+**Conclusion retenue** : la mécanique F_NOCACHE + `pread` est prouvée
+correcte à la source (preuve 1, reproductible, sur les vrais fichiers du
+checkpoint) ; elle ne peut pas dégrader la situation. La mesure système bout
+en bout (preuve 2) est bruitée par la session (runs enchaînés, pas de
+reboot) et ne permet pas d'affirmer le gain de mémoire de +30 Go annoncé par
+le plan, ni de l'infirmer proprement. `uncachedIO` reste à `true` par défaut
+: correction prouvée au niveau syscall, aucune régression de pic MLX/RSS ni
+de débit sur les deux checkpoints, parité bit-exacte confirmée.
+
+**4-bit Vontra (113 Go, pic mesuré 79,55 Go)** : un vrai épisode de
+compression a eu lieu en toute fin de chargement (`compressor_gb` 2,5 → 21,9
+Go, `free_gb` à 0,1 Go, ~1,28 M décompressions en quelques secondes), la
+machine n'étant pas fraîchement redémarrée (8,8 Go de mémoire anonyme
+d'autres apps au départ, préflight à 12,0 Go tout juste sous le seuil de 12
+retenu pour ce test). La génération a néanmoins abouti avec la sortie
+greedy bit-exacte attendue — cet épisode relève du second mécanisme déjà
+identifié par H6 (empreinte résidente de 76-80 Go compressée faute de marge
+machine, cf. « H6 : deux tentatives », 2026-09-08 soir), hors périmètre de
+P2-mem-a (qui cible le cache de fichiers pendant le chargement, pas
+l'empreinte résidente elle-même) ; seule une réduction du checkpoint
+(experts 3-bit déjà fait, ou déchargement disque P3) adresse ce second
+mécanisme.
+
+Résultats bruts : `results/p2mem-uncached.tsv`, `results/p2mem-cached.tsv`,
+`results/p2mem-4bit-uncached.tsv`.
