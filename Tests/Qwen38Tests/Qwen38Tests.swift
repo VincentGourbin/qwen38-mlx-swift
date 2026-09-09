@@ -825,6 +825,56 @@ func qwen4ExpQSAKVCacheTracksIndexerState() {
     #expect(cache.indexerTokenCount == 2)
 }
 
+@Test("PM4.1 : gatedDeltaUpdateWithStates égale T forwards à un token, y égale le kernel upstream")
+func qwen4ExpGatedDeltaUpdateWithStatesMatchesSingleStepForwards() {
+    MLXRandom.seed(4_010_1)
+    // Dk a multiple of 32 so the reference per-step calls below actually
+    // exercise the fused Metal kernel (`gatedDeltaUpdate` routes to it only
+    // when `Dk % 32 == 0`), matching the letter of PM4.1 ("y égale la
+    // sortie du kernel upstream"). At Dk == 32 the kernel's inner Kahan loop
+    // runs exactly one iteration (`n_per_t = Dk / 32 == 1`), so it cannot
+    // itself introduce a summation-order difference against the plain
+    // ops-based recurrence under test.
+    let B = 1, T = 3, Hk = 2, Hv = 4, Dk = 32, Dv = 8
+    let q = MLXRandom.normal([B, T, Hk, Dk])
+    let k = MLXRandom.normal([B, T, Hk, Dk])
+    let v = MLXRandom.normal([B, T, Hv, Dv])
+    let a = MLXRandom.normal([B, T, Hv])
+    let b = MLXRandom.normal([B, T, Hv])
+    let aLog = MLXRandom.normal([Hv])
+    let dtBias = MLXRandom.normal([Hv])
+    eval(q, k, v, a, b, aLog, dtBias)
+
+    let (yBatched, states) = gatedDeltaUpdateWithStates(
+        q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias)
+    eval(yBatched, states)
+    #expect(states.shape == [B, T, Hv, Dv, Dk])
+    #expect(yBatched.shape == [B, T, Hv, Dv])
+
+    // Reference: the public upstream primitive, one token at a time,
+    // threading its recurrent state exactly like a real decode loop.
+    var state: MLXArray?
+    var referenceYs: [MLXArray] = []
+    for t in 0 ..< T {
+        let (yStep, newState) = gatedDeltaUpdate(
+            q: q[0..., t ..< (t + 1)], k: k[0..., t ..< (t + 1)], v: v[0..., t ..< (t + 1)],
+            a: a[0..., t ..< (t + 1)], b: b[0..., t ..< (t + 1)],
+            aLog: aLog, dtBias: dtBias, state: state)
+        eval(yStep, newState)
+        referenceYs.append(yStep)
+        state = newState
+
+        let batchedStateAtT = states[0..., t]
+        eval(batchedStateAtT)
+        let stateDiff = MLX.abs(batchedStateAtT - newState).max().item(Float.self)
+        #expect(stateDiff < 1e-5, "état intermédiaire t=\(t) : écart \(stateDiff)")
+    }
+    let referenceY = concatenated(referenceYs, axis: 1)
+    eval(referenceY)
+    let yDiff = MLX.abs(yBatched.asType(.float32) - referenceY.asType(.float32)).max().item(Float.self)
+    #expect(yDiff < 1e-3, "sortie y : écart \(yDiff) vs kernel upstream par étape")
+}
+
 @Test("QSA retombe sur le masque causal avant le budget puis sélectionne les blocs")
 func qwen4ExpQSAMaskUsesDenseFallbackAndSparseBlocks() {
     let query = MLXArray([
