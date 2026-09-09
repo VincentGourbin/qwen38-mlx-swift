@@ -3764,3 +3764,30 @@ branchement opt-in ») ; détail complet et écarts assumés :
 et son addendum « PM4.3 (branchement) ». **PM4.4 non exécutée** (hors
 périmètre de cette session : mémoire insuffisante sur cette machine, run
 précédent tué).
+
+### P4 — Débit de décodage : mesurer exactement, puis fusionner — plan du 2026-09-09
+
+**Point de départ (3-bit, Release, résident, `asyncEval` par couche, prompt de
+référence)** : greedy 0,166 s/token (6 tok/s, 48 couches ≈ 3,4 ms/couche),
+MTP bloc 2 0,135 s/token (48 % d'acceptation), GPU ~32 %. Bench synthétique :
+4,5 ms/couche `asyncEval`, ~0,5 ms de calcul utile. Préfill sain (87-190
+tok/s). P2-fusion (F1/F2/F4) a supprimé ~10 % des ops sans gain mesurable :
+le coût est réparti sur toutes les petites opérations, et personne n'a
+encore **compté** les noyaux réellement lancés par couche ni vu la timeline
+GPU. Ce plan commence par cette mesure, puis n'attaque que ce qu'elle
+désigne. Règle : un levier est conservé s'il gagne ≥ 5 % sur le modèle réel
+à IDs identiques ; sinon il est retiré et consigné.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P4.0 | **Metal System Trace** (`xcrun xctrace record --template 'Metal System Trace' --launch -- <binaire> …`, puis `xctrace export --xpath` ou ouverture dans Instruments) sur (a) le bench `flash-layer-bench --steps 50 --async-interval 8` et (b) le modèle réel `flash-chat-probe … --max-new-tokens 8`. Extraire : nombre de noyaux Metal par couche et par token (par nom de noyau, agrégés par famille), durée GPU totale par token, durée d'encodage CPU, temps mort GPU entre noyaux, nombre de command buffers par token. Même chose avec `Time Profiler` sur 10 s de décodage pour la répartition CPU (MLX eval/encode vs Swift vs noyau). | tableau « famille de noyau · nombre/couche · µs GPU/couche » dans `log.md`, trace `.trace` conservée dans `results/` |
+| P4.1 | Granularité des command buffers : `residentAsyncEval` gagne un intervalle `residentAsyncInterval` (asyncEval toutes les N couches, `eval` bloquant en fin de token) ; mesurer N = 1, 2, 4, 8, 12 sur le modèle réel (32 tokens, 2 runs chacun). | s/token par N ; le meilleur devient le défaut si ≥ 5 % |
+| P4.2 | Fin de token : mesurer `lm_head` (248 320 × 2 560 quantifié), `sampler.sample` et `.item()` (`Qwen4ExpStreamingGenerator.swift:222`) par token (`ContinuousClock`) ; si > 10 % du token : argmax/top-k sur GPU sans passage par le CPU pour la logique de sampling, un seul `.item()` par token, `lm_head` évalué en `asyncEval` avec la dernière couche. | ms/token avant/après |
+| P4.3 | Fusions guidées par P4.0, une par une, chacune derrière `Qwen4ExpFusionLevel`, avec test de parité (bit-exact ou 1e-3) et mesure réelle : candidats attendus (à confirmer par P4.0) — (a) pré/post-traitement GDN (gating `-exp(A_log)·softplus`, `sigmoid(b)`, fenêtre conv1d, RMSNormGated) en un noyau `MLXFast.metalKernel` ; (b) mix + injection des hyper-connections en un noyau ; (c) routage MoE (softmax, top-10, normalisation, tri des indices) en un noyau ; (d) toute famille de copies/`asType` que P4.0 montre > 10 % du temps GPU ou du nombre de noyaux. | par levier : noyaux/couche avant/après, s/token, parité ; conservé si ≥ 5 % |
+| P4.4 | Warm-up du premier forward : la GUI mesure 2,39 s de TTFT pour 59 tokens (40 ms/token) contre 5 ms/token en préfill chaud. Mesurer le premier forward après chargement avec `--profile-layers` : compilation des noyaux ? premier accès aux poids résidents ? misses n-gram à froid sur le Lexar (P4.5) ? `Qwen38FlashNextEngine.warmUp` fait déjà un forward factice d'un token : l'étendre à un préfill factice (8-16 tokens, 2 couches ?) si c'est la compilation. | TTFT GUI premier tour < 1 s pour 59 tokens |
+| P4.5 | Misses n-gram à froid : mesurer la latence d'un miss sur le Lexar pages froides vs chaudes (`Qwen4ExpLazyNGramStorage`, compteurs existants + horloge) ; si > 0,5 ms à froid, lire les lignes du prompt en **une passe triée par offset** (un `pread` par plage contiguë) au lieu de ligne par ligne ; option `QWEN38_NGRAM_PREWARM` qui lit séquentiellement les shards n-gram au chargement (35 Go, ~50 s sur USB, pages en cache) pour les sessions longues. | TTFT premier tour avant/après, `ngram_cache_misses` inchangé |
+| P4.6 | Validation finale : IDs identiques au greedy de référence (32 tokens), garde Q-B (`-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()`), tok/s greedy et MTP avant/après dans `BENCHMARKS.md`, 78+ tests verts. | tableau récapitulatif dans `log.md` |
+
+Hors périmètre de P4 : le 4-bit (mémoire), P3 (déchargement disque), la
+fusion « toute la couche en un kernel » (réécriture complète, à décider
+après P4.0), le préfill (sain).

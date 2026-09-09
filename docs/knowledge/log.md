@@ -2553,3 +2553,19 @@ L'incertitude « I/O Lexar par token » est levée. Un gain de TTFT (60 s → ~1
 demande la copie complète (`--full`, +54 Go). Le premier run après la copie
 paie le premier accès aux pages (×2 sur 32 tokens) : ne jamais mesurer sur un
 premier run.
+
+## 2026-09-09 — Copie hybride supprimée ; le préfill n'est pas un goulot
+
+Décision Vincent : la copie hybride du 3-bit sur le SSD interne est supprimée
+(aucun gain en régime établi) ; le Lexar reste la source. Deux mesures de
+préfill faites avant, Release, résident, `asyncEval` :
+
+| Prompt | tokens | vision | forward préfill (hors chargement) | tok/s |
+|---|---|---|---|---|
+| texte répété | 408 | — | 4,7 s (dont ~2 s de n-gram en couche 1, 19 632 misses à ~0,1 ms, pages chaudes) | 87 |
+| image de référence | 976 | 2,46 s | 5,1 s | 190 |
+
+Le « TTFT 48-68 s » des probes est le chargement des couches, pas le préfill.
+Le préfill est donc sain ; reste à vérifier le coût des misses n-gram **à
+froid** (premier tour après chargement : 59 tokens → 2,39 s de TTFT en GUI,
+soit 40 ms/token contre 5 ms/token à chaud), tâche P4.5.

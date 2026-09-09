@@ -1,0 +1,328 @@
+prompt tokens: 408
+generated ids: [2229, 85648]
+decoded: "Le président"
+TTFT: 68.173s
+prefill: 68.169s
+decode: 0.764s
+couches: 96 visites · load cumulé 63.801s · forward cumulé 4.685s
+MLX mémoire active: 56,24 GB
+MLX mémoire peak: 57,58 GB
+
+╭──────────────────────────────────────────────────────────────────╮
+│  QWEN3.8 FLASH-NEXT GREEDY PROBE                                 │
+├──────────────────────────────────────────────────────────────────┤
+  decoded: Le président  generated_ids: 2229,85648  image: none  layer_forward_seconds: 4.684712  layer_load_seconds: 63.800864  layer_visits: 96  max_new_tokens: 2  model: Qwen3.8-Flash-Next-MLX-e3bit-MTP  mtp: false  ngram_cache_entries: 2304  ngram_cache_hit_rate: 0.5000  ngram_cache_hits: 19632  ngram_cache_misses: 19632  prompt_tokens: 408  thinking: false
+  Device: applegpu_g15s  RAM: 96GB
+
+  PHASE TIMINGS                                    GPU%   CPU%
+  ──────────────────────────────────────────────────────────────────
+  Prefill                1m 08.2s   49.2% ████   46%   20.9%
+  Generation               759.2ms    0.5%    16%   93.5%
+  Flash globals            971.0ms    0.7%     2%   18.1%
+  Flash couche 0            1.69s     1.2%    10%    1.2%
+  Flash couche 1            3.47s     2.5%    11%    0.6%
+  Flash couche 2            1.42s     1.0%    15%    0.8%
+  Flash couche 3            1.41s     1.0%    15%    1.1%
+  Flash couche 4            1.44s     1.0%    18%    0.8%
+  Flash couche 5            1.45s     1.0%    20%    0.8%
+  Flash couche 6            1.43s     1.0%    15%    0.9%
+  Flash couche 7            1.40s     1.0%    20%    0.9%
+  Flash couche 8            1.42s     1.0%    16%    0.9%
+  Flash couche 9            1.43s     1.0%    17%    0.9%
+  Flash couche 10           1.42s     1.0%    17%    0.9%
+  Flash couche 11           1.41s     1.0%    18%    0.9%
+  Flash couche 12           1.43s     1.0%    17%    0.8%
+  Flash couche 13           1.41s     1.0%    16%    0.8%
+  Flash couche 14           1.45s     1.0%    20%    0.8%
+  Flash couche 15           1.42s     1.0%    15%    0.8%
+  Flash couche 16           1.43s     1.0%    21%    0.8%
+  Flash couche 17           1.47s     1.1%    17%    0.8%
+  Flash couche 18           1.51s     1.1%    13%    0.8%
+  Flash couche 19           1.44s     1.0%    14%    0.8%
+  Flash couche 20           1.42s     1.0%    20%    0.8%
+  Flash couche 21           1.44s     1.0%    20%    0.8%
+  Flash couche 22           1.41s     1.0%    15%    0.9%
+  Flash couche 23           1.42s     1.0%    17%    1.1%
+  Flash couche 24           1.44s     1.0%    15%    0.9%
+  Flash couche 25           1.44s     1.0%    20%    0.9%
+  Flash couche 26           1.44s     1.0%    16%    0.9%
+  Flash couche 27           1.42s     1.0%    15%    1.1%
+  Flash couche 28           1.47s     1.1%    19%    0.9%
+  Flash couche 29           1.43s     1.0%    23%    0.9%
+  Flash couche 30           1.43s     1.0%    17%    0.8%
+  Flash couche 31          738.2ms    0.5%    18%    1.7%
+  Flash couche 32           1.44s     1.0%    20%    0.8%
+  Flash couche 33           1.44s     1.0%    18%    0.9%
+  Flash couche 34           1.45s     1.0%    13%    0.9%
+  Flash couche 35           1.42s     1.0%    18%    0.9%
+  Flash couche 36           1.47s     1.1%    17%    0.8%
+  Flash couche 37           1.45s     1.0%    23%    0.9%
+  Flash couche 38           1.46s     1.1%    15%    0.8%
+  Flash couche 39           1.46s     1.1%    15%    0.9%
+  Flash couche 40           1.37s     1.0%    26%    1.0%
+  Flash couche 41          749.8ms    0.5%    20%    1.7%
+  Flash couche 42          746.2ms    0.5%    20%    2.5%
+  Flash couche 43          972.5ms    0.7%    23%    1.3%
+  Flash couche 44          756.2ms    0.5%    20%    2.0%
+  Flash couche 45           1.44s     1.0%    27%    1.1%
+  Flash couche 46           1.45s     1.0%    19%    1.1%
+  Flash couche 47           1.43s     1.0%    20%    0.2%
+  Flash couche 0            16.3ms    0.0%    10%  125.5%
+  Flash couche 1            50.7ms    0.0%    11%   42.3%
+  Flash couche 2            11.1ms    0.0%    15%  101.1%
+  Flash couche 3            14.3ms    0.0%    15%  108.3%
+  Flash couche 4            11.8ms    0.0%    18%   96.5%
+  Flash couche 5            11.8ms    0.0%    20%   96.5%
+  Flash couche 6            12.7ms    0.0%    15%   97.1%
+  Flash couche 7            13.2ms    0.0%    20%   99.2%
+  Flash couche 8            13.9ms    0.0%    16%   90.8%
+  Flash couche 9            12.6ms    0.0%    17%   98.0%
+  Flash couche 10           12.5ms    0.0%    17%   97.2%
+  Flash couche 11           13.0ms    0.0%    18%   99.0%
+  Flash couche 12           12.2ms    0.0%    17%   96.9%
+  Flash couche 13           11.9ms    0.0%    16%   96.3%
+  Flash couche 14           11.5ms    0.0%    20%   95.8%
+  Flash couche 15           12.2ms    0.0%    15%   98.1%
+  Flash couche 16           11.8ms    0.0%    21%   96.4%
+  Flash couche 17           11.8ms    0.0%    17%   95.9%
+  Flash couche 18           11.9ms    0.0%    13%   96.5%
+  Flash couche 19           12.1ms    0.0%    14%   98.4%
+  Flash couche 20           11.6ms    0.0%    20%   96.1%
+  Flash couche 21           11.9ms    0.0%    20%   96.4%
+  Flash couche 22           12.9ms    0.0%    15%   93.9%
+  Flash couche 23           14.9ms    0.0%    17%  100.1%
+  Flash couche 24           12.9ms    0.0%    15%   97.8%
+  Flash couche 25           12.9ms    0.0%    20%   97.1%
+  Flash couche 26           13.0ms    0.0%    16%   97.6%
+  Flash couche 27           15.4ms    0.0%    15%   99.5%
+  Flash couche 28           14.2ms    0.0%    19%   97.1%
+  Flash couche 29           13.2ms    0.0%    23%   96.9%
+  Flash couche 30           12.3ms    0.0%    17%   96.6%
+  Flash couche 31           12.4ms    0.0%    18%   98.5%
+  Flash couche 32           12.2ms    0.0%    20%   96.5%
+  Flash couche 33           12.8ms    0.0%    18%   97.2%
+  Flash couche 34           12.9ms    0.0%    13%   96.7%
+  Flash couche 35           13.2ms    0.0%    18%   99.0%
+  Flash couche 36           13.0ms    0.0%    17%   93.4%
+  Flash couche 37           13.2ms    0.0%    23%   94.5%
+  Flash couche 38           12.5ms    0.0%    15%   96.0%
+  Flash couche 39           13.1ms    0.0%    15%   96.7%
+  Flash couche 40           13.8ms    0.0%    26%   95.1%
+  Flash couche 41           13.4ms    0.0%    20%   94.8%
+  Flash couche 42           19.0ms    0.0%    20%   96.2%
+  Flash couche 43           12.9ms    0.0%    23%   96.7%
+  Flash couche 44           15.6ms    0.0%    20%   96.0%
+  Flash couche 45           16.4ms    0.0%    27%   95.6%
+  Flash couche 46           16.6ms    0.0%    19%   95.3%
+  Flash couche 47            6.6ms    0.0%    20%   51.6%
+  ──────────────────────────────────────────────────────────────────
+  TOTAL                  2m 18.6s  100.0%
+
+  MEMORY
+  ──────────────────────────────────────────────────────────────────
+  Peak MLX Active: 54589.2 MB
+  Peak Process: 56623.0 MB
+
+  Memory Timeline:
+    begin:Flash globals                 MLX:     0.0 MB
+    end:Flash globals                   MLX:   761.8 MB
+    begin:Prefill                       MLX:   761.8 MB
+    begin:Flash couche 0                MLX:   761.8 MB
+    end:Flash couche 0                  MLX:  1888.9 MB
+    begin:Flash couche 1                MLX:  1888.9 MB
+    end:Flash couche 1                  MLX:  3026.0 MB
+    begin:Flash couche 2                MLX:  3026.0 MB
+    end:Flash couche 2                  MLX:  4135.1 MB
+    begin:Flash couche 3                MLX:  4135.1 MB
+    end:Flash couche 3                  MLX:  5240.8 MB
+    begin:Flash couche 4                MLX:  5240.8 MB
+    end:Flash couche 4                  MLX:  6358.1 MB
+    begin:Flash couche 5                MLX:  6358.1 MB
+    end:Flash couche 5                  MLX:  7475.3 MB
+    begin:Flash couche 6                MLX:  7475.3 MB
+    end:Flash couche 6                  MLX:  8592.5 MB
+    begin:Flash couche 7                MLX:  8592.5 MB
+    end:Flash couche 7                  MLX:  9692.8 MB
+    begin:Flash couche 8                MLX:  9692.8 MB
+    end:Flash couche 8                  MLX: 10810.0 MB
+    begin:Flash couche 9                MLX: 10810.0 MB
+    end:Flash couche 9                  MLX: 11927.3 MB
+    begin:Flash couche 10               MLX: 11927.3 MB
+    end:Flash couche 10                 MLX: 13068.4 MB
+    begin:Flash couche 11               MLX: 13044.5 MB
+    end:Flash couche 11                 MLX: 14144.7 MB
+    begin:Flash couche 12               MLX: 14144.7 MB
+    end:Flash couche 12                 MLX: 15277.9 MB
+    begin:Flash couche 13               MLX: 15262.0 MB
+    end:Flash couche 13                 MLX: 16379.3 MB
+    begin:Flash couche 14               MLX: 16379.3 MB
+    end:Flash couche 14                 MLX: 17562.8 MB
+    begin:Flash couche 15               MLX: 17496.6 MB
+    end:Flash couche 15                 MLX: 18612.8 MB
+    begin:Flash couche 16               MLX: 18596.9 MB
+    end:Flash couche 16                 MLX: 19780.3 MB
+    begin:Flash couche 17               MLX: 19714.1 MB
+    end:Flash couche 17                 MLX: 20917.9 MB
+    begin:Flash couche 18               MLX: 20831.4 MB
+    end:Flash couche 18                 MLX: 21948.6 MB
+    begin:Flash couche 19               MLX: 21948.6 MB
+    end:Flash couche 19                 MLX: 23048.9 MB
+    begin:Flash couche 20               MLX: 23048.9 MB
+    end:Flash couche 20                 MLX: 24166.1 MB
+    begin:Flash couche 21               MLX: 24166.1 MB
+    end:Flash couche 21                 MLX: 25283.4 MB
+    begin:Flash couche 22               MLX: 25283.4 MB
+    end:Flash couche 22                 MLX: 26400.6 MB
+    begin:Flash couche 23               MLX: 26400.6 MB
+    end:Flash couche 23                 MLX: 27500.9 MB
+    begin:Flash couche 24               MLX: 27500.9 MB
+    end:Flash couche 24                 MLX: 28618.1 MB
+    begin:Flash couche 25               MLX: 28618.1 MB
+    end:Flash couche 25                 MLX: 29735.4 MB
+    begin:Flash couche 26               MLX: 29735.4 MB
+    end:Flash couche 26                 MLX: 30876.9 MB
+    begin:Flash couche 27               MLX: 30852.6 MB
+    end:Flash couche 27                 MLX: 31952.8 MB
+    begin:Flash couche 28               MLX: 31952.8 MB
+    end:Flash couche 28                 MLX: 33070.1 MB
+    begin:Flash couche 29               MLX: 33070.1 MB
+    end:Flash couche 29                 MLX: 34187.3 MB
+    begin:Flash couche 30               MLX: 34187.3 MB
+    end:Flash couche 30                 MLX: 35304.6 MB
+    begin:Flash couche 31               MLX: 35304.6 MB
+    end:Flash couche 31                 MLX: 36404.8 MB
+    begin:Flash couche 32               MLX: 36404.8 MB
+    end:Flash couche 32                 MLX: 37522.0 MB
+    begin:Flash couche 33               MLX: 37522.0 MB
+    end:Flash couche 33                 MLX: 38639.3 MB
+    begin:Flash couche 34               MLX: 38639.3 MB
+    end:Flash couche 34                 MLX: 39756.5 MB
+    begin:Flash couche 35               MLX: 39756.5 MB
+    end:Flash couche 35                 MLX: 40856.8 MB
+    begin:Flash couche 36               MLX: 40856.8 MB
+    end:Flash couche 36                 MLX: 41974.0 MB
+    begin:Flash couche 37               MLX: 41974.0 MB
+    end:Flash couche 37                 MLX: 43091.3 MB
+    begin:Flash couche 38               MLX: 43091.3 MB
+    end:Flash couche 38                 MLX: 44208.5 MB
+    begin:Flash couche 39               MLX: 44208.5 MB
+    end:Flash couche 39                 MLX: 45308.7 MB
+    begin:Flash couche 40               MLX: 45308.7 MB
+    end:Flash couche 40                 MLX: 46426.0 MB
+    begin:Flash couche 41               MLX: 46426.0 MB
+    end:Flash couche 41                 MLX: 47543.2 MB
+    begin:Flash couche 42               MLX: 47543.2 MB
+    end:Flash couche 42                 MLX: 48660.5 MB
+    begin:Flash couche 43               MLX: 48660.5 MB
+    end:Flash couche 43                 MLX: 49760.7 MB
+    begin:Flash couche 44               MLX: 49760.7 MB
+    end:Flash couche 44                 MLX: 50877.9 MB
+    begin:Flash couche 45               MLX: 50877.9 MB
+    end:Flash couche 45                 MLX: 51995.2 MB
+    begin:Flash couche 46               MLX: 51995.2 MB
+    end:Flash couche 46                 MLX: 53112.4 MB
+    begin:Flash couche 47               MLX: 53112.4 MB
+    end:Flash couche 47                 MLX: 54212.7 MB
+    end:Prefill                         MLX: 54589.2 MB
+    begin:Generation                    MLX: 54589.2 MB
+    begin:Flash couche 0                MLX: 54589.2 MB
+    end:Flash couche 0                  MLX: 54581.3 MB
+    begin:Flash couche 1                MLX: 54581.3 MB
+    end:Flash couche 1                  MLX: 54565.4 MB
+    begin:Flash couche 2                MLX: 54565.4 MB
+    end:Flash couche 2                  MLX: 54557.4 MB
+    begin:Flash couche 3                MLX: 54557.4 MB
+    end:Flash couche 3                  MLX: 54557.5 MB
+    begin:Flash couche 4                MLX: 54557.5 MB
+    end:Flash couche 4                  MLX: 54541.7 MB
+    begin:Flash couche 5                MLX: 54541.6 MB
+    end:Flash couche 5                  MLX: 54525.7 MB
+    begin:Flash couche 6                MLX: 54525.7 MB
+    end:Flash couche 6                  MLX: 54509.8 MB
+    begin:Flash couche 7                MLX: 54509.8 MB
+    end:Flash couche 7                  MLX: 54509.8 MB
+    begin:Flash couche 8                MLX: 54509.8 MB
+    end:Flash couche 8                  MLX: 54494.4 MB
+    begin:Flash couche 9                MLX: 54493.9 MB
+    end:Flash couche 9                  MLX: 54478.0 MB
+    begin:Flash couche 10               MLX: 54478.0 MB
+    end:Flash couche 10                 MLX: 54462.1 MB
+    begin:Flash couche 11               MLX: 54462.1 MB
+    end:Flash couche 11                 MLX: 54462.1 MB
+    begin:Flash couche 12               MLX: 54462.1 MB
+    end:Flash couche 12                 MLX: 54446.2 MB
+    begin:Flash couche 13               MLX: 54446.2 MB
+    end:Flash couche 13                 MLX: 54430.3 MB
+    begin:Flash couche 14               MLX: 54430.3 MB
+    end:Flash couche 14                 MLX: 54414.3 MB
+    begin:Flash couche 15               MLX: 54414.3 MB
+    end:Flash couche 15                 MLX: 54414.4 MB
+    begin:Flash couche 16               MLX: 54414.4 MB
+    end:Flash couche 16                 MLX: 54398.6 MB
+    begin:Flash couche 17               MLX: 54398.5 MB
+    end:Flash couche 17                 MLX: 54382.5 MB
+    begin:Flash couche 18               MLX: 54382.5 MB
+    end:Flash couche 18                 MLX: 54366.6 MB
+    begin:Flash couche 19               MLX: 54366.6 MB
+    end:Flash couche 19                 MLX: 54366.8 MB
+    begin:Flash couche 20               MLX: 54366.7 MB
+    end:Flash couche 20                 MLX: 54350.8 MB
+    begin:Flash couche 21               MLX: 54350.8 MB
+    end:Flash couche 21                 MLX: 54334.8 MB
+    begin:Flash couche 22               MLX: 54334.8 MB
+    end:Flash couche 22                 MLX: 54320.5 MB
+    begin:Flash couche 23               MLX: 54318.9 MB
+    end:Flash couche 23                 MLX: 54319.0 MB
+    begin:Flash couche 24               MLX: 54319.0 MB
+    end:Flash couche 24                 MLX: 54303.0 MB
+    begin:Flash couche 25               MLX: 54303.0 MB
+    end:Flash couche 25                 MLX: 54287.1 MB
+    begin:Flash couche 26               MLX: 54287.1 MB
+    end:Flash couche 26                 MLX: 54271.2 MB
+    begin:Flash couche 27               MLX: 54271.2 MB
+    end:Flash couche 27                 MLX: 54271.3 MB
+    begin:Flash couche 28               MLX: 54271.3 MB
+    end:Flash couche 28                 MLX: 54255.3 MB
+    begin:Flash couche 29               MLX: 54255.3 MB
+    end:Flash couche 29                 MLX: 54239.4 MB
+    begin:Flash couche 30               MLX: 54239.4 MB
+    end:Flash couche 30                 MLX: 54223.5 MB
+    begin:Flash couche 31               MLX: 54223.5 MB
+    end:Flash couche 31                 MLX: 54223.5 MB
+    begin:Flash couche 32               MLX: 54223.5 MB
+    end:Flash couche 32                 MLX: 54207.6 MB
+    begin:Flash couche 33               MLX: 54207.6 MB
+    end:Flash couche 33                 MLX: 54191.7 MB
+    begin:Flash couche 34               MLX: 54191.7 MB
+    end:Flash couche 34                 MLX: 54175.8 MB
+    begin:Flash couche 35               MLX: 54175.8 MB
+    end:Flash couche 35                 MLX: 54175.8 MB
+    begin:Flash couche 36               MLX: 54175.8 MB
+    end:Flash couche 36                 MLX: 54159.9 MB
+    begin:Flash couche 37               MLX: 54159.9 MB
+    end:Flash couche 37                 MLX: 54144.0 MB
+    begin:Flash couche 38               MLX: 54144.0 MB
+    end:Flash couche 38                 MLX: 54128.1 MB
+    begin:Flash couche 39               MLX: 54128.1 MB
+    end:Flash couche 39                 MLX: 54128.1 MB
+    begin:Flash couche 40               MLX: 54128.1 MB
+    end:Flash couche 40                 MLX: 54112.2 MB
+    begin:Flash couche 41               MLX: 54112.2 MB
+    end:Flash couche 41                 MLX: 54096.3 MB
+    begin:Flash couche 42               MLX: 54096.3 MB
+    end:Flash couche 42                 MLX: 54080.4 MB
+    begin:Flash couche 43               MLX: 54080.4 MB
+    end:Flash couche 43                 MLX: 54080.4 MB
+    begin:Flash couche 44               MLX: 54080.4 MB
+    end:Flash couche 44                 MLX: 54064.5 MB
+    begin:Flash couche 45               MLX: 54064.5 MB
+    end:Flash couche 45                 MLX: 54048.6 MB
+    begin:Flash couche 46               MLX: 54048.6 MB
+    end:Flash couche 46                 MLX: 54032.7 MB
+    begin:Flash couche 47               MLX: 54032.7 MB
+    end:Flash couche 47                 MLX: 54032.7 MB
+    end:Generation                      MLX: 54033.6 MB
+
+╰──────────────────────────────────────────────────────────────────╯
+
+trace profiler: results/prefill-long.trace.json
