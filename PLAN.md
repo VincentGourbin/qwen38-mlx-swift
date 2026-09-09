@@ -3653,3 +3653,25 @@ binaire Release (`Scripts/build-release.sh`), machine dans son état normal :
   depuis BF16 (option B) si le 3-bit devient la référence.
 - (d) Réglage de veille du Mac (`sleep 1` sur secteur) : le moteur pose une
   assertion, mais les probes CLI et les builds longs restent exposés.
+
+### P2-fusion — réduire le nombre de noyaux par couche — lancé le 2026-09-09
+
+Constat (P0/P2-code) : ~4,5 ms par couche en `asyncEval` pour ~0,5 ms de
+calcul utile, GPU 32 % en génération ; le comptage par `sample` donne, par
+famille, Copy ≈ 260, binaire ≈ 270, QuantizedMatmul+qmv ≈ 77, Concatenate
+62, Reduce 39, unaire 36, SDPA 33 échantillons : les copies et les petites
+opérations élémentaires coûtent plus que le matmul quantifié. Objectif :
+≤ 2,5 ms par couche sur le bench (`flash-layer-bench --async-interval 8`,
+Release), soit ~8-10 tok/s en génération, à sortie **bit-identique** sur le
+prompt de référence et Q-B inchangé. Méthode inchangée : un levier = une
+mesure avant/après = un commit, même négatif.
+
+| # | Levier | Critère |
+|---|---|---|
+| F1 | GDN : fusionner `in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a` en un seul `QuantizedLinear` (concaténation des poids packés, scales et biases sur l'axe de sortie **au chargement**, découpage par `split` après le matmul) ; idem pour tout autre groupe de projections partageant la même entrée (QSA q/k/v, indexeur). | ms/pas bench, IDs identiques, parité GDN publique verte |
+| F2 | Normes : toute RMSNorm zéro-centrée (`hc_norm`, q/k norm, indexeur, PLE) passe par `MLXFast.rmsNorm` avec un poids `1 + w` (ou `w` pour Vontra, cf. piège 12) **précalculé au chargement**, plus aucune addition ni cast par appel ; vérifier que `Qwen4ExpRMSNorm` n'upcaste pas en float32 quand ce n'est pas nécessaire. | idem |
+| F3 | Hyper-connections : relire `Qwen4ExpHyperConnection.swift` et `Qwen4ExpDecoderLayer.inject` ; remplacer les `expandedDimensions` + broadcast + `mean` + `reshaped` par un ou deux matmuls batchés sur `[B, S, 4, hidden]` et supprimer les copies (`Copy`/`Concatenate` dominants en (a)). | idem, test « mélangent quatre flux » vert |
+| F4 | MoE : `softmax(precise:)` → mesurer sans `precise` (perte de précision acceptable ? comparer les indices routés sur 200 tokens synthétiques) ; `argPartition` + `takeAlong` + normalisation + `weightedExpertSum` : éliminer reshapes et casts intermédiaires ; expert partagé : gate sigmoid fusionnée. | idem, test MoE vert |
+| F5 | Casts : inventorier tous les `asType` par pas (GDN gating en float32, MRoPE, masques) et ne garder que ceux exigés par la numérique (état GDN float32, tables RoPE float32 — piège 6). | idem |
+| F6 | `MLX.compile` **par sous-graphe élémentaire stable** (gating GDN, mix hyper-connections, routage MoE), pas sur la couche entière (P2-code (c) : +13 % en QSA). | idem |
+| F7 | Validation finale sur le checkpoint 3-bit : `flash-chat-probe … --temperature 0 --max-new-tokens 8 --resident-layers --resident-async` (IDs identiques `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`), garde Q-B (`xcodebuild … '-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()'` avec `TEST_RUNNER_QWEN38_FLASH_MODEL`, attendu 10/28 −4,80), s/token avant/après dans `BENCHMARKS.md`. | tableau final dans `log.md` |
