@@ -2903,3 +2903,16 @@ Trois défauts trouvés et corrigés :
    tokens, TTFT, débit, durée, MTP acceptés/proposés, état du cache,
    `conversation_id` (demande Vincent). Le serveur ne conserve plus le dernier
    fragment, il horodate la fin de session.
+
+## 2026-09-09 (nuit) — Test LAN 2 après correctifs : 9/10 OK, thinking par défaut désactivé côté serveur
+
+Rejoué par l'agent Haiku sur le serveur relancé : 404 JSON pour un modèle
+inconnu ✓, streaming MTP 66 chunks ✓ (42 % d'acceptation), non-stream
+identique ✓, deux tours avec cache réutilisé ✓, image Macron ✓ (976 tokens,
+TTFT 6,8 s), `/metrics` avec tokens entrée/sortie par session ✓. Reste la
+requête **minimale** (aucun champ maison, 96 tokens) : thinking actif par
+défaut, effort `low`, mais 96 tokens ne suffisent pas à fermer `</think>` →
+`content` vide. Un client OpenAI standard n'envoie jamais `enable_thinking` :
+le défaut serveur devient **thinking désactivé**, activé seulement si le
+client envoie `enable_thinking: true` ou un `reasoning_effort` (top-level,
+`reasoning.effort` ou `extra`). La GUI garde son propre toggle.
