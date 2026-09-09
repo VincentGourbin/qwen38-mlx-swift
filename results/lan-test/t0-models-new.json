@@ -1,0 +1,12 @@
+{
+    "object": "list",
+    "data": [
+        {
+            "object": "model",
+            "owned_by": "local",
+            "id": "Qwen3.8-Flash-Next-MLX-e3bit-MTP",
+            "loaded": true,
+            "family": "qwen4_exp"
+        }
+    ]
+}

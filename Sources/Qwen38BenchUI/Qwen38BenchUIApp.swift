@@ -690,7 +690,7 @@ private struct ServerView: View {
                                 .textFieldStyle(.roundedBorder)
                         }
                         Text(model.serverSnapshot.status == .running
-                            ? "LAN : http://<adresse-du-Mac>:\(model.serverSnapshot.port)"
+                            ? "LAN : http://\(Qwen38LocalNetwork.primaryIPv4() ?? "<adresse-du-Mac>"):\(String(model.serverSnapshot.port))/v1"
                             : "Le catalogue sera chargé à la demande sur le premier appel.")
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
@@ -832,39 +832,46 @@ private struct ServerView: View {
     }
 
     private func sessionRow(_ session: Qwen38ServerSession) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        // Demande Vincent (2026-09-09) : plus de flux de tokens dans la liste,
+        // seulement les statistiques de génération, avec entrée / sortie.
+        let duration = (session.finishedAt ?? Date()).timeIntervalSince(session.startedAt)
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Circle()
                     .fill(sessionColor(session.status))
                     .frame(width: 7, height: 7)
                 Text(session.status.rawValue.capitalized)
                     .font(.caption.weight(.semibold))
+                Text(session.inputDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let conversationID = session.conversationID {
+                    Text("conv \(conversationID)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Text("\(session.model) · \(session.path)")
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
             }
-            HStack(spacing: 10) {
-                        Text(session.model)
-                        Text(session.inputDescription)
-                Text("\(session.generatedTokens) tokens")
-                if let ttft = session.timeToFirstToken {
-                    Text(String(format: "TTFT %.0f ms", ttft * 1000))
+            HStack(spacing: 14) {
+                sessionStat("Entrée", "\(session.promptTokens) tok")
+                sessionStat("Sortie", "\(session.generatedTokens) tok")
+                sessionStat("TTFT", session.timeToFirstToken.map { String(format: "%.0f ms", $0 * 1000) } ?? "—")
+                sessionStat("Décodage", session.tokensPerSecond.map { String(format: "%.1f tok/s", $0) } ?? "—")
+                sessionStat("Durée", String(format: "%.1f s", duration))
+                if session.mtpProposed > 0 {
+                    sessionStat(
+                        "MTP",
+                        "\(session.mtpAccepted)/\(session.mtpProposed)"
+                            + (session.mtpAcceptRate.map { String(format: " · %.0f %%", $0 * 100) } ?? ""))
+                } else if session.mtp != "indisponible" {
+                    sessionStat("MTP", session.mtp)
                 }
-                if let speed = session.tokensPerSecond {
-                    Text(String(format: "%.1f tok/s", speed))
+                if session.cacheReused {
+                    sessionStat("Cache", session.conversationReplayed ? "rejoué" : "réutilisé")
                 }
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            if !session.lastToken.isEmpty {
-                Text(session.lastToken)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.cyan)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(7)
-                    .background(Color.cyan.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
             }
             if let error = session.error {
                 Text(error).font(.caption2).foregroundStyle(.orange)
@@ -872,6 +879,13 @@ private struct ServerView: View {
         }
         .padding(10)
         .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func sessionStat(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).font(.caption.monospacedDigit())
+            Text(title).font(.caption2).foregroundStyle(.tertiary)
+        }
     }
 
     private func sessionColor(_ status: Qwen38ServerSessionStatus) -> Color {
@@ -1265,5 +1279,29 @@ struct Qwen38BenchUIApp: App {
 
     var body: some Scene {
         WindowGroup("Qwen3.8 Bench") { ContentView() }
+    }
+}
+
+
+/// Adresse IPv4 de la première interface active non-loopback (en0 d'abord),
+/// pour afficher l'URL LAN réelle du serveur dans l'onglet Serveur.
+enum Qwen38LocalNetwork {
+    static func primaryIPv4() -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+        var candidates: [(name: String, address: String)] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = cursor {
+            defer { cursor = entry.pointee.ifa_next }
+            guard let addr = entry.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  (Int32(entry.pointee.ifa_flags) & IFF_UP) != 0,
+                  (Int32(entry.pointee.ifa_flags) & IFF_LOOPBACK) == 0 else { continue }
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &buffer, socklen_t(buffer.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            candidates.append((String(cString: entry.pointee.ifa_name), String(cString: buffer)))
+        }
+        return (candidates.first { $0.name == "en0" } ?? candidates.first)?.address
     }
 }

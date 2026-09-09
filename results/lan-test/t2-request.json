@@ -1,0 +1,22 @@
+{
+  "model": "Qwen3.8-Flash-Next-MLX-e3bit-MTP",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Présente-toi en deux phrases et dis quel jour nous sommes si tu le sais."
+    },
+    {
+      "role": "assistant",
+      "content": "Je suis un assistant IA polyvalent et bienveillant, conçu pour vous aider avec précision et efficacité dans une grande variété de tâches. Je ne connais pas la date exacte d'aujourd'hui, car je n'ai pas accès à un calendrier en temps réel."
+    },
+    {
+      "role": "user",
+      "content": "Résume ta réponse précédente en cinq mots."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 64,
+  "mtp": false,
+  "enable_thinking": false,
+  "conversation_id": "lan-test-1"
+}

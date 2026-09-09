@@ -1,0 +1,14 @@
+{
+  "model": "Qwen3.8-Flash-Next-MLX-e3bit-MTP",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Présente-toi en deux phrases et dis quel jour nous sommes si tu le sais."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 64,
+  "mtp": false,
+  "enable_thinking": false,
+  "conversation_id": "lan-test-1"
+}

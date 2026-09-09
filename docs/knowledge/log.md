@@ -2875,3 +2875,31 @@ greedy (déjà connu) au chemin MTP (nouveau cette session).
 Commits : `7c93277` (P4.1 mécanisme), `170a3c9` (P4.1 défaut N=8),
 `aa4fc0c` (P4.2), `ddab183` (P4.5). Traces `.trace`, sorties `.stdout.txt`
 et le sweep complet conservés dans `results/`.
+
+## 2026-09-09 (soir) — Test LAN par agent (8 requêtes) et correctifs GUI/serveur
+
+Serveur lancé depuis la GUI (Release), 3-bit chargé, agent Haiku en client
+`curl` sur `http://192.168.1.183:8848` (bind LAN, même machine). 8 requêtes :
+tours liés par `conversation_id`, streaming MTP (98 chunks, `[DONE]`,
+33/63 acceptés), thinking `low` (reasoning et contenu non vides, Canberra),
+image (Emmanuel Macron, 976 tokens de prompt, TTFT 7,3 s), sampling
+(température 0,7 : MTP en fallback explicite), erreur de modèle. Débits 6,1 à
+7,4 tok/s, TTFT 1,3-2,8 s en texte. Pendant une requête de 96 tokens,
+`ioreg` mesure **GPU 93-94 %** et le process GUI à ~50 % d'un cœur : le GPU
+n'est plus inactif sur le chemin serveur (P4.1 en production). L'observation
+« CPU > 100 %, GPU au repos » de Vincent correspond à la session précédente
+où le **4-bit** avait été chargé par erreur (catalogue pointé sur Vontra) avec
+73 Go dans le compresseur : c'est la décompression, pas le décodage.
+
+Trois défauts trouvés et corrigés :
+1. **Erreurs HTTP** : `modelNotFound` ressortait en 500 sans corps ; le handler
+   renvoie maintenant un JSON d'erreur OpenAI avec 404 / 400 / 401 / 503.
+2. **`reasoning_effort` par défaut `xhigh`** : une requête sans `enable_thinking`
+   ni effort produisait 96 tokens de raisonnement et un `content` vide
+   (T3/T4 du test — l'agent avait omis le champ). Défaut serveur → `low`.
+3. **Onglet Serveur** : l'URL LAN affichait `<adresse-du-Mac>` et le port « 8 848 »
+   (Int interpolé dans `Text`) ; l'IP `en0` réelle est maintenant affichée. La
+   liste des sessions n'affiche plus le flux de tokens : Entrée / Sortie en
+   tokens, TTFT, débit, durée, MTP acceptés/proposés, état du cache,
+   `conversation_id` (demande Vincent). Le serveur ne conserve plus le dernier
+   fragment, il horodate la fin de session.

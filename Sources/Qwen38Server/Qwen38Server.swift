@@ -27,6 +27,8 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     public var mtpAccepted: Int
     public var mtpAcceptRate: Double?
     public var error: String?
+    /// Set when the session completes or fails (GUI: durée totale).
+    public var finishedAt: Date?
     public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil) {
         self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error
     }
@@ -265,7 +267,7 @@ public actor Qwen38InferenceServer {
             let selectedModel = try await ensureModelLoaded(requestedModel)
             updateSession(id) { $0.model = selectedModel }
             let prepared = try prepare(input.messages)
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: input.temperature ?? 0, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? true, reasoningEffort: input.effectiveReasoningEffort ?? "xhigh", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine))
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: input.temperature ?? 0, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? true, reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine))
             let conversationID = input.effectiveConversationID
             let usePersistentCache = try await prepareConversation(
                 id: conversationID,
@@ -302,8 +304,8 @@ public actor Qwen38InferenceServer {
                 clearActiveConversation()
                 await runtime.resetConversation()
             }
-            updateSession(id) { $0.status = .failed; $0.error = error.localizedDescription }
-            throw error
+            updateSession(id) { $0.status = .failed; $0.error = error.localizedDescription; $0.finishedAt = Date() }
+            return Self.errorResponse(Self.status(for: error), message: error.localizedDescription)
         }
     }
 
@@ -441,7 +443,7 @@ public actor Qwen38InferenceServer {
                 let output = parser.append(chunk)
                 reasoning += output.reasoning
                 text += output.content
-                updateSession(sessionID) { $0.generatedTokens += 1; $0.lastToken = String(chunk.suffix(48)) }
+                updateSession(sessionID) { $0.generatedTokens += 1 }
             case .metrics(let value):
                 let tail = parser.finish()
                 reasoning += tail.reasoning
@@ -509,14 +511,32 @@ public actor Qwen38InferenceServer {
     private func authorize(_ request: Request) throws { guard let apiKey, !apiKey.isEmpty else { return }; guard request.headers[.authorization] == "Bearer \(apiKey)" else { throw Qwen38ServerError.unauthorized } }
     private func updateSession(_ id: UUID, _ body: (inout Qwen38ServerSession) -> Void) { guard var session = sessions[id] else { return }; body(&session); sessions[id] = session }
     private func updateSessionAsync(_ id: UUID, chunk: String) { updateSession(id) { $0.generatedTokens += 1; $0.lastToken = String(chunk.suffix(48)) } }
-    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) { updateSession(id) { $0.status = .completed; $0.promptTokens = metrics.metrics.promptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate } }
+    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) { updateSession(id) { $0.status = .completed; $0.finishedAt = Date(); $0.promptTokens = metrics.metrics.promptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate } }
     private func completeSessionAsync(_ id: UUID, metrics: Qwen38RunMetrics) { completeSession(id, metrics: metrics) }
-    private func failSessionAsync(_ id: UUID, error: String) { updateSession(id) { $0.status = .failed; $0.error = error } }
+    private func failSessionAsync(_ id: UUID, error: String) { updateSession(id) { $0.status = .failed; $0.error = error; $0.finishedAt = Date() } }
     private func trimSessions() { while sessionOrder.count > 32 { sessions.removeValue(forKey: sessionOrder.removeFirst()) } }
     private static func finishReason(_ reason: Any?) -> String { guard let reason else { return "stop" }; return String(describing: reason).lowercased().contains("length") ? "length" : "stop" }
     private static func mtpLabel(_ status: Qwen38MTPRunStatus) -> String { switch status.availability { case .active: return "actif"; case .unavailable: return "indisponible"; case .fallback(let reason): return "fallback: \(reason)" } }
     private static func jsonResponse<T: Encodable>(_ value: T) -> Response { let data = (try? JSONEncoder().encode(value)) ?? Data(); var buffer = ByteBufferAllocator().buffer(capacity: data.count); buffer.writeBytes(data); var headers = HTTPFields(); headers[.contentType] = "application/json; charset=utf-8"; return .init(status: .ok, headers: headers, body: .init(byteBuffer: buffer)) }
-    private static func errorResponse(_ status: HTTPResponse.Status, message: String) -> Response { jsonResponse(ErrorResponse(error: .init(message: message, type: "server_error", code: nil))) }
+    private static func errorResponse(_ status: HTTPResponse.Status, message: String) -> Response {
+        var response = jsonResponse(ErrorResponse(error: .init(message: message, type: status.code >= 500 ? "server_error" : "invalid_request_error", code: nil)))
+        response.status = status
+        return response
+    }
+
+    /// LAN test 2026-09-09 (T8): a `Qwen38ServerError` escaping the handler used
+    /// to surface as an empty HTTP 500. Map it to an OpenAI-style JSON error
+    /// with a meaningful status instead.
+    private static func status(for error: any Error) -> HTTPResponse.Status {
+        guard let serverError = error as? Qwen38ServerError else { return .internalServerError }
+        switch serverError {
+        case .modelNotFound: return .notFound
+        case .unauthorized: return .unauthorized
+        case .invalidRequest, .unsupportedImageURL, .invalidPort: return .badRequest
+        case .modelNotLoaded, .noModelsAvailable: return .serviceUnavailable
+        case .alreadyRunning: return .conflict
+        }
+    }
 }
 
 private extension String { var nilIfEmpty: String? { isEmpty ? nil : self } }
