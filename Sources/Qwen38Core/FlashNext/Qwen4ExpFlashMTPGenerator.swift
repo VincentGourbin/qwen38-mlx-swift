@@ -227,10 +227,13 @@ public extension Qwen4ExpGreedyGenerator {
 
             if profileMTP { profiler.start("MTP targetIDs") }
             let targetIDsStart = ContinuousClock.now
-            let targetIDs = (0 ..< verifyTokens.dim(1)).map { index in
-                greedyToken(from: verification.logits[0..., index, 0...])
-                    .item(Int32.self)
-            }
+            // PM2 (a) (2026-09-09): a single batched `argMax(axis: -1)` over
+            // every verified position, followed by one `asArray` host sync,
+            // instead of one `.item()` per position (V54's suspect #3 — a
+            // CPU sync per verified token). Bit-identical result: `argMax`
+            // over the vocabulary axis at each position is exactly what the
+            // per-position `ArgMaxSampler` loop computed, just batched.
+            let targetIDs = argMax(verification.logits, axis: -1).asArray(Int32.self)
             stepTimings.targetIDs += (ContinuousClock.now - targetIDsStart).seconds
             if profileMTP { profiler.end("MTP targetIDs") }
 

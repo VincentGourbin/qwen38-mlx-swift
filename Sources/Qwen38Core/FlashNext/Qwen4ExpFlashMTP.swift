@@ -264,6 +264,14 @@ public final class Qwen4ExpFlashMTPDraftEngine: @unchecked Sendable {
 
     private func greedyToken(logits: MLXArray) -> MLXArray {
         let sampled = ArgMaxSampler().sample(logits: logits[0..., -1, 0...])
-        return normalizedColumn(sampled)
+        let token = normalizedColumn(sampled)
+        // PM2 (b) (2026-09-09, V54 suspect #2): materialize the token here
+        // instead of returning a lazy graph node. Without this, `token`
+        // (stored as `state.seedToken`/consumed as the next round's draft
+        // input) deferred the quantized 248K-vocab `lm_head` matmul this
+        // logits came from to whichever later call first forced evaluation —
+        // unpredictable and never accounted by any profiled phase.
+        eval(token)
+        return token
     }
 }
