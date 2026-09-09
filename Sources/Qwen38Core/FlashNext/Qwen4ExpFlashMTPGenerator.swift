@@ -130,7 +130,27 @@ public extension Qwen4ExpGreedyGenerator {
         // for). The cheap `ContinuousClock` totals in
         // `Qwen4ExpFlashMTPStepTimings` are always collected regardless of
         // this flag.
-        profileMTP: Bool = false
+        profileMTP: Bool = false,
+        // PM4.3 (branchement, 2026-09-09): multi-turn continuation, mirroring
+        // `Qwen4ExpStreamingGenerationOptions.continueConversation`. Controls
+        // only `model.resetConversation()` — `false` (every CLI probe) keeps
+        // the original behavior; `true` lets the target keep its own KV/GDN
+        // caches (same contract as the greedy/streaming path). The drafter's
+        // own reset-vs-continue decision is independent (see `state` below).
+        continueConversation: Bool = false,
+        // `nil` (default, every CLI probe) creates a fresh state for this
+        // call, always primed via `prepare()`. A caller that wants drafter
+        // continuity across turns supplies the *same* state object every
+        // call; whether that state gets `prepare()` (never primed yet) or
+        // `prepareContinuation()` (already has history) is then decided
+        // below from `state.nextPosition`, not from `continueConversation`.
+        state suppliedState: Qwen4ExpFlashMTPState? = nil,
+        // PM4.3 (branchement): invoked once per emitted token, in order, as
+        // soon as it is known — lets `Qwen38FlashNextEngine` stream chunks
+        // through the same `AsyncThrowingStream` the greedy path uses,
+        // instead of only seeing the complete `tokenIDs` array at the end.
+        // `nil` (every CLI probe) costs nothing extra.
+        onToken: ((Int32) -> Void)? = nil
     ) throws -> Qwen4ExpFlashMTPGenerationResult {
         guard !promptTokenIDs.isEmpty else {
             throw Qwen4ExpGreedyGenerationError.emptyPrompt
@@ -142,8 +162,10 @@ public extension Qwen4ExpGreedyGenerator {
             throw Qwen4ExpFlashMTPEngineError.invalidBlockSize
         }
 
-        model.resetConversation()
-        model.resetNGramCacheStats()
+        if !continueConversation {
+            model.resetConversation()
+            model.resetNGramCacheStats()
+        }
         let prompt = MLXArray(promptTokenIDs).reshaped([1, promptTokenIDs.count])
         let started = Date()
         profiler.startPrefill()
@@ -155,7 +177,7 @@ public extension Qwen4ExpGreedyGenerator {
         profiler.endPrefill()
 
         let engine = Qwen4ExpFlashMTPDraftEngine(target: model, predictor: predictor)
-        let state = engine.makeState()
+        let state = suppliedState ?? engine.makeState()
         let firstBonus = greedyToken(from: prefill.logits[0..., -1, 0...])
         let firstBonusID = firstBonus.item(Int32.self)
         if options.stopTokenIDs.contains(firstBonusID) {
@@ -165,12 +187,30 @@ public extension Qwen4ExpGreedyGenerator {
                 timeToFirstToken: nil, stats: .init(), layerReports: [prefill.reports])
         }
 
-        try engine.prepare(
-            promptTokenIDs: prompt,
-            targetHidden: prefill.preMixerHidden,
-            firstBonus: firstBonus,
-            state: state)
+        // The drafter's own reset/continuation decision is independent of
+        // the target's (`continueConversation` above only controls
+        // `model.resetConversation()`): `state.nextPosition == 0` means this
+        // state has never been primed — including a state created for a
+        // conversation whose *earlier* turns did not use MTP at all, where
+        // `continueConversation` is true for the target but there is no
+        // drafter history to extend. `prepare()` on such a state is exactly
+        // right: it primes over whatever prompt/hidden this call was given,
+        // with a no-op `state.reset()`.
+        if state.nextPosition == 0 {
+            try engine.prepare(
+                promptTokenIDs: prompt,
+                targetHidden: prefill.preMixerHidden,
+                firstBonus: firstBonus,
+                state: state)
+        } else {
+            try engine.prepareContinuation(
+                promptTokenIDs: prompt,
+                targetHidden: prefill.preMixerHidden,
+                firstBonus: firstBonus,
+                state: state)
+        }
 
+        onToken?(firstBonusID)
         var output = [firstBonusID]
         var bonus = firstBonus
         var lastHidden = prefill.preMixerHidden[0..., (-1)..., 0...]
@@ -285,9 +325,11 @@ public extension Qwen4ExpGreedyGenerator {
             for token in walk.emitted {
                 if options.stopTokenIDs.contains(token) {
                     output.append(token)
+                    onToken?(token)
                     break
                 }
                 output.append(token)
+                onToken?(token)
                 if output.count >= options.maxNewTokens { break }
             }
 

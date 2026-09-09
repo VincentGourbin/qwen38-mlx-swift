@@ -121,6 +121,16 @@ final class BenchViewModel: ObservableObject {
             do {
                 try await runtime.load(from: directory)
                 loadedFamily = info?.family
+                // PM4.3 (branchement, 2026-09-09): `mtpEnabled` defaults to
+                // `true` (27B: a present drafter is the common case). For
+                // Flash-Next the local MTP path is opt-in by design (PLAN.md
+                // P-MTP suite PM4.3 — measured faster than greedy but short
+                // of the auto-branch bar), so force it off on every load of
+                // that family rather than inheriting whatever the toggle was
+                // last left at.
+                if loadedFamily == .qwen4Exp {
+                    mtpEnabled = false
+                }
                 if await runtime.isFlashNextLoaded {
                     status = "Chargement Flash-Next (résident, ~100 s depuis le Lexar)…"
                     flashLoadProgress = (0, expectedLayers)

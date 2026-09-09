@@ -3730,14 +3730,37 @@ plus aucun `model.snapshot()`/`restore()`/rejeu dans `generateMTP`,
 `stats.replayedTokens` reste à 0, confirmé sur les 12 runs PM4.3 sur le
 3-bit (32 et 128 tokens, blocs 2/3/4, IDs identiques au greedy partout).
 Correctif trouvé au passage : direction de `Qwen4ExpQSAKVCache.trim` sur
-les clés indexeur. **PM4.3 exécutée, cible non atteinte** : bloc 2 passe
-de ~1,19-1,6x plus lent que le greedy à **0,81-0,86x** (mesures répétées,
-32 et 128 tokens) — plus rapide que le greedy, mais au-dessus du seuil
-`≤ 0,8x` requis pour brancher automatiquement (marge 1-8 points selon le
-run/la longueur). Décision : MTP local **reste hors catalogue**
-(`Qwen38FlashNextEngine` ignore toujours `options.mtp`, message mis à
-jour) ; pas de ligne `BENCHMARKS.md` (non branché). Tableau complet et
-détail des écarts : `docs/knowledge/log.md`, « 2026-09-09 — PM4 :
-vérification MTP sans rejeu ». **PM4.4 non exécutée** (hors périmètre de
-cette session : mémoire insuffisante sur cette machine, run précédent
-tué).
+les clés indexeur. **PM4.3 mesure** : bloc 2 passe de ~1,19-1,6x plus lent
+que le greedy à **0,81-0,86x** (mesures répétées, 32 et 128 tokens) — plus
+rapide que le greedy, mais au-dessus du seuil `≤ 0,8x` fixé initialement
+pour un branchement automatique (marge 1-8 points selon le run/la
+longueur).
+
+**PM4.3 (branchement) — décision révisée par Vincent, 2026-09-09** : le
+seuil 0,8x était une jauge, pas un critère de rejet ; un gain de 14-19 % à
+sortie bit-identique vaut d'être branché **en opt-in, défaut off**. MTP
+local branché dans `Qwen38FlashNextEngine.runGenerationStream` :
+`options.mtp.enabled` route vers `Qwen4ExpGreedyGenerator.generateMTP`
+(bloc = `options.mtp.draftDepth` borné à 2…4, défaut 2), streaming des
+tokens acceptés via les mêmes `Qwen38GenerationEvent` (`.chunk`/`.metrics`,
+`mtpStatus = .active` avec proposés/acceptés/rounds), image ⇒ fallback
+greedy (`mtpStatus = .fallback("MTP Flash-Next : texte seul")`),
+continuation multi-tour respectée (`continueConversation`, drafter
+persistant `mtpDraftState`, `prepare`/`prepareContinuation` selon
+`state.nextPosition`). `Qwen38FlashNextEngineProtocol.mtpState` (nouveau)
+reflète dynamiquement le chargement du prédicteur (à la demande, premier
+tour MTP, `Qwen4ExpMTPLoader` en `uncachedIO`) ; `Qwen38Runtime.mtpState`
+délègue à l'engine chargé. GUI : `mtpEnabled` forcé à `false` au chargement
+d'un modèle `qwen4Exp` (toggle réactivé par `mtpState == .active` comme
+avant, mécanisme inchangé). Validation : 78 tests verts (dispatch mocké +
+un test PM4.3 dédié), build Release vert, et un run serveur réel
+(`qwen38 serve` sur le 3-bit) — deux `curl` 32 tokens `"temperature":0`,
+`"mtp":false` puis `"mtp":true` : même `content`, 7,95 s → 7,42 s,
+`mtpAccepted: 10/21` dans `/metrics` ; une continuation à deux tours par
+`conversation_id` avec `mtp:true` répond correctement (`cacheReused:
+true`). Tableau détaillé : `BENCHMARKS.md` (« MTP local Flash-Next —
+branchement opt-in ») ; détail complet et écarts assumés :
+`docs/knowledge/log.md`, « 2026-09-09 — PM4 : vérification MTP sans rejeu »
+et son addendum « PM4.3 (branchement) ». **PM4.4 non exécutée** (hors
+périmètre de cette session : mémoire insuffisante sur cette machine, run
+précédent tué).

@@ -53,6 +53,29 @@ serveur le gardent résident). Détails : `docs/knowledge/log.md` (P1, Q3.3, H6)
 
 | 2026-09-09 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP — **GUI** (Release, lancée depuis le terminal), thinking élevé, 2048 max | 3-bit g64 | 84 Go | 48,4 s | **5,4 tok/s** (1 072 tokens en 200 s) · prefill 24,7 tok/s, TTFT 2,39 s (59 tokens) | 52,9 Go | — | démo G-8 : premier tour GUI Flash-Next, MTP en fallback attendu |
 
+### MTP local Flash-Next — branchement opt-in (PM4.3, 2026-09-09)
+
+Même prompt de référence, checkpoint 3-bit, `--resident-layers --resident-async`,
+IDs identiques au greedy dans les deux colonnes (`docs/knowledge/log.md`
+« PM4 : vérification MTP sans rejeu »). « Avant » = P-MTP PM3 (rejeu
+`model.snapshot()`/`restore()` par rejet) ; « après » = PM4.1/PM4.2 (rollback
+sans rejeu) + PM4.3 branché dans `Qwen38FlashNextEngine`
+(`options.mtp.enabled`, opt-in, défaut off).
+
+| Variante | tokens | avant (PM3, avec rejeu) | après (PM4, sans rejeu) | ratio après/greedy |
+|---|---:|---:|---:|---:|
+| Greedy (référence) | 128 | 21,16 s | 21,16 s | 1,00 |
+| MTP bloc 2 | 128 | ~1,19-1,6× le greedy (plus lent) | **18,13 s** | **0,86** |
+
+Validation du branchement (serveur, `qwen38 serve --model-path
+.../Qwen3.8-Flash-Next-MLX-e3bit-MTP`) : deux `curl` 32 tokens
+`"temperature":0` sur le même prompt, `"mtp":false` puis `"mtp":true` —
+`content` identique dans les deux réponses, 7,95 s contre 7,42 s
+(`mtpAccepted: 10`, `mtpProposed: 21`, `mtpAcceptRate: 0.476` dans
+`/metrics`). Continuation multi-tour testée par `conversation_id` : le
+second tour MTP répond correctement à partir du premier (`cacheReused:
+true`, `mtp: "actif"`), sans rejeu du préfixe.
+
 Bench synthétique d'une couche (`flash-layer-bench`, Release, poids aléatoires,
 sans checkpoint) : GDN+MoE 5,5 ms/pas, QSA+MoE 5,8 ms/pas en eager ; 4,5 ms
 avec `asyncEval` (GPU 82 % `ioreg`). Debug : 6,5 / 10,3 ms. Le profiler par

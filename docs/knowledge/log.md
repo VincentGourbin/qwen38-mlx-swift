@@ -2417,3 +2417,116 @@ au-delà de ~50 %.
    non exécutée, conformément à la consigne reçue.
 3. Pas de ligne `BENCHMARKS.md` : la consigne ne le demande que si le MTP
    est branché en production, ce qui n'est pas le cas ici.
+
+## 2026-09-09 — PM4.3 (branchement) : MTP Flash-Next opt-in dans Qwen38FlashNextEngine
+
+Décision de Vincent après la mesure ci-dessus : le seuil `≤ 0,8x` du plan
+était une jauge de décision automatique, pas un critère de rejet du
+chantier — un gain net de 14-19 % à sortie bit-identique (0,81-0,86x)
+justifie un branchement **opt-in, défaut off**, plutôt que de laisser le
+travail PM4.1/PM4.2 hors catalogue.
+
+### Câblage
+
+- `Qwen4ExpFlashMTP.swift` : `prepare(...)` refactoré autour d'un
+  `primePredictor(..., resetState:)` privé partagé ; nouvelle
+  `prepareContinuation(...)` (même priming, sans `state.reset()`) pour
+  étendre le cache du drafter au lieu de le reconstruire à chaque tour.
+- `Qwen4ExpFlashMTPGenerator.generateMTP` gagne trois paramètres, tous à
+  défaut neutre (aucun appelant CLI existant n'est affecté) :
+  `continueConversation` (contrôle uniquement `model.resetConversation()`,
+  même contrat que `Qwen4ExpStreamingGenerationOptions`), `state`
+  (fourni par l'appelant au lieu d'être créé en interne, pour survivre
+  entre tours) et `onToken` (callback par token émis, pour streamer via
+  `Qwen38GenerationEvent` sans dupliquer la boucle de rounds existante).
+  Le choix `prepare` vs `prepareContinuation` pour le drafter est décidé
+  **indépendamment** de `continueConversation`, par `state.nextPosition
+  == 0` : un état jamais amorcé se prime toujours à neuf, y compris si la
+  cible, elle, continue une conversation dont les tours précédents
+  n'utilisaient pas le MTP (le drafter n'a alors aucun historique à
+  perdre — `prepare()` sur ce tour-là est correct, `prepareContinuation()`
+  serait un no-op déguisé en continuation).
+- `Qwen38FlashNextEngineProtocol` gagne `var mtpState: Qwen38MTPAvailability`
+  (dynamique : `.fallback` avant le premier tour MTP, `.active` une fois le
+  prédicteur chargé). `Qwen38FlashNextEngine` charge le prédicteur à la
+  demande (`Qwen4ExpMTPLoader.load(uncachedIO: true)`) dans la `Task` de
+  streaming (pas avant : éviter de bloquer l'actor `Qwen38Runtime` sur de
+  l'IO Lexar), garde `mtpDraftState` en propriété (effacé par
+  `resetConversation()`, les poids du prédicteur restent chargés).
+  `runGenerationStream` route vers un nouveau `runMTPGenerationStream`
+  quand `options.mtp.enabled && !hasImage` ; image + MTP demandé ⇒ log +
+  fallback greedy avec `mtpStatus = .fallback("MTP Flash-Next : texte
+  seul")` ; MTP non demandé ⇒ `mtpStatus = .unavailable` (au lieu du
+  message fixe PM3/PM4 précédent, qui s'affichait même quand MTP n'était
+  pas demandé).
+- `Qwen38Runtime.mtpState` délègue à `flashEngine.mtpState` quand
+  Flash-Next est chargé (au lieu du `mtpAvailability` figé pris à
+  `load()`) ; le `.qwen4Exp` de `load()` initialise `mtpAvailability =
+  .unavailable`, la valeur réelle vient désormais de l'engine.
+- GUI (`Qwen38BenchUIApp.swift`) : `mtpEnabled` (défaut `true`, pensé pour
+  le 27B où un drafter présent est le cas courant) est forcé à `false` à
+  chaque chargement d'un modèle `qwen4Exp`, pour que le MTP Flash-Next
+  reste opt-in même si l'utilisateur n'a jamais touché le toggle. Le
+  mécanisme de réactivation du toggle (`disabled(mtpAvailability !=
+  .active)`) est inchangé — non spécifique à Flash-Next, non modifié.
+
+### Tests
+
+`Tests/Qwen38Tests/Qwen38Tests.swift` : `MockFlashNextEngine` gagne un
+`mtpState` settable et enregistre les `options` reçues par
+`generate`/`generateFromMessages` ; `MockFlashNextEngineFactory` devient
+une classe qui garde une référence à l'engine créé (le test doit pouvoir
+remonter dedans après coup). Le test existant `runtimeDispatchesToFlashNextEngine`
+est mis à jour pour le nouveau message `.fallback` par défaut. Nouveau test
+« PM4.3 (branchement) » : vérifie que `Qwen38Runtime.mtpState` restitue
+`.active` une fois le mock basculé, et que `options.mtp.enabled`/`draftDepth`
+atteignent bien l'engine via `runtime.generate(...)`. 78 tests verts
+(`Scripts/run-tests.sh`), `Scripts/build-release.sh` vert.
+
+### Validation matérielle (serveur réel, 3-bit)
+
+`qwen38 serve --model-path .../Qwen3.8-Flash-Next-MLX-e3bit-MTP`,
+`caffeinate -dimsu`, préflight OK (24,6 Go à évincer, seuil 35 Go).
+
+| Requête | `mtp` | temps total (`curl`) | `content` | `/metrics` |
+|---|---|---:|---|---|
+| 1 | `false` | 7,95 s | « Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire centrale » | `mtp: "indisponible"` |
+| 2 | `true` | **7,42 s** | **identique mot pour mot** | `mtp: "actif"`, `mtpProposed: 21`, `mtpAccepted: 10`, `mtpAcceptRate: 0.476` |
+
+`content` strictement identique entre les deux réponses, la requête MTP
+plus rapide malgré le surcoût fixe HTTP/session qui dilue le gain mesuré en
+CLI (0,81-0,86x en décodage pur devient ~0,93x sur le temps `curl` total,
+TTFT/queue/JSON inclus). Un premier appel `mtp:false` avec
+`enable_thinking` par défaut (`true`) a d'abord consommé tout le budget de
+32 tokens dans `reasoning_content` (`content` vide) — attendu, pas un bug :
+refait avec `"enable_thinking":false` pour comparer des générations
+équivalentes au prompt de référence CLI.
+
+Continuation multi-tour testée par `conversation_id` (deux tours, `mtp:true`
+sur les deux) : le second tour (« Et quel âge a-t-il ? ») répond
+correctement à partir du contexte du premier (« Xi Jinping, né le 15 juin
+1953 »), `cacheReused: true`, `mtp: "actif"`, `mtpAccepted: 9/14` — confirme
+que `prepareContinuation`/`state.nextPosition` fonctionnent en conditions
+réelles, pas seulement en test unitaire.
+
+### Écarts assumés
+
+1. **Défaut serveur `"mtp"` non spécifié à la requête reste `true`**
+   (`ChatCompletionRequest.effectiveMTP`, comportement global hérité du
+   27B, non modifié) : un client Flash-Next qui omet le champ `mtp`
+   obtient donc le MTP actif par défaut via l'API brute, à la différence
+   du toggle GUI (forcé off pour cette famille). Changer ce défaut aurait
+   affecté le comportement 27B existant hors périmètre de cette tâche ;
+   documenté plutôt que corrigé. Un client qui veut explicitement le
+   greedy doit envoyer `"mtp": false`.
+2. **`options.temperature`/`topP`/`topK` ignorés par le chemin MTP** :
+   `generateMTP` échantillonne en greedy (`ArgMaxSampler`) partout, cible
+   et drafter, exactement comme tous les probes CLI existants. Un appelant
+   qui demande MTP avec une température non nulle l'obtient quand même en
+   greedy, sans erreur ni avertissement dédié — comportement identique à
+   `flash-generate-probe --mtp`, non traité comme une régression.
+3. **Chargement du prédicteur dans la `Task` de streaming, pas avant** :
+   évite de bloquer l'actor `Qwen38Runtime` sur l'IO Lexar, mais veut dire
+   que `mtpState` ne devient `.active` qu'après le retour du premier
+   `.metrics` (pas au moment où le flux est retourné). Cohérent avec « à
+   la demande au premier tour MTP » de la consigne.

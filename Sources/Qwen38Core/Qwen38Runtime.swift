@@ -226,10 +226,11 @@ public actor Qwen38Runtime {
             // to revisit once P (débit) profiles the resident path.
             Memory.cacheLimit = 8 * 1024 * 1024 * 1024
             flashEngine = try await flashNextEngineFactory.makeEngine(directory: directory)
-            // P-MTP (Flash-Next's own MTP) is a separate chantier, opt-in
-            // and not wired into the runtime yet — always report a clear
-            // fallback rather than throwing when a caller requests MTP.
-            mtpAvailability = .fallback("Flash-Next : MTP local en chantier P-MTP")
+            // PM4.3 (branchement, 2026-09-09): `mtpState` now delegates to
+            // the loaded engine's own dynamic availability (predictor loads
+            // lazily on the first MTP-enabled turn) instead of a fixed
+            // snapshot taken here — see the `mtpState` getter below.
+            mtpAvailability = .unavailable
         case .qwen35:
             await Qwen38MTPRegistration.register()
             // The generic helper tries registered factories in order. The LLM
@@ -289,7 +290,13 @@ public actor Qwen38Runtime {
         directConversationMode = false
     }
 
-    public var mtpState: Qwen38MTPAvailability { mtpAvailability }
+    /// PM4.3 (branchement, 2026-09-09): Flash-Next reports its own dynamic
+    /// availability (predictor loaded lazily on the first MTP-enabled
+    /// turn); the 27B path keeps the fixed snapshot taken at `load()`.
+    public var mtpState: Qwen38MTPAvailability {
+        if let flashEngine { return flashEngine.mtpState }
+        return mtpAvailability
+    }
 
     /// H4.2: whether the resident model currently loaded is Flash-Next —
     /// callers use this to decide whether `flashNextWarmUp()` is meaningful

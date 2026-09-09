@@ -76,13 +76,51 @@ public final class Qwen4ExpFlashMTPDraftEngine: @unchecked Sendable {
 
     /// Prefill the private MTP cache from the target's prompt hidden states.
     /// `firstBonus` is the token sampled from the target prompt logits and is
-    /// therefore the last input of the shifted MTP prefill.
+    /// therefore the last input of the shifted MTP prefill. Resets `state`
+    /// first: use this for a fresh conversation (turn 1, or any turn where
+    /// the target's own cache was also reset).
     public func prepare(
         promptTokenIDs: MLXArray,
         targetHidden: MLXArray,
         firstBonus: MLXArray,
         positionIDs: MLXArray? = nil,
         state: Qwen4ExpFlashMTPState
+    ) throws {
+        try primePredictor(
+            promptTokenIDs: promptTokenIDs, targetHidden: targetHidden, firstBonus: firstBonus,
+            positionIDs: positionIDs, state: state, resetState: true)
+    }
+
+    /// PM4.3 (branchement, 2026-09-09): continuation variant of `prepare`
+    /// for a turn where the target model's own cache was *not* reset
+    /// (`Qwen4ExpStreamingGenerator`'s `continueConversation` contract).
+    /// Identical priming pass over this turn's prompt suffix, but the
+    /// predictor's existing cache/history survives instead of being
+    /// recreated — otherwise every new turn would silently discard the
+    /// drafter's memory of the conversation while the target kept its own.
+    /// `positionIDs` is already absolute (`Qwen4ExpMRoPE.textPositionIDs`
+    /// continues from the target's ongoing `logicalOffset`), so no
+    /// state-relative position adjustment is needed beyond skipping the
+    /// reset itself.
+    public func prepareContinuation(
+        promptTokenIDs: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionIDs: MLXArray? = nil,
+        state: Qwen4ExpFlashMTPState
+    ) throws {
+        try primePredictor(
+            promptTokenIDs: promptTokenIDs, targetHidden: targetHidden, firstBonus: firstBonus,
+            positionIDs: positionIDs, state: state, resetState: false)
+    }
+
+    private func primePredictor(
+        promptTokenIDs: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionIDs: MLXArray?,
+        state: Qwen4ExpFlashMTPState,
+        resetState: Bool
     ) throws {
         let prompt = promptTokenIDs.ndim == 1
             ? promptTokenIDs.reshaped([1, promptTokenIDs.dim(0)])
@@ -99,7 +137,9 @@ public final class Qwen4ExpFlashMTPDraftEngine: @unchecked Sendable {
             throw Qwen4ExpFlashMTPEngineError.invalidPromptHidden
         }
 
-        state.reset()
+        if resetState {
+            state.reset()
+        }
         let shifted = concatenated([prompt[0..., 1...], bonus], axis: 1)
         let shiftedHidden = targetHidden[0..., 0..<shifted.dim(1), 0...]
         let shiftedPositions = shiftedPositionIDs(

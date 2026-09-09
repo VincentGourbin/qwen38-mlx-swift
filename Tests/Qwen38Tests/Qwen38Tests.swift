@@ -500,6 +500,16 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     let directory: URL
     private(set) var resetConversationCount = 0
     private(set) var unloadCount = 0
+    /// PM4.3 (branchement): settable so a test can simulate the predictor
+    /// having loaded on a prior MTP-enabled turn, exactly like the real
+    /// `Qwen38FlashNextEngine.mtpState` flipping to `.active`.
+    var mtpState: Qwen38MTPAvailability = .fallback(
+        "Flash-Next : MTP local chargé à la demande au premier tour MTP")
+    /// PM4.3 (branchement): records what `Qwen38Runtime.generate` forwarded,
+    /// so a test can verify `options.mtp` reaches the engine unchanged
+    /// (H3.2's "options ignorées, pas de traduction" contract).
+    private(set) var lastGenerateOptions: Qwen38GenerationOptions?
+    private(set) var lastGenerateFromMessagesOptions: Qwen38GenerationOptions?
 
     init(directory: URL) { self.directory = directory }
 
@@ -511,19 +521,29 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func generate(
         prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
-        AsyncThrowingStream { $0.finish() }
+        lastGenerateOptions = options
+        return AsyncThrowingStream { $0.finish() }
     }
 
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
-        AsyncThrowingStream { $0.finish() }
+        lastGenerateFromMessagesOptions = options
+        return AsyncThrowingStream { $0.finish() }
     }
 }
 
-private struct MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory {
+private final class MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory, @unchecked Sendable {
+    /// PM4.3 (branchement): the factory protocol only returns an existential,
+    /// so a test that needs to reach back into the concrete mock (to flip
+    /// `mtpState` or read `lastGenerateOptions`) keeps its own reference
+    /// here instead of downcasting `Qwen38Runtime`'s private storage.
+    private(set) var lastEngine: MockFlashNextEngine?
+
     func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol {
-        MockFlashNextEngine(directory: directory)
+        let engine = MockFlashNextEngine(directory: directory)
+        lastEngine = engine
+        return engine
     }
 }
 
@@ -543,12 +563,45 @@ func runtimeDispatchesToFlashNextEngine() async throws {
     let mtpState = await runtime.mtpState
     #expect(loadedAfter == true)
     #expect(loadedDirectory == directory)
-    #expect(mtpState == .fallback("Flash-Next : MTP local en chantier P-MTP"))
+    // PM4.3 (branchement): `Qwen38Runtime.mtpState` now delegates to the
+    // loaded Flash-Next engine's own dynamic availability instead of a
+    // fixed snapshot taken at load time — see `MockFlashNextEngine`'s
+    // default below, matching the real engine's pre-first-MTP-turn state.
+    #expect(
+        mtpState
+            == .fallback("Flash-Next : MTP local chargé à la demande au premier tour MTP"))
 
     await runtime.resetConversation()
     await runtime.unload()
     let loadedAfterUnload = await runtime.isLoaded
     #expect(loadedAfterUnload == false)
+}
+
+@Test("PM4.3 (branchement) : Qwen38Runtime.mtpState reflète l'engine Flash-Next chargé et transmet options.mtp au dispatch")
+func runtimeReflectsFlashNextEngineMTPStateAndForwardsOptions() async throws {
+    let directory = try writeQwen4ExpFixtureDirectory(named: "qwen4-exp-mtp-dispatch")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: directory)
+    let mock = try #require(factory.lastEngine)
+
+    // Before any MTP turn, the predictor has not been loaded yet.
+    let before = await runtime.mtpState
+    #expect(before.isActive == false)
+
+    // Simulate the engine having loaded its predictor on a first MTP turn.
+    mock.mtpState = .active
+    let after = await runtime.mtpState
+    #expect(after == .active)
+
+    var options = Qwen38GenerationOptions()
+    options.mtp.enabled = true
+    options.mtp.draftDepth = .fixed(2)
+    _ = try await runtime.generate(prompt: "bonjour", options: options)
+    #expect(mock.lastGenerateOptions?.mtp.enabled == true)
+    #expect(mock.lastGenerateOptions?.mtp.draftDepth == .fixed(2))
 }
 
 @Test("Le mergeur Flash remplace uniquement les marqueurs image")

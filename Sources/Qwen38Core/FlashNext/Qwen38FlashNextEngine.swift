@@ -28,6 +28,12 @@ public enum Qwen38FlashNextEngineError: LocalizedError, Equatable {
 /// without loading the real ~80 GB resident checkpoint.
 public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     var directory: URL { get }
+    /// PM4.3 (branchement, 2026-09-09): dynamic MTP availability for this
+    /// loaded engine. Unlike the 27B path (drafter presence known at load
+    /// time), Flash-Next's predictor loads lazily on the first turn that
+    /// requests it (`options.mtp.enabled`), so this starts as `.fallback`
+    /// and flips to `.active` once that load has happened.
+    var mtpState: Qwen38MTPAvailability { get }
     func resetConversation()
     func unload()
     func decode(tokenIDs: [Int32]) -> String
@@ -73,6 +79,20 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     private var hasConversationHistory = false
     private var turnIndex = 0
 
+    /// PM4.3 (branchement, 2026-09-09): loaded lazily on the first turn
+    /// that requests `options.mtp.enabled` (`Qwen4ExpMTPLoader`,
+    /// `uncachedIO` — same F_NOCACHE contract as the decoder/global
+    /// loaders, PLAN.md §6.3-4/8). `nil` means "not requested yet", not
+    /// "unavailable": every Flash-Next checkpoint used in this codebase
+    /// ships an MTP head.
+    private var mtpPredictor: Qwen4ExpMTPPredictor?
+    /// The drafter's persistent per-conversation cache (PM4.3): created
+    /// once alongside `mtpPredictor` and reused across turns so
+    /// `continueConversation` can extend it (`prepareContinuation`)
+    /// instead of re-priming from scratch every turn. Cleared by
+    /// `resetConversation()` together with the target's own caches.
+    private var mtpDraftState: Qwen4ExpFlashMTPState?
+
     /// Keeps macOS from idle-sleeping while a Flash-Next model is resident:
     /// P1 (2026-09-08) showed the Mac entering 'Idle Sleep' 73 s into a
     /// resident load (1-minute idle sleep in the power profile), which
@@ -113,10 +133,23 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         ProcessInfo.processInfo.endActivity(sleepActivity)
     }
 
+    /// PM4.3 (branchement): `.active` once the predictor has been loaded by
+    /// a prior MTP-enabled turn, `.fallback` (with a reason a caller can
+    /// surface, e.g. the GUI's `mtpHelp` text) until then.
+    public var mtpState: Qwen38MTPAvailability {
+        mtpPredictor != nil
+            ? .active
+            : .fallback("Flash-Next : MTP local chargé à la demande au premier tour MTP")
+    }
+
     public func resetConversation() {
         model.resetConversation()
         hasConversationHistory = false
         turnIndex = 0
+        // The drafter's cache is tied to the target's own conversation
+        // history; the predictor's *weights* stay loaded (no need to pay
+        // Lexar IO again), only its per-conversation state is discarded.
+        mtpDraftState = nil
     }
 
     public func unload() {
@@ -224,29 +257,6 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         let maxNewTokens = max(options.maxTokens, 1)
         let preset = Qwen4ExpSamplingPreset.custom(
             temperature: options.temperature, topP: options.topP, topK: options.topK)
-        if options.mtp.enabled {
-            // P-MTP (2026-09-09, PM3) → P-MTP suite (2026-09-09, PM4):
-            // measured, still not wired in, but for a different and much
-            // smaller reason than PM3's. The Vontra-norm fix (loader +
-            // pre_fc_norm_*) raised block-2 acceptance from 24% to 47.6%,
-            // and PM4.1/PM4.2 removed the verify round's
-            // `model.snapshot()`/`restore()` + replay forward entirely
-            // (per-token GDN states + a capture-based cache rollback instead
-            // — `stats.replayedTokens` is now always 0). Net effect on the
-            // 3-bit checkpoint: block 2 went from ~1.19x SLOWER than greedy
-            // (PM3) to ~0.81-0.86x — genuinely *faster* than greedy at 32
-            // and 128 tokens, bit-identical token ids — but that stays just
-            // short of PLAN.md's ≤0.8x bar for auto-branching (PM4.3, table
-            // in docs/knowledge/log.md 2026-09-09 "P-MTP (suite) : PM4"),
-            // margin ~2-8% depending on run/context length. Blocks 3 and 4
-            // regress further (accept rate falls with block size). Log and
-            // ignore rather than fail the request (H3.2: "options.mtp
-            // ignoré, un log, pas d'erreur").
-            FileHandle.standardError.write(
-                Data(
-                    "qwen38: Flash-Next ignore options.mtp (P-MTP : sans rejeu mais encore ~0,8-0,86x greedy, sous le seuil ≤0,8x — voir log.md 2026-09-09 PM4)\n"
-                        .utf8))
-        }
 
         let profiler = MLXProfiler.shared
         let profileSession = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
@@ -255,6 +265,29 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         profileSession.metadata["turn"] = String(currentTurnIndex)
         profiler.activeSession = profileSession
         profiler.enable()
+
+        // PM4.3 (branchement, 2026-09-09): opt-in local MTP — default off
+        // (`options.mtp.enabled`). PLAN.md P-MTP suite PM4.3 measured block
+        // 2 at 0.81-0.86x greedy on the 3-bit checkpoint (bit-identical
+        // token ids, `stats.replayedTokens == 0`): faster than greedy but
+        // short of the 0.8x bar set for auto-branching, hence a caller has
+        // to ask for it explicitly rather than it being the default. Text
+        // only — `Qwen4ExpFlashMTPDraftEngine`'s multimodal M-RoPE
+        // continuation isn't wired into the drafter (see its doc comment).
+        let requestedMTP = options.mtp.enabled
+        let hasImage = built.visionEmbeddings != nil
+        if requestedMTP && !hasImage {
+            return runMTPGenerationStream(
+                built: built, options: options, continueConversation: continueConversation,
+                inputDescription: inputDescription, currentTurnIndex: currentTurnIndex,
+                maxNewTokens: maxNewTokens, profiler: profiler, profileSession: profileSession)
+        }
+        if requestedMTP && hasImage {
+            FileHandle.standardError.write(
+                Data(
+                    "qwen38: Flash-Next ignore options.mtp pour ce tour (image présente, MTP local texte seul)\n"
+                        .utf8))
+        }
 
         let inner = generator.generate(
             promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
@@ -292,6 +325,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 generationTime: summary.decodeTime,
                                 promptTokens: summary.promptTokenCount,
                                 generatedTokens: summary.tokenIDs.count)
+                            let mtpStatus = (requestedMTP && hasImage)
+                                ? Qwen38MTPRunStatus(
+                                    availability: .fallback("MTP Flash-Next : texte seul"),
+                                    engine: options.mtp.engine)
+                                : Qwen38MTPRunStatus(availability: .unavailable)
                             continuation.yield(
                                 .metrics(
                                     Qwen38RunMetrics(
@@ -308,12 +346,116 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                         cacheReused: continueConversation,
                                         conversationReplayed: false,
                                         inputDescription: inputDescription,
-                                        mtpStatus: Qwen38MTPRunStatus(
-                                            availability: .fallback(
-                                                "Flash-Next : MTP local mesuré ~0,8-0,86x greedy (PM4), sous le seuil ≤0,8x"))
-                                    )))
+                                        mtpStatus: mtpStatus)))
                         }
                     }
+                    continuation.finish()
+                    profiler.disable()
+                } catch {
+                    continuation.finish(throwing: error)
+                    profiler.disable()
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// PM4.3 (branchement, 2026-09-09): drives `Qwen4ExpGreedyGenerator.generateMTP`
+    /// behind the same `Qwen38GenerationEvent` stream the greedy/sampling
+    /// path uses. The predictor loads lazily here (first MTP-enabled turn)
+    /// and `mtpDraftState` persists on `self` across turns so a later
+    /// continuation turn can extend the drafter's cache instead of
+    /// re-priming it (see `generateMTP`'s `state`/`continueConversation`
+    /// docs). MTP is greedy-only (`generateMTP` samples via `ArgMaxSampler`
+    /// throughout, target and drafter alike, matching every CLI probe);
+    /// `options.temperature`/`topP`/`topK` are not applied to this path.
+    private func runMTPGenerationStream(
+        built: Qwen4ExpBuiltPrompt, options: Qwen38GenerationOptions,
+        continueConversation: Bool, inputDescription: String,
+        currentTurnIndex: Int, maxNewTokens: Int,
+        profiler: MLXProfiler, profileSession: ProfilingSession
+    ) -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        let requestedDrafts = options.mtp.draftDepth.requestedDraftTokens
+        let blockSize = min(max(requestedDrafts + 1, 2), 4)
+        let mtpEngineKind = options.mtp.engine
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // Loading (Lexar IO, first MTP turn only) and the
+                    // draft-state lookup both happen inside the task so a
+                    // caller gets its stream back immediately, exactly like
+                    // the greedy path above.
+                    let predictor: Qwen4ExpMTPPredictor
+                    if let loaded = self.mtpPredictor {
+                        predictor = loaded
+                    } else {
+                        let loaded = try Qwen4ExpMTPLoader.load(
+                            from: self.directory, uncachedIO: true)
+                        predictor = loaded.model
+                        self.mtpPredictor = predictor
+                    }
+                    let state = self.mtpDraftState
+                        ?? Qwen4ExpFlashMTPDraftEngine(target: self.model, predictor: predictor)
+                            .makeState()
+                    self.mtpDraftState = state
+
+                    let greedyGenerator = Qwen4ExpGreedyGenerator(model: self.model)
+                    let result = try greedyGenerator.generateMTP(
+                        promptTokenIDs: built.tokenIDs,
+                        predictor: predictor,
+                        options: .init(maxNewTokens: maxNewTokens, stopTokenIDs: self.stopTokenIDs),
+                        blockSize: blockSize,
+                        profiler: profiler,
+                        continueConversation: continueConversation,
+                        state: state,
+                        onToken: { token in
+                            if Task.isCancelled { return }
+                            guard self.visibleTokenFilter.shouldEmit(Int(token)) else { return }
+                            let piece = Qwen38VisibleText.sanitize(
+                                self.tokenizer.decode(
+                                    tokens: [Int(token)], skipSpecialTokens: false))
+                            if !piece.isEmpty {
+                                continuation.yield(.chunk(piece))
+                            }
+                        })
+
+                    let stopReason: GenerateStopReason
+                    if let last = result.tokenIDs.last, self.stopTokenIDs.contains(last) {
+                        stopReason = .stop
+                    } else if result.tokenIDs.count >= maxNewTokens {
+                        stopReason = .length
+                    } else {
+                        stopReason = .cancelled
+                    }
+                    let llmMetrics = LLMMetrics(
+                        prefillTime: result.prefillTime,
+                        generationTime: result.generationTime,
+                        promptTokens: result.promptTokenCount,
+                        generatedTokens: result.tokenIDs.count)
+                    let mtpStatus = Qwen38MTPRunStatus(
+                        availability: .active,
+                        engine: mtpEngineKind,
+                        blockSize: blockSize,
+                        proposedTokens: result.stats.proposedTokens,
+                        acceptedTokens: result.stats.acceptedTokens,
+                        rounds: result.stats.rounds)
+                    continuation.yield(
+                        .metrics(
+                            Qwen38RunMetrics(
+                                metrics: llmMetrics,
+                                stopReason: stopReason,
+                                report: profileSession.generateReport(),
+                                chromeTrace: ChromeTraceExporter.export(session: profileSession),
+                                activeMemoryBytes: Memory.activeMemory,
+                                peakMemoryBytes: Memory.peakMemory,
+                                acceptRate: result.stats.acceptanceRate,
+                                timeToFirstToken: result.timeToFirstToken,
+                                turnIndex: currentTurnIndex,
+                                cacheReused: continueConversation,
+                                conversationReplayed: false,
+                                inputDescription: inputDescription,
+                                mtpStatus: mtpStatus)))
                     continuation.finish()
                     profiler.disable()
                 } catch {
