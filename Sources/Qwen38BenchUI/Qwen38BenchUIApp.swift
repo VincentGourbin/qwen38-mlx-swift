@@ -761,7 +761,7 @@ private struct ServerView: View {
                             .tint(model.serverSnapshot.status == .running ? .red : .accentColor)
                             .disabled(model.serverSnapshot.status == .starting || model.serverSnapshot.status == .stopping)
                             Spacer()
-                            Text("Local : 127.0.0.1:\(model.serverSnapshot.port)")
+                            Text("Local : 127.0.0.1:\(String(model.serverSnapshot.port))")
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.tertiary)
                         }
