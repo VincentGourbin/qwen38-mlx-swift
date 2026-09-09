@@ -53,7 +53,23 @@ struct Qwen38DiscoveredModel: Identifiable, Equatable {
 
 @MainActor
 final class BenchViewModel: ObservableObject {
-    @Published var modelPath = "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit"
+    /// Profils de chemins de modèle (demande Vincent 2026-09-09) : liste
+    /// persistée dans UserDefaults, un clic recharge le catalogue autour du
+    /// chemin choisi ; le dernier chemin utilisé est restauré au lancement.
+    static let defaultProfiles = [
+        "/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
+        "/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+        "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit",
+    ]
+    private static let profilesKey = "qwen38.modelProfiles"
+    private static let lastPathKey = "qwen38.lastModelPath"
+
+    @Published var modelPath: String {
+        didSet { UserDefaults.standard.set(modelPath, forKey: Self.lastPathKey) }
+    }
+    @Published var profiles: [String] {
+        didSet { UserDefaults.standard.set(profiles, forKey: Self.profilesKey) }
+    }
     @Published var catalog: [Qwen38DiscoveredModel] = []
     @Published var flashLoadProgress: (visited: Int, total: Int)?
     @Published var loadedFamily: Qwen38ModelFamily?
@@ -101,6 +117,49 @@ final class BenchViewModel: ObservableObject {
         let runtime = Qwen38Runtime()
         self.runtime = runtime
         self.inferenceServer = Qwen38InferenceServer(runtime: runtime)
+        let saved = UserDefaults.standard.stringArray(forKey: Self.profilesKey)
+        self.profiles = (saved?.isEmpty == false) ? saved! : Self.defaultProfiles
+        self.modelPath = UserDefaults.standard.string(forKey: Self.lastPathKey) ?? Self.defaultProfiles[0]
+    }
+
+    // MARK: profils de chemins
+
+    static func profileLabel(_ path: String) -> String {
+        let parts = path.split(separator: "/").map(String.init)
+        return parts.suffix(2).joined(separator: "/")
+    }
+
+    func applyProfile(_ path: String) {
+        guard !isBusy else { return }
+        if isLoaded && modelPath != path {
+            isLoaded = false
+            mtpAvailability = .unavailable
+            status = "Profil sélectionné — charge le modèle"
+        }
+        modelPath = path
+        refreshCatalog()
+    }
+
+    func addCurrentPathAsProfile() {
+        let trimmed = modelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !profiles.contains(trimmed) else { return }
+        profiles.insert(trimmed, at: 0)
+    }
+
+    func removeProfile(_ path: String) {
+        profiles.removeAll { $0 == path }
+    }
+
+    func browseForModelDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: modelPath, isDirectory: true).deletingLastPathComponent()
+        panel.message = "Choisir le dossier d'un modèle (contenant config.json)"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        applyProfile(url.path)
+        if !profiles.contains(url.path) { profiles.insert(url.path, at: 0) }
     }
 
     func loadModel() {
@@ -1002,12 +1061,51 @@ private struct SettingsView: View {
                 .font(.headline)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Modèle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextField("Répertoire du modèle", text: $model.modelPath)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.refreshCatalog() }
+                HStack {
+                    Text("Modèle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Menu {
+                        ForEach(model.profiles, id: \.self) { path in
+                            Button {
+                                model.applyProfile(path)
+                            } label: {
+                                if path == model.modelPath {
+                                    Label(BenchViewModel.profileLabel(path), systemImage: "checkmark")
+                                } else {
+                                    Text(BenchViewModel.profileLabel(path))
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("Ajouter le chemin actuel") { model.addCurrentPathAsProfile() }
+                            .disabled(model.profiles.contains(model.modelPath))
+                        Button("Choisir un dossier…") { model.browseForModelDirectory() }
+                        if !model.profiles.isEmpty {
+                            Menu("Retirer") {
+                                ForEach(model.profiles, id: \.self) { path in
+                                    Button(BenchViewModel.profileLabel(path)) { model.removeProfile(path) }
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Profils", systemImage: "folder")
+                            .font(.caption)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(model.isBusy)
+                }
+                HStack(spacing: 6) {
+                    TextField("Répertoire du modèle", text: $model.modelPath)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { model.refreshCatalog() }
+                    Button("Parcourir…") { model.browseForModelDirectory() }
+                        .buttonStyle(.bordered)
+                        .disabled(model.isBusy)
+                        .help("Choisir le dossier du modèle avec le sélecteur de fichiers")
+                }
             }
 
             HStack {
