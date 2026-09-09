@@ -80,3 +80,25 @@ Bench synthétique d'une couche (`flash-layer-bench`, Release, poids aléatoires
 sans checkpoint) : GDN+MoE 5,5 ms/pas, QSA+MoE 5,8 ms/pas en eager ; 4,5 ms
 avec `asyncEval` (GPU 82 % `ioreg`). Debug : 6,5 / 10,3 ms. Le profiler par
 couche coûte ~4,7 ms par phase (opt-in `--profile-layers` depuis P0-c).
+
+### P4 — débit de décodage : `residentAsyncInterval` corrige un bug de bookkeeping (2026-09-09)
+
+Même checkpoint/prompt/réglages ; `residentAsyncEval` était un no-op en
+production (`residentEvaluationInterval == 1` forçait un `eval` bloquant sur
+chaque couche quel que soit ce flag). `residentAsyncInterval` (nouveau,
+défaut 8) répare l'asynchronie sans toucher `residentEvaluationInterval`
+(piège 11 inchangé). Détail, sweep N=1-12 et méthodologie Metal System
+Trace : `docs/knowledge/log.md` « 2026-09-09 — P4 : débit de décodage ».
+
+| Variante | tokens | avant P4 | après P4 (N=8) | Δ | IDs = référence |
+|---|---:|---:|---:|---:|---|
+| Greedy | 32 | 0,166 s/token (6,0 tok/s) | **0,1405 s/token (7,1 tok/s)** | **−15,4 %** | oui |
+| MTP bloc 2 | 32 | 0,135 s/token (7,4 tok/s) | **0,1328 s/token (7,5 tok/s)** | −1,6 % | oui |
+
+GPU actif pendant le décodage (Metal System Trace, union des intervalles,
+pas une moyenne d'échantillons `ioreg`) : 14,2 % avant P4.1 → 82-97 % après
+(`ioreg`, cross-check). Fin de token (`lm_head`+`sampler.sample`+`.item()`) :
+2,2 % du décodage, sous le seuil de 10 % — rien à changer (P4.2). Aucune
+fusion de noyau custom retenue (P4.3, décision documentée) : P2-fusion avait
+déjà montré un gain nul sur des leviers structurellement comparables, et
+P4.1 seul a refermé l'essentiel de l'écart GPU visé par ces fusions.

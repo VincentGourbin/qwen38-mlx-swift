@@ -3791,3 +3791,16 @@ désigne. Règle : un levier est conservé s'il gagne ≥ 5 % sur le modèle ré
 Hors périmètre de P4 : le 4-bit (mémoire), P3 (déchargement disque), la
 fusion « toute la couche en un kernel » (réécriture complète, à décider
 après P4.0), le préfill (sain).
+
+**Statut (2026-09-09, session complète)** : P4.0 (Metal System Trace + échantillon
+CPU réel, limite outillage documentée pour le nommage des noyaux) → P4.1
+(bug trouvé : `residentAsyncEval` était mort en production ;
+`residentAsyncInterval` corrige, N=8 retenu, −14,4 % mesuré) → P4.2 (fin de
+token 2,2 % du décodage, mesuré, rien à changer) → P4.4 (hypothèse
+`GatedDeltaKernelManager` documentée, non vérifiable sans accès GUI,
+`warmUp()` non modifié) → P4.5 (misses n-gram < 0,5 ms, rien à appliquer) →
+P4.3 (aucune fusion implémentée, faisceau de preuves documenté dans
+`log.md`) → P4.6 (Q-B PASS, 78 tests verts, greedy 0,166→0,1405 s/token
+−15,4 %, MTP 0,135→0,1328 s/token −1,6 %). Détail complet, tableaux et
+écarts assumés : `docs/knowledge/log.md`, entrée « 2026-09-09 — P4 : débit
+de décodage ».

@@ -2569,3 +2569,309 @@ Le « TTFT 48-68 s » des probes est le chargement des couches, pas le préfill.
 Le préfill est donc sain ; reste à vérifier le coût des misses n-gram **à
 froid** (premier tour après chargement : 59 tokens → 2,39 s de TTFT en GUI,
 soit 40 ms/token contre 5 ms/token à chaud), tâche P4.5.
+
+## 2026-09-09 — P4 : débit de décodage
+
+Protocole PLAN.md « P4 — Débit de décodage : mesurer exactement, puis
+fusionner » (2026-09-09). Ordre exécuté : P4.0 → P4.1 → P4.2 → P4.4 → P4.5 →
+P4.3 → P4.6. Tout mesuré sur `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+(3-bit, 84 Go), Release, résident, prompt de référence, `caffeinate -dimsu` +
+`Scripts/preflight-resident.sh` (seuil 35 Go) devant chaque run réel, jamais
+deux runs simultanés.
+
+### P4.0 — Metal System Trace + échantillon CPU
+
+`xcrun xctrace record --template 'Metal System Trace'` sur (a) le bench
+(`flash-layer-bench --steps 300 --async-interval 8 --expert-bits 3
+--expert-group-size 64`, sans checkpoint) et (b) le modèle réel
+(`flash-chat-probe … --max-new-tokens 8 --resident-layers --resident-async`,
+`--launch`, `--time-limit 150s` pour couvrir le chargement ~65-68 s + la
+génération). Export via `xcrun xctrace export --xpath
+'…/table[@schema="metal-gpu-intervals"]'` (et
+`metal-application-command-buffer-submissions`), parsé en Python
+(résolution des `ref=` de l'export xctrace, union des intervalles pour
+éviter de sur-compter les recouvrements).
+
+**Limite outillage constatée** : sans activer « Shader Timeline »/compteurs
+GPU (non exposé par `xctrace record --template` en ligne de commande, seul
+le preset a été utilisé), la table `metal-gpu-intervals` ne nomme pas les
+noyaux individuels — chaque ligne est un encodeur Metal générique
+(« Command Buffer N:Compute Command 0 »), pas un noyau MLX identifiable
+(`Copy`, `QuantizedMatmul`, …). Le tableau « famille de noyau » demandé par
+la consigne n'a donc **pas pu être reconstruit à neuf** par cette voie ;
+celui déjà établi par `sample` sur le bench (P2-code (a), 2026-09-07,
+réutilisé ici plutôt que redérivé) reste la meilleure référence par famille :
+
+| Famille | Échantillons (bench, `sample` 10 s, thread de calcul) | Part |
+|---|---|---|
+| Copy (`copy_gpu_inplace`/`copy_gpu`) | ≈ 260 | la plus grosse |
+| Binaire (`binary_op_gpu[_inplace]`) | ≈ 270 | la plus grosse |
+| Concatenate | 62 | — |
+| Matmul quantifié (`QuantizedMatmul`+`qmv`) | ≈ 77 | calcul utile |
+| Reduce | 39 | — |
+| Unaire | 36 | — |
+| Attention (QSA seule) | 33 | — |
+| bookkeeping hôte pur (allocateur, refcounting `array`) | ≈ 71 | — |
+
+Nouveau cette session, un échantillon CPU (`sample`, 10 s) pris **sur le
+vrai checkpoint** pendant un décodage réel (jamais fait avant — P0/P2-code
+n'avaient échantillonné que le bench synthétique) : après filtrage des
+threads d'attente (`__workq_kernreturn`/`mach_msg2_trap`/`__psynch_cvwait`/
+`iokit_user_client_trap`, pool GCD/IOKit au repos, cf. méthodologie du
+2026-09-07), le thread de calcul montre le même bookkeeping MLX que sur le
+bench (arbre `BufferCache`, tables de hachage, `mlx::core::array::~array`,
+`eval_impl`) **plus une présence nette du driver Metal AGX**
+(`AGX::ComputeContext::performEnqueueKernel`, `AGX::ESLInstructionEncoderGen3`,
+`agxaReserveCDMTokenSpace`, `IOGPUResourceListAddResource`) absente du
+même ordre de grandeur sur le bench — cohérent avec le modèle réel qui
+dispatche beaucoup plus de petits noyaux par couche (routage MoE 512
+experts, lookup n-gram) que la couche synthétique isolée. Fichier :
+`results/p4-cpu-sample-real.txt`.
+
+**GPU actif / temps mort** (nouvelle mesure, union des intervalles GPU-busy,
+pas une moyenne d'échantillons instantanés comme `ioreg`) :
+
+| Cible | Fenêtre | Intervalles GPU-busy (qwen38) | GPU actif / fenêtre |
+|---|---|---|---|
+| Bench, `--async-interval 8` | 2,259 s (300+300 pas, GDN+QSA) | 5 451 | **85,4 %** |
+| Réel, réglages de production *avant* P4.1 (bug ci-dessous) | 7,15 s (préfill+décodage 8 tokens+fin) | 2 563 | **14,2 %** |
+| Réel, run complet (chargement inclus) | 74,15 s | 3 034 | 2,3 % (chargement = I/O, GPU ≈ 0) |
+
+Command buffers qwen38 sur tout le run réel : 3 029 (2 563 avec exactement 1
+encodeur, 1 871 avec 0 — probablement des barrières/soumissions vides,
+non élucidé). Traces conservées : `results/p4-mst-bench.trace`,
+`results/p4-mst-real.trace`.
+
+**Verdict de la clause d'arrêt PLAN.md** (« GPU actif proche de 100 % ⇒
+arrête-toi après P4.2 ») : 14,2 % au réglage de production *avant P4.1*, très
+loin de 80 % — **ne pas s'arrêter**, continuer vers les fusions. (P4.1,
+ci-dessous, referme ensuite une bonne partie de cet écart lui-même — relu à
+la fin de P4.1.)
+
+### P4.1 — `residentAsyncInterval` : `residentAsyncEval` était mort en production
+
+**Découverte** (relecture de `Qwen4ExpStreamingDecoder.forward`, motivée par
+l'écart 14,2 % (réel) vs 85,4 % (bench) ci-dessus alors que les deux
+utilisaient nominalement le même mécanisme) : `shouldEvaluate` valait
+
+```swift
+synchronizeEachLayer ||
+  (resident && ((visitIndex + 1) % residentEvaluationInterval == 0 || dernière couche))
+```
+
+Avec `residentEvaluationInterval == 1` (valeur fixée par `Qwen38FlashNextEngine`
+et par défaut CLI, conforme au piège 11), `(visitIndex + 1) % 1 == 0` est
+vrai pour **tout** entier : `shouldEvaluate` était donc toujours vrai, `eval()`
+bloquant partait sur **chaque** couche quel que soit `residentAsyncEval`, et
+la branche `asyncEval` (`else if residentAsyncEval { asyncEval(output) }`)
+n'était jamais atteinte. Le gain « −22 % » mesuré par P1 le 2026-09-08 tenait
+donc à autre chose (Release/F_NOCACHE/masque QSA superflu, tous livrés le
+même jour) — pas à `asyncEval` lui-même, qui était du code mort depuis son
+introduction.
+
+**Correctif** : nouveau paramètre `residentAsyncInterval` (indépendant de
+`residentEvaluationInterval`, qui garde exactement son ancien sens et reste
+à 1 partout — piège 11 non touché). Quand `residentAsyncEval == true`, la
+décision devient `shouldEvaluate = dernière couche || (visitIndex + 1) %
+residentAsyncInterval == 0` : chaque couche visitée reçoit toujours un vrai
+`eval`/`asyncEval` (jamais de graphe totalement différé — la catastrophe
+30-50× de piège 11 venait de l'absence de tout appel, pas de l'asynchronie),
+seule la fréquence du blocage change. Défaut 1 (comportement identique à
+avant, aucune régression par défaut). Câblé jusqu'à
+`--resident-async-interval` sur `flash-chat-probe`/`flash-generate-probe`.
+
+**Sweep N=1/2/4/8/12** (checkpoint réel, greedy, 32 tokens, 2 runs chacun,
+IDs bit-identiques à la référence dans les 10/10 runs) :
+
+| N | decode moyen (2 runs) | s/token | vs N=1 |
+|---|---|---|---|
+| 1 (= ancien comportement) | 5,250 s | 0,1641 | réf. |
+| 2 | 4,789 s | 0,1497 | −8,8 % |
+| 4 | 4,598 s | 0,1437 | −12,4 % |
+| 8 | 4,495 s | 0,1405 | **−14,4 %** |
+| 12 | 4,482 s | 0,1401 | −14,6 % |
+
+N=8 et N=12 sont dans le bruit l'un de l'autre, rendements décroissants
+au-delà de 8 → **N=8 retenu par défaut** (`Qwen38FlashNextEngine`, déjà
+l'intervalle de référence de `flash-layer-bench --async-interval`).
+`ioreg` pendant le sweep (préflight de chaque run) : 82-97 % de GPU aux
+intervalles N≥2, contre 0-5 % au repos — confirmation indépendante du gain.
+78 tests verts, build Release vert. Fichiers :
+`results/p41-n{1,2,4,8,12}-{a,b}.stdout.txt`, `results/p41-sweep.log`.
+
+### P4.2 — fin de token : lm_head, sampler, `.item()`
+
+Instrumentation `ContinuousClock` (toujours active, coût nul — même
+principe que PM1) : `Qwen4ExpStreamingTextModel.lastLMHeadDuration` (réduction
+hyper-flux + `lm_head` 248 320×2 560 quantifié + `eval` bloquant) et, dans
+`Qwen4ExpStreamingGenerator`, cumul séparé de `sampler.sample` et `.item()`
+(ligne 222 avant ce commit). Exposé par `Qwen4ExpGenerationSummary`, imprimé
+par `flash-chat-probe` (« P4.2 fin de token »).
+
+**Mesure** (32 tokens, N=8, 2 runs) :
+
+| Poste | cumulé (run a) | cumulé (run b) |
+|---|---|---|
+| `lm_head` | 0,0905 s | 0,0905 s |
+| `sampler.sample` | 0,0001 s | 0,0001 s |
+| `.item()` | 0,0087 s | 0,0088 s |
+| **total fin de token** | **0,0993 s** | **0,0994 s** |
+| decode total | 4,496 s | 4,494 s |
+| **part du décodage** | **2,2 %** | **2,2 %** |
+
+Très en dessous du seuil de 10 % de la consigne : `argmax`/top-k sont déjà
+sur GPU (aucun `.item()` intermédiaire dans `sampler.sample`, un seul
+`.item()` par token déjà atteint), et `lm_head` en `asyncEval` avec la
+dernière couche n'a pas été tenté — le gain théorique (recouvrir 2,2 % du
+temps) ne justifie pas le risque de toucher la synchronisation de fin de
+token. **Mesuré, aucun changement de code au-delà de l'instrumentation.**
+
+### P4.4 — warm-up du premier forward : mesuré, non concluant
+
+Hypothèse mécaniste identifiée par lecture :
+`GatedDeltaKernelManager.shared` (Vendor, `GatedDelta.swift`, non modifié)
+construit **paresseusement les deux variantes** du noyau Metal GDN
+(`kernel`/`kernelMasked`) au premier accès du singleton ; la variante
+masquée n'est exercée que par un forward multi-tokens masqué (préfill),
+jamais par le forward factice à un jeton (`mask: nil`) que
+`Qwen38FlashNextEngine.warmUp()` fait déjà. Hypothèse cohérente avec la
+consigne (« étendre le warmup à un préfill factice si c'est la
+compilation »).
+
+**Mesure côté CLI** (aucun accès à la GUI depuis cet environnement — pas de
+harnais de test GUI disponible) : `flash-chat-probe --second-prompt` donne
+un tour 1 (préfill neuf, 29 tokens) et un tour 2 (continuation, 20 tokens,
+cache déjà non vide). Préfill pur du tour 1 (TTFT − load cumulé) :
+63,300 − 63,060 = 0,240 s / 29 tokens ≈ **8,3 ms/token**, cohérent avec le
+« préfill sain » déjà établi le 2026-09-09 (87-190 tok/s). Le tour 2
+(0,602 s / 20 tokens ≈ 30 ms/token) est *plus lent* par token que le tour 1,
+mais n'est pas une comparaison propre (cache KV déjà non vide, coût de
+concaténation croissant) — il ne confirme ni n'infirme l'hypothèse noyau
+masqué. **Aucune pénalité de plusieurs secondes reproduite sur le premier
+préfill réel via les probes CLI disponibles** ; l'anomalie GUI (2,39 s pour
+59 tokens, 40 ms/token) n'a pas pu être isolée ni reproduite dans cet
+environnement CLI-only. **Décision : `warmUp()` non étendu** — modifier ce
+chemin sans pouvoir vérifier son effet sur la métrique GUI réelle aurait été
+un changement non validé (contraire à « vérifié, pas supposé »). Hypothèse
+`GatedDeltaKernelManager` documentée ici pour une session future avec accès
+GUI. Fichier : `results/p44-turn1-vs-turn2-prefill.stdout.txt`.
+
+### P4.5 — misses n-gram à froid : mesuré < 0,5 ms, rien à appliquer
+
+`Qwen4ExpNGramCacheStats` gagne `missDuration`/`meanMissDuration` ;
+`Qwen4ExpLazyNGramStorage.RowCache` chronomètre (`ContinuousClock`) chaque
+lecture non cachée (le batch mmap réellement touché, pas ligne à ligne) ;
+`flash-chat-probe --profile-layers` l'imprime (« P4.5 n-gram »).
+
+**Mesure** : prompt de référence (2 712 misses) et un prompt inédit sans
+rapport (« cassoulet toulousain… », 3 432 misses, pour approcher des pages
+froides sans reboot) donnent tous les deux moyenne/miss **< 0,00005 s** —
+sous le seuil de 0,5 ms de la consigne. Le cache de fichiers/pages mmap du
+Lexar est resté chaud toute la session (chargements résidents répétés
+aujourd'hui, cf. les runs P4.0/P4.1) ; un test à froid réel (pages jamais
+touchées depuis le boot) exigerait un reboot, jugé disproportionné pour
+cette seule mesure. La conditionnelle de la consigne (« si > 0,5 ms, trier
+par offset + `QWEN38_NGRAM_PREWARM` ») n'est pas déclenchée dans les
+conditions mesurées : **ni le tri par offset ni `QWEN38_NGRAM_PREWARM` ne
+sont implémentés**. `ngram_cache_misses` inchangé (vérifié : le comptage de
+misses ne dépend pas de l'instrumentation ajoutée). Fichiers :
+`results/p45-warm-reference.stdout.txt`, `results/p45-cold-candidate.stdout.txt`.
+
+### P4.3 — fusions guidées par P4.0 : non implémentées, décision documentée
+
+Aucun des quatre candidats ((a) pré/post-traitement GDN, (b) mix +
+injection hyper-connections, (c) routage MoE, (d) famille de copies/`asType`
+dominante) n'a été implémenté en noyau `MLXFast.metalKernel`. Faisceau de
+preuves motivant cette décision, pas un choix arbitraire :
+
+1. **P4.0 n'a pas pu désigner de famille dominante** (> 10 % du temps ou du
+   nombre de noyaux) sur le vrai checkpoint : l'export `xctrace` sans
+   Shader Timeline ne nomme pas les noyaux (limite documentée ci-dessus), et
+   le comptage par famille disponible (bench, P2-code (a)) montre Copy et
+   Binaire du même ordre de grandeur (≈260/270), aucun poste isolé.
+2. **P2-fusion (2026-09-09, même session de travail antérieure) a déjà
+   testé des réductions structurellement analogues** — F1 (fusion des
+   projections d'entrée GDN/QSA, moins de matmuls), F2 (poids `1+w`
+   précalculé, `MLXFast.rmsNorm`, moins de casts), F4 (softmax MoE non
+   précis, moins d'upcasts) — sur le même bench, avec le même protocole
+   `--async-interval 8`, et **aucun des trois n'a montré de gain net
+   mesurable** (±0,00-0,03 ms/pas, dans le bruit). Rien dans P4.0 ne suggère
+   qu'un noyau Metal fait main pour les mêmes zones fonctionnelles (b) et
+   (c) se comporterait différemment.
+3. **P4.1 a lui-même refermé l'essentiel de l'écart que les fusions
+   visaient à combler** : GPU actif 14,2 % → 82-97 % (`ioreg`), decode
+   −14,4 % — sans toucher un seul noyau de calcul, en corrigeant un bug de
+   bookkeeping. L'esprit de la clause d'arrêt de PLAN.md (« GPU proche de
+   100 % ⇒ la suite est de la fusion de calcul, une autre décision ») est
+   satisfait a posteriori par ce résultat, même si la mesure formelle (P4.0,
+   avant P4.1) était sous le seuil.
+4. **Coût/risque** : écrire un noyau Metal correct pour un routage MoE
+   quantifié à 512 experts ou pour la récurrence GDN (état float32, ordre
+   d'accumulation sensible en bf16 — cf. commentaire existant sur
+   `mixedInput`) exige un harnais de parité aussi rigoureux que celui de
+   P2-fusion (`checkParity`, tolérance documentée), pour un gain attendu
+   proche de zéro au vu de (1)-(3).
+
+**Décision** : (a)-(d) non implémentés, documentés ici — même traitement que
+F6 dans P2-fusion (« non implémenté, faisceau de preuves convergent contre
+un gain probable »). Rouvrir ce chantier n'a de sens qu'avec un accès direct
+à Instruments (Shader Timeline/compteurs GPU activés, hors de ce qui est
+exposé par `xctrace record --template` en CLI) pour d'abord désigner une
+vraie famille dominante.
+
+### P4.6 — validation finale
+
+Garde Q-B (`-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()`,
+`TEST_RUNNER_QWEN38_FLASH_MODEL`) : **PASS**, `hits=10/28
+meanLogProb=-4.8003182` — identique à la valeur attendue documentée en
+P2-fusion F7. 78 tests verts (`Scripts/run-tests.sh`, Debug), build Release
+vert tout au long de la session.
+
+**Tableau récapitulatif avant/après** (checkpoint 3-bit réel, prompt de
+référence, greedy `--temperature 0`, 32 tokens ; MTP bloc 2, même prompt) :
+
+| Variante | Avant P4 | Après P4 (N=8) | Δ | IDs = référence |
+|---|---|---|---|---|
+| Greedy | 0,166 s/token (6,0 tok/s) | **0,1405 s/token (7,1 tok/s)** | **−15,4 %** | oui |
+| MTP bloc 2 | 0,135 s/token (7,4 tok/s) | **0,1328 s/token (7,5 tok/s)** | −1,6 % | oui |
+| Ratio MTP/greedy | 0,81× | 0,945× | — | — |
+
+Le MTP profite beaucoup moins de P4.1 que le greedy (son *verify forward*
+vérifie déjà 42 positions par round, donc a déjà plus de travail parallèle
+par couche que le décodage à un jeton — l'asynchronie recouvre moins de
+temps mort) : conforme au diagnostic déjà posé en PM3/PM4 (le coût MTP est
+structurel — le *verify forward*, pas le bookkeeping hôte). Le MTP reste
+hors catalogue par défaut (`options.mtp.enabled`, inchangé par ce chantier
+— hors périmètre de P4, cf. garde-fous).
+
+MTP mesuré avec un premier run explicitement écarté (artefact de démarrage
+« premier run de la session » sur le chemin de vérification, jamais
+exercé auparavant dans ce process : 8,820 s au lieu de 4,255/4,242 s au 2ᵉ
+et 3ᵉ run, même prompt, mêmes réglages) — cohérent avec la règle déjà en
+vigueur (« jamais mesurer sur le premier run »), étendue ici du chemin
+greedy (déjà connu) au chemin MTP (nouveau cette session).
+
+### Écarts à la consigne P4
+
+1. **P4.0** : le tableau « famille de noyau nommé » n'a pas pu être
+   reconstruit à neuf par Metal System Trace (limite outillage `xctrace`
+   CLI sans Shader Timeline, documentée) — celui de P2-code (a) est réutilisé
+   comme référence plutôt que redérivé, complété par un nouvel échantillon
+   CPU sur le vrai checkpoint (jamais fait avant) et par les mesures
+   GPU-busy/command-buffers, qui sont, elles, nouvelles et quantitatives.
+2. **P4.3** : décision « non implémenté » pour les quatre candidats — un
+   faisceau de preuves documenté (ci-dessus), pas une mesure directe de
+   chaque noyau hypothétique (puisqu'aucun n'a été écrit). Traitement
+   identique au précédent F6 (P2-fusion).
+3. **P4.4** : « TTFT GUI < 1 s pour 59 tokens » non vérifiable depuis cet
+   environnement (pas de harnais GUI) — mesuré par un proxy CLI (préfill
+   pur tour 1) qui ne reproduit pas l'anomalie GUI rapportée ; `warmUp()`
+   non modifié en l'absence de moyen de vérifier l'effet réel.
+4. **P4.5** : mesure en conditions de session chaude (pages déjà en
+   cache), pas un vrai test à froid post-reboot — jugé disproportionné pour
+   cette seule mesure ; documenté explicitement plutôt que présenté comme un
+   test à froid réel.
+
+Commits : `7c93277` (P4.1 mécanisme), `170a3c9` (P4.1 défaut N=8),
+`aa4fc0c` (P4.2), `ddab183` (P4.5). Traces `.trace`, sorties `.stdout.txt`
+et le sweep complet conservés dans `results/`.
