@@ -1815,3 +1815,81 @@ func qwen4ExpLayerBenchCompiledMatchesEager() {
         }
     }
 }
+
+@Test("P2-fusion (F1/F2) : le chemin fusionné égale le chemin d'origine sur poids aléatoires seedés")
+func qwen4ExpLayerBenchFusionMatchesOriginalPath() {
+    // Same reduced dimensions as the P0/P2-code bench tests above, kept
+    // small so the 32-step parity harness stays fast in CI. F1 fuses
+    // GDN's in_proj_qkv/z/b/a and QSA's q/k/v_proj into one matmul each;
+    // F2 precomputes RMSNorm's `1 + weight` convention. Both are exact
+    // reorderings (see Qwen4ExpFusion.swift), so the tolerance only needs
+    // to absorb floating-point summation-order noise, not a real
+    // numerical approximation.
+    let dimensions = Qwen4ExpLayerBenchDimensions(
+        hiddenSize: 256,
+        numAttentionHeads: 4,
+        numKeyValueHeads: 1,
+        headDim: 64,
+        linearNumKeyHeads: 4,
+        linearNumValueHeads: 8,
+        linearKeyHeadDim: 32,
+        linearValueHeadDim: 32,
+        linearConvKernelDim: 4,
+        numExperts: 8,
+        numExpertsPerToken: 2,
+        moeIntermediateSize: 64,
+        sharedExpertIntermediateSize: 64,
+        indexerBudget: 64,
+        indexerCompressRatio: 4,
+        indexerHeadDim: 64,
+        indexerKVHeads: 1,
+        indexerNHeads: 2,
+        hcCount: 4,
+        hcLowrank: 32,
+        vocabSize: 1_000,
+        maxPositionEmbeddings: 4_096)
+
+    for kind in [Qwen4ExpLayerBenchKind.gdn, .qsa] {
+        for level in [
+            Qwen4ExpFusionLevel.f1InputProjections, .f2PrecomputedNorms, .f4MoE,
+        ] {
+            let result = Qwen4ExpLayerBench.checkParity(
+                kind: kind, dimensions: dimensions, fusionLevel: level, steps: 32)
+            #expect(
+                result.maxRelativeDifference <= 1,
+                "\(kind) niveau \(level.rawValue) : diff normalisée max \(result.maxRelativeDifference)")
+            #expect(
+                result.argmaxMismatches == 0,
+                "\(kind) niveau \(level.rawValue) : \(result.argmaxMismatches) désaccords lm_head")
+            #expect(result.passed)
+        }
+    }
+}
+
+@Test("P2-fusion (F4) : le routage MoE reste identique sans softmax précis")
+func qwen4ExpSparseMoERoutingSurvivesImpreciseSoftmax() {
+    // F4's argument (PLAN.md, Qwen4ExpSparseMoE.callAsFunction): softmax is
+    // a strictly monotonic transform of the gate logits, so the top-`topK`
+    // *set* selected by `argPartition` should not depend on `precise`,
+    // barring a precision-driven tie flip right at the kth boundary.
+    // Exercised at the real checkpoint's router dimensions (512 experts,
+    // top-10) over 200 independent synthetic single-token logit vectors.
+    let numExperts = 512
+    let topK = 10
+    MLXRandom.seed(2_026_0909)
+    var mismatches = 0
+    for _ in 0..<200 {
+        let logits = MLXRandom.uniform(low: Float(-8), high: Float(8), [numExperts])
+        func routedIndices(precise: Bool) -> Set<Int32> {
+            let probabilities = MLX.softmax(logits, axis: -1, precise: precise)
+            let indices = MLX.argPartition(probabilities, kth: numExperts - topK, axis: -1)[
+                (numExperts - topK)...]
+            eval(indices)
+            return Set(indices.asArray(Int32.self))
+        }
+        if routedIndices(precise: true) != routedIndices(precise: false) {
+            mismatches += 1
+        }
+    }
+    #expect(mismatches == 0, "\(mismatches)/200 vecteurs de logits ont changé de routage")
+}

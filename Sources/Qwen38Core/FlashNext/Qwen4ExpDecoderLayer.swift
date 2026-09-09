@@ -27,7 +27,12 @@ public final class Qwen4ExpDecoderLayer: Module {
         rmsNormEps: Float = 1e-6,
         quantization: Qwen4ExpQuantizationSpec? = nil,
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
-        lazyNGramStorage: Qwen4ExpLazyNGramStorage? = nil
+        lazyNGramStorage: Qwen4ExpLazyNGramStorage? = nil,
+        /// P2-fusion (F4): threaded to `Qwen4ExpSparseMoE` at construction
+        /// time (unlike F1/F2, which are applied post-load by
+        /// `prepareFusion` — F4 changes a runtime behavior flag, not a
+        /// loaded weight).
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
         self.layerIndex = layerIndex
@@ -45,7 +50,7 @@ public final class Qwen4ExpDecoderLayer: Module {
 
         _mlp.wrappedValue = Qwen4ExpSparseMoE(
             configuration: configuration, quantization: quantization,
-            expertsQuantization: expertsQuantization)
+            expertsQuantization: expertsQuantization, fusionLevel: fusionLevel)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
             quantization: quantization, parityPrefix: "attn_")

@@ -821,6 +821,20 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var expertGroupSize: Int?
 
+    @Option(
+        name: .long,
+        help:
+            "P2-fusion : niveau cumulatif F1-F6 appliqué à la couche après chargement (0 = chemin d'origine, défaut)"
+    )
+    var fusionLevel: Int = 0
+
+    @Flag(
+        name: .long,
+        help:
+            "P2-fusion : au lieu de mesurer, compare la sortie du chemin fusionné (--fusion-level) à celle du chemin d'origine sur des poids aléatoires seedés (32 pas), plus l'argmax d'un lm_head synthétique"
+    )
+    var checkParity = false
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -841,6 +855,12 @@ struct FlashLayerBench: AsyncParsableCommand {
                 throw ValidationError("--expert-group-size doit être positif")
             }
         }
+        guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
+            throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
+        }
+        if checkParity && resolvedFusionLevel == .none {
+            throw ValidationError("--check-parity exige --fusion-level 1-6 (comparaison à .none)")
+        }
         let expertsQuantization: Qwen4ExpQuantizationSpec? =
             (expertBits != nil || expertGroupSize != nil)
             ? Qwen4ExpQuantizationSpec(
@@ -848,6 +868,29 @@ struct FlashLayerBench: AsyncParsableCommand {
             : nil
 
         _ = Device.defaultDevice()
+
+        let kinds: [Qwen4ExpLayerBenchKind]
+        switch layerKind {
+        case .both: kinds = [.gdn, .qsa]
+        case .gdn: kinds = [.gdn]
+        case .qsa: kinds = [.qsa]
+        }
+
+        if checkParity {
+            for kind in kinds {
+                let result = Qwen4ExpLayerBench.checkParity(
+                    kind: kind, expertsQuantization: expertsQuantization,
+                    fusionLevel: resolvedFusionLevel)
+                print(
+                    "parité \(kind.rawValue) niveau \(resolvedFusionLevel.rawValue) : "
+                        + "\(result.steps) pas, diff abs max \(result.maxAbsoluteDifference), "
+                        + "diff rel max \(result.maxRelativeDifference), "
+                        + "argmax lm_head désaccords \(result.argmaxMismatches)/\(result.steps) — "
+                        + (result.passed ? "PASS" : "FAIL"))
+            }
+            return
+        }
+
         let profiler = MLXProfiler.shared
         let profileSession: ProfilingSession?
         if trace != nil {
@@ -876,13 +919,6 @@ struct FlashLayerBench: AsyncParsableCommand {
             }
         }
 
-        let kinds: [Qwen4ExpLayerBenchKind]
-        switch layerKind {
-        case .both: kinds = [.gdn, .qsa]
-        case .gdn: kinds = [.gdn]
-        case .qsa: kinds = [.qsa]
-        }
-
         func percentile(_ sortedMs: [Double], _ p: Double) -> Double {
             guard !sortedMs.isEmpty else { return .nan }
             let index = Int((Double(sortedMs.count - 1) * p).rounded())
@@ -902,7 +938,8 @@ struct FlashLayerBench: AsyncParsableCommand {
                 profiler: profiler,
                 computeMode: Qwen4ExpLayerBenchComputeMode(
                     compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval,
-                    skipTrivialCausalMask: skipTrivialMask))
+                    skipTrivialCausalMask: skipTrivialMask),
+                fusionLevel: resolvedFusionLevel)
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)
@@ -1005,12 +1042,22 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var cachedIO = false
 
+    @Option(
+        name: .long,
+        help:
+            "P2-fusion : niveau cumulatif F1-F6 appliqué à chaque couche (0 = chemin d'origine, défaut — F7 valide ce flag sur le vrai checkpoint avant tout changement de défaut)"
+    )
+    var fusionLevel: Int = 0
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
         }
         guard residentEvalInterval > 0 else {
             throw ValidationError("--resident-eval-interval doit être positif")
+        }
+        guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
+            throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
         }
         let samplingPreset: Qwen4ExpSamplingPreset
         if temperature != nil || topP != nil || topK != nil {
@@ -1065,7 +1112,8 @@ struct FlashChatProbe: AsyncParsableCommand {
             residentEvaluationInterval: residentEvalInterval,
             profileLayers: profileLayers,
             residentAsyncEval: residentAsync,
-            uncachedIO: !cachedIO)
+            uncachedIO: !cachedIO,
+            fusionLevel: resolvedFusionLevel)
         profiler.end("Flash globals")
         let generator = Qwen4ExpStreamingGenerator(model: model)
 

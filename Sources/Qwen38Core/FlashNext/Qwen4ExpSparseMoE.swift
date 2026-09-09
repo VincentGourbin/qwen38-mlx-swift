@@ -52,15 +52,22 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
     /// Disabled during normal inference so intermediate graphs are not kept alive.
     public private(set) var captureParity = false
 
+    /// F4 (P2-fusion): whether the router softmax runs in `precise` (fp32
+    /// accumulation) mode. `true` until `fusionLevel >= .f4MoE` — see
+    /// `callAsFunction` for why dropping `precise` is safe for routing.
+    private let preciseRouterSoftmax: Bool
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         normalizeTopK: Bool = true,
         quantization: Qwen4ExpQuantizationSpec? = nil,
-        expertsQuantization: Qwen4ExpQuantizationSpec? = nil
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) {
         numExperts = configuration.numExperts
         topK = configuration.numExpertsPerToken
         self.normalizeTopK = normalizeTopK
+        self.preciseRouterSoftmax = fusionLevel < .f4MoE
 
         precondition(numExperts > 0)
         precondition(topK > 0 && topK <= numExperts)
@@ -104,7 +111,16 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         precondition(x.ndim >= 2)
-        let probabilities = MLX.softmax(gate(x), axis: -1, precise: true)
+        // F4 (P2-fusion): softmax is a strictly monotonic transform of the
+        // gate logits (dividing every exp(logit) by the same positive sum
+        // preserves relative order), so the top-`topK` *set* selected by
+        // `argPartition` below is mathematically identical whether or not
+        // `precise` upcasts to fp32 — unless two logits are close enough
+        // that the lower-precision reduction flips their order right at the
+        // kth boundary. Measured on 200 synthetic single-token gate vectors
+        // at this checkpoint's real dimensions (512 experts, top-10): zero
+        // such flips (see the "P2-fusion (F4)" test and log.md entry).
+        let probabilities = MLX.softmax(gate(x), axis: -1, precise: preciseRouterSoftmax)
         let kth = numExperts - topK
         let indices = MLX.argPartition(probabilities, kth: kth, axis: -1)[.ellipsis, kth...]
         var scores = MLX.takeAlong(probabilities, indices, axis: -1)

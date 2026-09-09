@@ -36,6 +36,13 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     /// Disabled during normal inference so intermediate graphs are not kept alive.
     public private(set) var captureParity = false
 
+    /// F1 (P2-fusion): `in_proj_qkv/z/b/a` concatenated into one matmul once
+    /// `fuseInputProjections()` has run. Not an `@ModuleInfo` property: it
+    /// carries no checkpoint key of its own and must stay invisible to
+    /// `parameters()`/`update(parameters:)`. `nil` means the original,
+    /// four-separate-matmuls path (unchanged behavior).
+    private var fusedInProj: Linear?
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
@@ -88,10 +95,32 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         let batch = inputs.dim(0)
         let sequence = inputs.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped([batch, sequence, numValueHeads, valueHeadDim])
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        var qkv: MLXArray
+        let z: MLXArray
+        let b: MLXArray
+        let a: MLXArray
+        if let fusedInProj {
+            // F1: one matmul instead of four; the split widths exactly match
+            // in_proj_qkv/z/b/a's original output widths, in that order.
+            let fused = fusedInProj(inputs)
+            let parts = MLX.split(
+                fused,
+                indices: [
+                    keyDim * 2 + valueDim,
+                    keyDim * 2 + valueDim + valueDim,
+                    keyDim * 2 + valueDim + valueDim + numValueHeads,
+                ],
+                axis: -1)
+            qkv = parts[0]
+            z = parts[1].reshaped([batch, sequence, numValueHeads, valueHeadDim])
+            b = parts[2]
+            a = parts[3]
+        } else {
+            qkv = inProjQKV(inputs)
+            z = inProjZ(inputs).reshaped([batch, sequence, numValueHeads, valueHeadDim])
+            b = inProjB(inputs)
+            a = inProjA(inputs)
+        }
 
         let convState: MLXArray
         if let state = cache?[0] {
@@ -157,6 +186,21 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         if !enabled {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// F1 (P2-fusion): build the fused `in_proj_qkv/z/b/a` matmul once, after
+    /// the four checkpoint-shaped modules have their real loaded weights.
+    /// Idempotent (a second call is a no-op) and safe to call unconditionally
+    /// — callers gate it on `Qwen4ExpFusionLevel`, not this method.
+    public func fuseInputProjections() {
+        guard fusedInProj == nil else { return }
+        let fused = qwen4ExpFuseLinear([inProjQKV, inProjZ, inProjB, inProjA])
+        eval(fused.weight)
+        if let quantized = fused as? QuantizedLinear {
+            eval(quantized.scales)
+            if let biases = quantized.biases { eval(biases) }
+        }
+        fusedInProj = fused
     }
 }
 

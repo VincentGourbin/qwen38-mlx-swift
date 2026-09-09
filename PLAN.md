@@ -3675,3 +3675,21 @@ mesure avant/après = un commit, même négatif.
 | F5 | Casts : inventorier tous les `asType` par pas (GDN gating en float32, MRoPE, masques) et ne garder que ceux exigés par la numérique (état GDN float32, tables RoPE float32 — piège 6). | idem |
 | F6 | `MLX.compile` **par sous-graphe élémentaire stable** (gating GDN, mix hyper-connections, routage MoE), pas sur la couche entière (P2-code (c) : +13 % en QSA). | idem |
 | F7 | Validation finale sur le checkpoint 3-bit : `flash-chat-probe … --temperature 0 --max-new-tokens 8 --resident-layers --resident-async` (IDs identiques `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`), garde Q-B (`xcodebuild … '-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()'` avec `TEST_RUNNER_QWEN38_FLASH_MODEL`, attendu 10/28 −4,80), s/token avant/après dans `BENCHMARKS.md`. | tableau final dans `log.md` |
+
+**Statut — 2026-09-09** : F1 (fusion GDN/QSA input projections), F2 (normes
+`1+w` précalculées, `MLXFast.rmsNorm` non groupé) et F4 (`softmax(precise:
+false)`, routage vérifié sur 200 tokens synthétiques) implémentés,
+parité-validés (`flash-layer-bench --check-parity`, 74 tests verts), mais
+**aucun gain ms/pas mesurable** au protocole (`--steps 300 --async-interval
+8` : ~4,5 ms/pas GDN/QSA à tous les niveaux 0→4, GPU 45-46 % inchangé) —
+conservés en option (`--fusion-level`/`Qwen4ExpFusionLevel`, défaut `.none`
+partout, comportement de production inchangé) par analogie avec P2-code
+(e), pas par gain démontré. F3 : rien à changer (re-confirme P2-code (b)).
+F5 : audit, rien au-delà de F2. F6 : non implémenté (gating GDN dans le
+paquet vendu épinglé ; faisceau de preuves F1/F2/F4 + P2-code (c) rendant un
+gain improbable). **F7 non exécutée** : préflight REFUS (43,9 Go à évincer,
+`qwen38-bench-ui` actif à 24 Go — machine jugée occupée par Vincent),
+commandes prêtes (`--fusion-level` câblé jusqu'à `flash-chat-probe`) pour la
+prochaine session avec la machine libre. Détail complet, tableau de mesures
+et écarts assumés : `docs/knowledge/log.md`, « 2026-09-09 — P2-fusion :
+leviers F1-F7 ».

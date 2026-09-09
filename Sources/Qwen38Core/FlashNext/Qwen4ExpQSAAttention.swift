@@ -31,6 +31,11 @@ public final class Qwen4ExpQSAAttention: Module {
     /// Disabled during normal inference so intermediate graphs are not kept alive.
     public private(set) var captureParity = false
 
+    /// F1 (P2-fusion): `q_proj/k_proj/v_proj` concatenated into one matmul
+    /// once `fuseInputProjections()` has run. Not an `@ModuleInfo` property —
+    /// see the identical comment on `Qwen4ExpGatedDeltaNet.fusedInProj`.
+    private var fusedQKV: Linear?
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
@@ -81,17 +86,35 @@ public final class Qwen4ExpQSAAttention: Module {
         let positions = positionIDs ?? Qwen4ExpMRoPE.textPositionIDs(
             sequenceLength: sequence, offset: cache?.offset ?? 0)
 
-        let qOutput = qProj(hiddenStates).reshaped(
-            [batch, sequence, numAttentionHeads, headDim * 2])
+        let qWidth = numAttentionHeads * headDim * 2
+        let kWidth = numKeyValueHeads * headDim
+        let qRaw: MLXArray
+        let kRaw: MLXArray
+        let vRaw: MLXArray
+        if let fusedQKV {
+            // F1: one matmul instead of three; split widths match
+            // q_proj/k_proj/v_proj's original output widths, in that order.
+            let fused = fusedQKV(hiddenStates)
+            let parts = MLX.split(fused, indices: [qWidth, qWidth + kWidth], axis: -1)
+            qRaw = parts[0]
+            kRaw = parts[1]
+            vRaw = parts[2]
+        } else {
+            qRaw = qProj(hiddenStates)
+            kRaw = kProj(hiddenStates)
+            vRaw = vProj(hiddenStates)
+        }
+
+        let qOutput = qRaw.reshaped([batch, sequence, numAttentionHeads, headDim * 2])
         let qParts = qOutput.split(parts: 2, axis: -1)
         let normalizedQueries = qNorm(qParts[0])
         var queries = normalizedQueries.transposed(0, 2, 1, 3)
         let outputGate = qParts[1].reshaped([batch, sequence, numAttentionHeads * headDim])
 
-        let normalizedKeys = kNorm(kProj(hiddenStates).reshaped(
+        let normalizedKeys = kNorm(kRaw.reshaped(
             [batch, sequence, numKeyValueHeads, headDim]))
         var keys = normalizedKeys.transposed(0, 2, 1, 3)
-        let values = vProj(hiddenStates).reshaped(
+        let values = vRaw.reshaped(
             [batch, sequence, numKeyValueHeads, headDim]).transposed(0, 2, 1, 3)
 
         queries = rotaryEmbedding.apply(queries, positionIDs: positions)
@@ -176,6 +199,21 @@ public final class Qwen4ExpQSAAttention: Module {
         if !enabled {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// F1 (P2-fusion): build the fused `q_proj/k_proj/v_proj` matmul once,
+    /// after the three checkpoint-shaped modules have their real loaded
+    /// weights. Idempotent; the indexer's `index_qk_proj` already covers
+    /// query+key in one projection and needs no equivalent step.
+    public func fuseInputProjections() {
+        guard fusedQKV == nil else { return }
+        let fused = qwen4ExpFuseLinear([qProj, kProj, vProj])
+        eval(fused.weight)
+        if let quantized = fused as? QuantizedLinear {
+            eval(quantized.scales)
+            if let biases = quantized.biases { eval(biases) }
+        }
+        fusedQKV = fused
     }
 
     public static func causalMask(

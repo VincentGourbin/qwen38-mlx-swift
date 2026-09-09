@@ -77,7 +77,8 @@ public enum Qwen4ExpCheckpointLayerLoader {
         index: Qwen4ExpCheckpointLayerIndex? = nil,
         materialize: Bool = true,
         useCheckpointQuantization: Bool = true,
-        uncachedIO: Bool = true
+        uncachedIO: Bool = true,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) throws -> Qwen4ExpLoadedDecoderLayer {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         guard configuration.textConfiguration.layerTypes.indices.contains(layerIndex) else {
@@ -187,9 +188,16 @@ public enum Qwen4ExpCheckpointLayerLoader {
                 of: layerIndex + 1),
             quantization: useCheckpointQuantization ? checkpointQuantization : nil,
             expertsQuantization: useCheckpointQuantization ? checkpointExpertsQuantization : nil,
-            lazyNGramStorage: useCheckpointQuantization ? lazyNGramStorage : nil)
+            lazyNGramStorage: useCheckpointQuantization ? lazyNGramStorage : nil,
+            fusionLevel: fusionLevel)
         try layer.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        // P2-fusion: applied after the checkpoint-shaped modules above have
+        // their real loaded weights (and, for norms, after the Vontra shift
+        // correction a few lines up) — see Qwen4ExpFusion.swift. `.none`
+        // (the default until F7 validates on the real checkpoint) is a
+        // strict no-op.
+        layer.prepareFusion(level: fusionLevel)
 
         let bytes: Int64
         if materialize {

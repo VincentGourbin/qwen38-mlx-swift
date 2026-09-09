@@ -69,6 +69,11 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// P2-mem-a entry). Defaults to `true`: validated bit-exact against the
     /// old path with unchanged peak MLX/RSS.
     public let uncachedIO: Bool
+    /// P2-fusion (F1-F6, docs/knowledge/log.md "P2-fusion"): kernel-reduction
+    /// level applied to every layer right after it loads. `.none` (the
+    /// default) is the original path, unchanged until F7 validates the fused
+    /// path bit-for-bit on the real checkpoint.
+    public let fusionLevel: Qwen4ExpFusionLevel
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -83,7 +88,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         residentEvaluationInterval: Int = 1,
         profileLayers: Bool = false,
         residentAsyncEval: Bool = false,
-        uncachedIO: Bool = true
+        uncachedIO: Bool = true,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) throws {
         precondition(residentEvaluationInterval > 0)
         self.directory = directory
@@ -95,6 +101,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.profileLayers = profileLayers
         self.residentAsyncEval = residentAsyncEval
         self.uncachedIO = uncachedIO
+        self.fusionLevel = fusionLevel
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -152,7 +159,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     from: directory,
                     index: checkpointIndex,
                     materialize: materializeLayers,
-                    uncachedIO: uncachedIO)
+                    uncachedIO: uncachedIO,
+                    fusionLevel: fusionLevel)
                 loadDuration = ContinuousClock.now - start
                 if layerLoadingMode == .resident {
                     residentLayers[layerIndex] = loaded

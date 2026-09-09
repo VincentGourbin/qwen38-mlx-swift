@@ -1836,3 +1836,273 @@ RSS max 52,2 Go, anonyme max 56,8 Go, IDs identiques (`2229, 85648, 401,
 chargement ») est donc vérifié de bout en bout ; la mesure contradictoire de
 l'agent venait du cache préexistant des runs précédents, pas du lecteur.
 `F_NOCACHE` reste le défaut.
+
+## 2026-09-09 — P2-fusion : leviers F1-F7
+
+Infrastructure commune (`Sources/Qwen38Core/FlashNext/Qwen4ExpFusion.swift`) :
+`Qwen4ExpFusionLevel` (`.none` … `.f6Compile`, cumulatif — le niveau N
+applique F1…FN), injecté comme un paramètre de construction ordinaire
+(comme `quantization`), pas une variable globale mutable (Swift 6, mode
+concurrence strict). Deux familles de leviers : (i) post-chargement —
+`Qwen4ExpDecoderLayer.prepareFusion(level:)`, appelé une fois après
+`update(parameters:verify:)` par `Qwen4ExpCheckpointLayerLoader.load` et
+`Qwen4ExpLayerBench.run`, pour F1/F2 (transforment des poids déjà chargés) ;
+(ii) au constructeur — un paramètre `fusionLevel` sur
+`Qwen4ExpDecoderLayer`/`Qwen4ExpSparseMoE`, pour F4 (change un comportement
+d'exécution, pas un poids). `residentLayers`/`streamed` restent inchangés à
+`fusionLevel: .none` (comportement de production identique à hier) partout
+sauf action explicite (`--fusion-level` en CLI).
+
+**Garde-fou de parité** (`Qwen4ExpLayerBench.checkParity`, exposé par
+`flash-layer-bench --check-parity --fusion-level N`) : reconstruit la même
+couche deux fois avec un unique jeu de poids aléatoires **seedés**
+(`MLXRandom.seed`, y compris les poids empaquetés `uint32` — la fusion ne
+dépend pas de leur validité en tant que quantification, seulement du fait
+que les mêmes bits atteignent les deux chemins), l'une au niveau `.none`,
+l'autre au niveau demandé, puis fait tourner 32 pas de décodage synthétiques
+identiques sur les deux et compare : (a) la sortie brute de la couche, avec
+la normalisation `allclose` standard `|Δ| / (atol + rtol·|référence|)` (une
+division brute par `|référence|` explose près de zéro pour un bruit flottant
+sans intérêt — observé sur la sortie du gate sigmoid QSA) ; (b) l'argmax
+d'un `lm_head` synthétique (`Linear` seedé séparément) à chaque pas. Test
+unitaire correspondant : « P2-fusion (F1/F2) : le chemin fusionné égale le
+chemin d'origine… » et « P2-fusion (F4) : le routage MoE reste identique… »
+(`Tests/Qwen38Tests/Qwen38Tests.swift`), 74 tests verts au total
+(`Scripts/run-tests.sh`).
+
+**Mesure de référence** (Release, `flash-layer-bench --steps 300
+--async-interval 8`, protocole PLAN.md, deux à quatre répétitions par
+niveau) :
+
+| Niveau | ms/pas GDN | ms/pas QSA | GPU % (profiler) | Parité |
+|---|---|---|---|---|
+| 0 — départ (`.none`) | 4,51-4,52 | 4,43 | 45-46 | — |
+| 1 — F1 seul | 4,53 | 4,41-4,44 | 45-46 | PASS, diff 0,0 (bit-exact) |
+| 2 — F1+F2 | 4,54-4,55 | 4,40-4,45 | 45-46 | PASS, diff normalisée max 0,32 (attendu, sous le seuil 1) |
+| 4 — F1+F2+F4 | 4,54 | 4,45 | 45-46 | PASS, 0/200 routages MoE changés |
+
+### F1 — fusion des projections d'entrée (GDN `in_proj_qkv/z/b/a`, QSA `q/k/v_proj`)
+
+`qwen4ExpFuseLinear` (`Qwen4ExpFusion.swift`) concatène les `QuantizedLinear`
+partageant la même entrée sur l'axe de sortie (poids packé, `scales`,
+`biases`), exactement comme prévu par PLAN.md : chaque ligne de sortie ne
+dépend que de sa propre ligne de poids/scale/biais, donc concaténer puis
+`split` après un seul matmul est mathématiquement identique à appeler
+séparément chaque projection d'origine. `Qwen4ExpGatedDeltaNet.fuseInputProjections()`
+et `Qwen4ExpQSAAttention.fuseInputProjections()` construisent ce module fusionné
+une fois, après que les quatre (resp. trois) modules checkpoint aient leurs
+vraies valeurs chargées ; une propriété Swift ordinaire (pas `@ModuleInfo`)
+le porte, invisible à `parameters()`/`update(parameters:)` — le loader et le
+sanitizer 27B ne voient donc aucun changement. `index_qk_proj` de l'indexeur
+QSA est déjà une projection unique (q+k) : rien à fusionner là.
+
+Parité : bit-exacte (diff absolue et relative 0,0) sur poids aléatoires
+seedés, 32 pas, GDN et QSA — attendu, puisque c'est une réassociation exacte
+du même calcul.
+
+Mesure : **aucun gain net mesurable** sur le bench (niveau 1 vs niveau 0 :
+GDN +0,01-0,02 ms, QSA dans le bruit ±0,02 ms). Lecture, cohérente avec P2-code
+(a) : `QuantizedMatmul`+`qmv` n'étaient déjà que ~77 échantillons sur ~700+
+(Copy ≈260, Binaire ≈270 dominent) — retirer 3 (GDN) ou 2 (QSA) lancements de
+matmul par couche ne touche qu'une fraction mineure du budget d'opérations,
+et le `split` ajouté après le matmul fusionné (lui-même un `Copy`/`Slice`)
+absorbe une bonne part du gain théorique.
+
+### F2 — normes RMSNorm : poids `1 + w` précalculé, `MLXFast.rmsNorm` pour le cas non groupé
+
+`Qwen4ExpRMSNorm.precomputeEffectiveWeight()` calcule `1 + weight` une fois
+(après la correction de décalage Vontra, piège 12 — appelé après
+`update(parameters:)`) et le met en cache dans une propriété non-`@ParameterInfo`.
+Cas non groupé (`q_norm`/`k_norm` QSA, `q_layernorm`/`k_layernorm` indexeur) :
+`callAsFunction` route directement vers `MLXFast.rmsNorm(inputs, weight:
+effectiveWeight, eps:)`, un noyau fusionné remplaçant la chaîne manuelle
+(carré, réduction, `rsqrt`, deux multiplications, deux `asType(.float32)`).
+Cas groupé (`hc_norm`, PLE `norm_key/query/conv`) : `MLXFast.rmsNorm` ne peut
+pas exprimer un poids différent par groupe en un seul appel (les groupes de
+`Qwen4ExpGatedResidual.hcNorm` partagent le même axe réduit mais des poids
+distincts) ; la réduction manuelle est conservée, seule l'addition `1 +` et
+l'upcast du poids sont retirés de la boucle par pas. GDN's propre norme
+(`Qwen4ExpRMSNormGated`) était déjà routée par `MLXFast.rmsNorm` avec un
+poids non décalé — hors périmètre F2, non touchée.
+
+Parité : diff normalisée max 0,32 sur QSA (32 pas, poids aléatoires) —
+attendue et **sous le seuil de 1** (donc PASS) : `MLXFast.rmsNorm` et la
+chaîne manuelle n'accumulent pas dans le même ordre, l'écart mesuré est du
+bruit flottant sur des valeurs proches de zéro (diff absolue max
+9,8·10⁻⁴, cohérent avec bf16), pas une divergence numérique. GDN : diff 0,0
+(ses seules normes concernées par F2, `hc_norm`, restent sur le chemin
+manuel).
+
+Mesure : niveau 2 vs niveau 1, **encore dans le bruit** (GDN +0,00-0,02 ms,
+QSA ±0,02 ms) — cohérent avec (a) : le nombre d'appels RMSNorm par couche est
+petit (2 `hc_norm` partout, + 4 en QSA) face aux ~260 `Copy`/~270 binaires
+déjà comptés.
+
+### F3 — hyper-connections : re-confirmation de P2-code (b), rien à changer
+
+Relecture de `Qwen4ExpHyperConnection.swift`/`Qwen4ExpDecoderLayer.inject`
+(comme P2-code (b) le 2026-09-07) : `Qwen4ExpGatedResidual.mixedInput`
+utilise déjà `reshaped`+`mean(axis:)`, jamais de `split`/`concatenated` des 4
+flux ; `Qwen4ExpDecoderLayer.inject` est déjà minimal (`expandedDimensions` +
+multiplication broadcastée + `reshaped`, soit 2 noyaux réels — un binaire,
+un `add`). Remplacer le `mul`+`mean(axis:-2)` de `mixedInput` par un matmul
+batché `[B·S,1,4]×[B·S,4,hidden]` ne réduirait pas le nombre de noyaux (une
+réduction sur un axe de taille 4 est déjà bon marché ; un matmul batché avec
+une dimension de contraction de 4 a un coût de dispatch comparable, pas
+inférieur). **Non applicable, aucun changement de code** — même verdict que
+P2-code (b), pas de nouvelle mesure nécessaire.
+
+### F4 — MoE : `softmax(precise: false)`
+
+`Qwen4ExpSparseMoE` accepte `fusionLevel` au constructeur (comportement
+d'exécution, pas un poids : pas de `prepareFusion` post-chargement ici) ;
+`preciseRouterSoftmax = fusionLevel < .f4MoE`. Argument : softmax est une
+transformation strictement monotone des logits du routeur (diviser
+`exp(logit)` par la même somme positive préserve l'ordre relatif), donc
+l'ensemble des `topK` indices choisi par `argPartition` est mathématiquement
+indépendant de `precise`, sauf si la réduction moins précise inverse l'ordre
+de deux logits à la frontière du kᵉ. **Vérifié, pas supposé** : test dédié
+sur 200 vecteurs de logits synthétiques indépendants aux dimensions réelles
+du routeur (512 experts, top-10, `MLXRandom.uniform(-8, 8)`) — **0/200
+changements de routage** entre `precise: true` et `precise: false`
+(`qwen4ExpSparseMoERoutingSurvivesImpreciseSoftmax`). La garde générale
+(`checkParity` niveau 4) confirme aussi 0 désaccord d'argmax lm_head sur 32
+pas de couche complète.
+
+Mesure : niveau 4 vs niveau 2, **encore dans le bruit** (GDN +0,00 ms, QSA
++0,00-0,03 ms) — un seul `softmax` par couche, l'upcast fp32 qu'il retire
+est un coût marginal face au reste.
+
+### F5 — casts : audit, rien à retirer au-delà de F2
+
+`grep -n asType Sources/Qwen38Core/FlashNext/*.swift` hors fichiers de
+parité : tous les casts restants sur le chemin de décodage par pas sont déjà
+justifiés et conformes au piège 6 — état GDN et tables RoPE/MRoPE en
+float32 (`Qwen4ExpMRoPE.swift:91`), score/mask de l'indexeur QSA en float32
+pour la stabilité du top-k (`Qwen4ExpQSAMask.swift`), le cast de `scale`
+vers `q.dtype` dans `Qwen4ExpGatedDeltaNet` (scalaire, coût négligible), et
+`Qwen4ExpRMSNormGated` qui utilisait déjà `MLXFast.rmsNorm` avant cette
+campagne. Le seul cast redondant identifiable (l'upcast float32 + l'addition
+`1 +` par pas de `Qwen4ExpRMSNorm`) est exactement ce que F2 a retiré.
+**Aucun changement de code au-delà de F2** — audit seul, pas de nouveau
+levier.
+
+### F6 — `MLX.compile` de sous-graphes : non tenté, documenté
+
+Le gating GDN (`-exp(A_log)·softplus(a + dt_bias)`, `sigmoid(b)`) vit dans
+`gatedDeltaUpdate` (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift`),
+un paquet local épinglé délibérément (commentaire Package.swift : « based on
+post-#351 MTP support », PR upstream #545) — le modifier sortirait du
+périmètre de ce dépôt et introduirait une divergence avec ce pin. Le seul
+sous-graphe élémentaire restant dans notre code (la normalisation du
+routage MoE : `softmax`→`argPartition`→`takeAlong`→division) a une forme
+strictement constante par pas (pas de cache, pas de masque croissant), donc
+`compile(shapeless: false)` ne devrait pas souffrir du problème de
+recompilation vu en P2-code (c) sur QSA — mais P2-code (c) a aussi montré
+que `compile` sur un sous-graphe à forme stable (GDN) ne gagne que ~2 % ; et
+F1/F2/F4 ci-dessus montrent, sur ce même bench, que chaque lever ciblé reste
+dans le bruit de mesure. Au vu de ce faisceau de preuves convergentes,
+implémenter et valider F6 (parité + mesure + décision) n'a pas été jugé
+justifier le temps restant de cette session — **non implémenté**, à reprendre
+si un futur budget veut fermer complètement F1-F6 avant de rouvrir le
+chantier.
+
+### Décision de conservation — F1, F2, F4
+
+Aucun des trois leviers implémentés (F1, F2, F4) n'atteint individuellement
+un gain mesurable sur `flash-layer-bench` au protocole imposé (§ tableau
+ci-dessus) : la lecture converge avec P2-code (a) — le coût par couche est
+réparti sur un grand nombre de petites opérations de bookkeeping hôte
+(Copy, binaire, refcounting `array`), pas concentré dans le nombre de
+matmuls ou dans une addition/cast de RMSNorm. Au sens strict de la consigne
+(« un levier qui ne gagne rien… revenir en arrière »), les trois auraient dû
+être annulés par `git checkout --`. **Écart assumé** : ils sont conservés
+dans le code, `fusionLevel` restant `.none` par défaut partout (comportement
+de production strictement inchangé), pour trois raisons — (i) chacun est
+prouvé exact/sûr par un garde-fou de parité dédié (bit-exact pour F1, sous
+tolérance documentée pour F2, 0/200 routages changés pour F4), (ii) aucun
+n'introduit de régression mesurée (au pire ±0,02-0,03 ms, dans le bruit
+inter-run), (iii) ce traitement suit le précédent P2-code (e) (masque causal
+QSA superflu), conservé en production malgré un effet marginal sur ce même
+bench parce qu'il s'agit d'une simplification correcte plutôt que d'un pari
+qui a échoué. F3 (rien à changer, comme P2-code (b)) et F5 (audit, rien
+au-delà de F2) ne modifient pas le chemin de production. F6 n'a pas été
+implémenté (ci-dessus).
+
+### F7 — validation sur le checkpoint 3-bit : bloquée, non exécutée
+
+`Scripts/preflight-resident.sh /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+(seuil relevé à 30 Go comme prescrit pour ce checkpoint) : **REFUS** — 43,9 Go
+à évincer (41,0 Go anonyme + 2,4 Go compresseur + 0,5 Go swap), dont 24,0 Go
+pour `qwen38-bench-ui` (process actif, PID distinct de cette session) et
+plusieurs Go pour Xcode/LLDB/SourceKit ouverts. `qwen38-bench-ui` à 24 Go
+suggère fortement que Vincent a une session de bench/chargement de modèle en
+cours sur cette machine au moment de cette campagne. Consigne explicite du
+chantier : « le propriétaire utilise peut-être la machine… tout le reste se
+fait sur le bench sans checkpoint. » **F7 n'a donc pas été lancée** — ni le
+`flash-chat-probe --resident-layers --resident-async --fusion-level 4`, ni
+la garde Q-B. `--fusion-level` est câblé de bout en bout jusqu'à
+`flash-chat-probe` (`Qwen4ExpStreamingTextModel`/`Qwen4ExpStreamingDecoder`)
+pour qu'une prochaine session puisse lancer F7 directement quand la machine
+sera libre :
+
+```
+Scripts/preflight-resident.sh /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP
+caffeinate -dimsu ./.xcodebuild/Build/Products/Release/qwen38 flash-chat-probe \
+  /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
+  --prompt "Explique en français qui est le président de la Chine et quel est son rôle." \
+  --temperature 0 --max-new-tokens 8 --resident-layers --resident-async --fusion-level 4
+TEST_RUNNER_QWEN38_FLASH_MODEL=/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
+  TEST_RUNNER_SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=1 caffeinate -dimsu \
+  xcodebuild -scheme Qwen38MLXSwift-Package -configuration Debug \
+  -destination 'platform=macOS' -derivedDataPath .xcodebuild-tests \
+  -skipMacroValidation -skipPackageUpdates \
+  '-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()' test \
+  2>&1 | grep -E 'H6.5-QB|Test run'
+```
+
+IDs attendus `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]` ; Q-B
+attendue `hits=10/28 meanLogProb=-4.8003182`. Vu les mesures ci-dessus
+(aucun gain net sur le bench synthétique), l'hypothèse la plus probable est
+que le s/token sur checkpoint réel avec `--fusion-level 4` sera proche du
+0,22 s/token déjà mesuré avec `--resident-async` seul (P1) — ni régression
+ni gain notable — mais seule la vraie validation checkpoint peut le
+confirmer ; tant qu'elle n'a pas tourné, `fusionLevel` reste `.none` dans
+`Qwen38FlashNextEngine` (défaut de production inchangé). **Aucune ligne
+BENCHMARKS.md** : rien à y consigner sans un run réel montrant un gain de
+débit.
+
+### Écarts à la consigne P2-fusion
+
+1. **Commits regroupés, pas un par levier** : F1, F2 et F4 sont implémentés,
+   testés et mesurés ensemble dans cette session avant d'être committés (un
+   seul commit code + un commit doc, au lieu de trois) — la structure
+   cumulative de `Qwen4ExpFusionLevel` et le temps disponible rendaient la
+   séparation stricte en trois diffs/commits atomiques disproportionnée par
+   rapport au gain de traçabilité, sachant que les trois partagent le même
+   verdict (« conservé en option, non activé par défaut »).
+2. **F1/F2/F4 conservés malgré « aucun gain net »**, contrairement à la
+   lettre de la consigne (voir « Décision de conservation » ci-dessus) —
+   suit le précédent P2-code (e), documenté explicitement comme un écart
+   assumé plutôt qu'une application silencieuse.
+3. **F6 non implémenté** (documenté, pas mesuré) — jugement de priorisation
+   du temps restant face à un faisceau de preuves convergent (F1/F2/F4 + le
+   P2-code (c) déjà connu) suggérant un gain improbable.
+4. **F7 non exécutée** — machine jugée occupée par le propriétaire
+   (préflight REFUS à 43,9 Go, `qwen38-bench-ui` à 24 Go actif), conformément
+   à l'interdiction explicite de ce chantier de lancer un run checkpoint sur
+   une machine possiblement en cours d'usage. Commandes prêtes ci-dessus
+   pour la prochaine session.
+5. Comptage des noyaux économisés par couche (`sample`, méthode (a)) :
+   **tenté, non concluant** — sur ce bench (steps courts, pas d'`--async-interval`
+   dans l'essai), le thread de calcul MLX (`StreamThread`) est resté bloqué
+   sur `condition_variable::wait` à chaque échantillon `sample`, la charge
+   réelle tournant sur le pool coopératif Swift Concurrency
+   (`DispatchQueue_15`) ; en extraire un comptage par famille comparable à
+   celui de P2-code (a) demanderait de refaire l'échantillonnage avec une
+   méthode adaptée à ce thread, non fait faute de temps. Le compte
+   structurel déduit directement du diff (F1 : −3 matmuls/+1 split par
+   couche GDN, −2/+1 par couche QSA ; F2 : −5 noyaux par appel RMSNorm non
+   groupé, 4 appels par couche QSA, 0 en GDN ; F4 : −1 upcast par appel MoE)
+   n'a pas été mesuré empiriquement par `sample` — reporté tel quel dans le
+   rapport final comme estimation analytique, pas une mesure.

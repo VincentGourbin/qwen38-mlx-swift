@@ -61,6 +61,42 @@ public struct Qwen4ExpLayerBenchResult: Sendable {
     }
 }
 
+/// Result of `Qwen4ExpLayerBench.checkParity` — the P2-fusion numerical
+/// guard comparing a fused path (`fusionLevel`) against the original,
+/// unfused path (`.none`) on identical seeded random weights and inputs.
+public struct Qwen4ExpLayerBenchParityResult: Sendable {
+    public let kind: Qwen4ExpLayerBenchKind
+    public let fusionLevel: Qwen4ExpFusionLevel
+    public let steps: Int
+    public let maxAbsoluteDifference: Float
+    /// Worst-case `|baseline - fused| / (atol + rtol * |baseline|)` over every
+    /// element and every step (the standard `allclose` normalization, not a
+    /// raw ratio): a value `<= 1` means every element is within tolerance.
+    /// A raw `diff / |baseline|` blows up wherever `baseline` is near zero
+    /// even when the absolute difference is floating-point noise (observed
+    /// on QSA's output-gate sigmoid, `~1e-5` absolute vs. a near-zero
+    /// baseline) — the `atol` floor absorbs exactly that case.
+    public let maxRelativeDifference: Float
+    /// Number of decode steps (out of `steps`) where a synthetic `lm_head`'s
+    /// top-1 id differed between the fused and the original path.
+    public let argmaxMismatches: Int
+    public let passed: Bool
+
+    public init(
+        kind: Qwen4ExpLayerBenchKind, fusionLevel: Qwen4ExpFusionLevel, steps: Int,
+        maxAbsoluteDifference: Float, maxRelativeDifference: Float,
+        argmaxMismatches: Int, passed: Bool
+    ) {
+        self.kind = kind
+        self.fusionLevel = fusionLevel
+        self.steps = steps
+        self.maxAbsoluteDifference = maxAbsoluteDifference
+        self.maxRelativeDifference = maxRelativeDifference
+        self.argmaxMismatches = argmaxMismatches
+        self.passed = passed
+    }
+}
+
 /// Dimensions needed to build a single Flash-Next decoder layer without a
 /// checkpoint or `config.json`. `.real` hardcodes the released `qwen4_exp`
 /// (Qwen3.8 Flash-Next) checkpoint's dimensions, taken from the
@@ -288,7 +324,12 @@ public enum Qwen4ExpLayerBench {
         /// of the layer's quantization.
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
         profiler: MLXProfiler = .shared,
-        computeMode: Qwen4ExpLayerBenchComputeMode = .eager
+        computeMode: Qwen4ExpLayerBenchComputeMode = .eager,
+        /// P2-fusion (`--fusion-level N`): applied to the freshly built layer
+        /// right after its (placeholder) weights are materialized, exactly
+        /// where `Qwen4ExpCheckpointLayerLoader.load` applies it to a real
+        /// checkpoint layer.
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) -> Qwen4ExpLayerBenchResult {
         precondition(warmupSteps >= 0, "--warmup doit être positif ou nul")
         precondition(measuredSteps > 0, "--steps doit être positif")
@@ -311,10 +352,12 @@ public enum Qwen4ExpLayerBench {
             layerIndex: 0,
             pleLayerIndex: nil,
             quantization: quantization,
-            expertsQuantization: expertsQuantization)
+            expertsQuantization: expertsQuantization,
+            fusionLevel: fusionLevel)
         let weightArrays = layer.parameters().flattened().map { $0.1 }
         eval(weightArrays)
         let materializedBytes = weightArrays.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        layer.prepareFusion(level: fusionLevel)
 
         // Same cache selection as `Qwen4ExpStreamingDecoder.makeCache(for:)`
         // (that method is `private`; PLE is intentionally out of scope for
@@ -478,6 +521,149 @@ public enum Qwen4ExpLayerBench {
         return Qwen4ExpLayerBenchResult(
             kind: kind, steps: measured, materializedBytes: materializedBytes,
             lastOutput: lastOutput?.asType(.float32).asArray(Float.self) ?? [])
+    }
+}
+
+extension Qwen4ExpLayerBench {
+    /// Random per-leaf replacement used only by `checkParity`: same shape and
+    /// dtype as the zero placeholder, small-magnitude content chosen to keep
+    /// the GDN recurrence (`-exp(A_log)`, `softplus`) numerically stable over
+    /// `steps` decode steps. Packed `uint32` quantized weights get random bit
+    /// patterns — parity only requires that the *same* bits reach both the
+    /// fused and the original path, not that they decode to a numerically
+    /// meaningful quantization: `qwen4ExpFuseLinear` is exact regardless of
+    /// the packed content (see its documentation).
+    private static func randomLeaf(like array: MLXArray) -> MLXArray {
+        if array.dtype == .uint32 {
+            return MLXRandom.randInt(low: Int32(0), high: Int32(1 << 30), array.shape)
+                .asType(.uint32)
+        }
+        return MLXRandom.uniform(low: Float(-0.05), high: Float(0.05), array.shape)
+            .asType(array.dtype)
+    }
+
+    /// P2-fusion numerical guard (F1/F2/…): rebuild the same layer twice with
+    /// identical seeded random weights, run `steps` synthetic decode steps
+    /// through the original path (`fusionLevel: .none`) and through
+    /// `fusionLevel`, and check that (a) the raw layer outputs match within
+    /// `relativeTolerance` and (b) a synthetic `lm_head` projection of each
+    /// step's output picks the same top-1 id on both paths. No checkpoint or
+    /// Lexar access — purely synthetic, like the rest of this bench.
+    public static func checkParity(
+        kind: Qwen4ExpLayerBenchKind,
+        dimensions: Qwen4ExpLayerBenchDimensions = .real,
+        quantization: Qwen4ExpQuantizationSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4),
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
+        fusionLevel: Qwen4ExpFusionLevel,
+        seed: UInt64 = 20_260_909,
+        steps: Int = 32,
+        /// Applied as `atol + rtol * |baseline|` (see
+        /// `Qwen4ExpLayerBenchParityResult.maxRelativeDifference`), both at
+        /// bf16's practical precision floor.
+        relativeTolerance: Float = 1e-3,
+        absoluteTolerance: Float = 1e-3
+    ) -> Qwen4ExpLayerBenchParityResult {
+        precondition(fusionLevel != .none, "La parité compare .none à un niveau de fusion positif")
+        _ = Device.defaultDevice()
+
+        let layerType: Qwen4ExpTextConfiguration.LayerType =
+            kind == .gdn ? .linearAttention : .fullAttention
+        let configuration = dimensions.textConfiguration(layerType: layerType)
+
+        // `level` only matters for the constructor-time levers (F4's router
+        // softmax precision); the post-load levers (F1/F2) are applied
+        // afterward via `prepareFusion`, below.
+        func makeLayer(level: Qwen4ExpFusionLevel) -> Qwen4ExpDecoderLayer {
+            Qwen4ExpDecoderLayer(
+                configuration: configuration, layerIndex: 0, pleLayerIndex: nil,
+                quantization: quantization, expertsQuantization: expertsQuantization,
+                fusionLevel: level)
+        }
+
+        // One shared set of random leaf replacements, applied identically to
+        // both layers below — the whole point of this harness is that the
+        // two paths start from bit-identical weights.
+        MLXRandom.seed(seed)
+        let template = makeLayer(level: .none)
+        let randomWeights = Dictionary(
+            uniqueKeysWithValues: template.parameters().flattened().map {
+                ($0.0, randomLeaf(like: $0.1))
+            })
+        eval(Array(randomWeights.values))
+
+        let baseline = makeLayer(level: .none)
+        try! baseline.update(
+            parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
+        let fused = makeLayer(level: fusionLevel)
+        try! fused.update(
+            parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
+        fused.prepareFusion(level: fusionLevel)
+
+        let hiddenDimensions = dimensions.hiddenSize * dimensions.hcCount
+        MLXRandom.seed(seed &+ 1)
+        let inputs = (0..<steps).map { _ in
+            MLXRandom.uniform(
+                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+        }
+        eval(inputs)
+
+        MLXRandom.seed(seed &+ 2)
+        let syntheticVocabulary = 32
+        let lmHead = Linear(hiddenDimensions, syntheticVocabulary, bias: false)
+        eval(lmHead.weight)
+
+        let inputIDs = MLXArray([Int32(1)]).reshaped([1, 1])
+        let baselineCache: any KVCache = kind == .gdn
+            ? MambaCache()
+            : Qwen4ExpQSAKVCache(
+                budget: dimensions.indexerBudget, compressRatio: dimensions.indexerCompressRatio)
+        let fusedCache: any KVCache = kind == .gdn
+            ? MambaCache()
+            : Qwen4ExpQSAKVCache(
+                budget: dimensions.indexerBudget, compressRatio: dimensions.indexerCompressRatio)
+
+        var maxAbsoluteDifference: Float = 0
+        var maxRelativeDifference: Float = 0
+        var argmaxMismatches = 0
+
+        for hidden in inputs {
+            let outBaseline: MLXArray
+            let outFused: MLXArray
+            if kind == .gdn {
+                outBaseline = baseline(hidden, inputIDs: inputIDs, cache: baselineCache)
+                outFused = fused(hidden, inputIDs: inputIDs, cache: fusedCache)
+            } else {
+                // queryLength == 1 throughout this bench, matching
+                // production's trivial-mask skip (P2-code (e)) on both sides.
+                outBaseline = baseline(
+                    hidden, inputIDs: inputIDs, mask: nil, cache: baselineCache,
+                    positionIDs: nil)
+                outFused = fused(
+                    hidden, inputIDs: inputIDs, mask: nil, cache: fusedCache, positionIDs: nil)
+            }
+
+            let baselineF32 = outBaseline.asType(.float32)
+            let fusedF32 = outFused.asType(.float32)
+            let absoluteDiff = MLX.abs(baselineF32 - fusedF32)
+            let tolerance = absoluteTolerance + relativeTolerance * MLX.abs(baselineF32)
+            let normalizedDiff = absoluteDiff / tolerance
+            let logitsBaseline = lmHead(outBaseline).argMax(axis: -1)
+            let logitsFused = lmHead(outFused).argMax(axis: -1)
+            eval(absoluteDiff, normalizedDiff, logitsBaseline, logitsFused)
+
+            maxAbsoluteDifference = max(maxAbsoluteDifference, absoluteDiff.max().item(Float.self))
+            maxRelativeDifference = max(maxRelativeDifference, normalizedDiff.max().item(Float.self))
+            if logitsBaseline.item(Int32.self) != logitsFused.item(Int32.self) {
+                argmaxMismatches += 1
+            }
+        }
+
+        let passed = maxRelativeDifference <= 1 && argmaxMismatches == 0
+        return Qwen4ExpLayerBenchParityResult(
+            kind: kind, fusionLevel: fusionLevel, steps: steps,
+            maxAbsoluteDifference: maxAbsoluteDifference,
+            maxRelativeDifference: maxRelativeDifference,
+            argmaxMismatches: argmaxMismatches, passed: passed)
     }
 }
 

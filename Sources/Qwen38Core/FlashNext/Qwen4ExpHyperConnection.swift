@@ -1,4 +1,5 @@
 import MLX
+import MLXFast
 import MLXNN
 
 /// Qwen4's four-stream gated residual mixer.
@@ -98,6 +99,15 @@ public final class Qwen4ExpRMSNorm: Module {
     public let groupSize: Int?
     @ParameterInfo(key: "weight") public var weight: MLXArray
 
+    /// F2 (P2-fusion): `1 + weight` baked once by `precomputeEffectiveWeight()`
+    /// after the checkpoint (and, where applicable, the Vontra `-1` shift
+    /// correction — PLAN.md §6.3 piège 12) has been loaded. Not an
+    /// `@ModuleInfo`/`@ParameterInfo` property: it is purely derived from
+    /// `weight` and must stay invisible to `parameters()`/`update(parameters:)`.
+    /// `nil` means the original per-call `1 + weight` path (unchanged
+    /// behavior).
+    private var effectiveWeight: MLXArray?
+
     public init(dimensions: Int, groupSize: Int? = nil, eps: Float = 1e-6) {
         precondition(groupSize == nil || dimensions % groupSize! == 0)
         self.eps = eps
@@ -107,6 +117,28 @@ public final class Qwen4ExpRMSNorm: Module {
     }
 
     public func callAsFunction(_ inputs: MLXArray) -> MLXArray {
+        if let effectiveWeight {
+            if let groupSize {
+                // Grouped case (hc_norm, PLE norms): each of `dimensions /
+                // groupSize` groups has its own weight slice, which
+                // `MLXFast.rmsNorm`'s single 1-D weight cannot express in one
+                // fused call. Keep the manual reduction, but the `1 +`
+                // addition and the weight upcast are already baked into
+                // `effectiveWeight`, so only the normalization itself still
+                // runs per call.
+                let inputShape = inputs.shape
+                let values = inputs.asType(.float32).reshaped(
+                    [inputShape.dropLast().reduce(1, *), inputShape.last! / groupSize, groupSize])
+                let groupedWeight = effectiveWeight.reshaped([-1, groupSize])
+                let normed = values * MLX.rsqrt((values * values).mean(axis: -1, keepDims: true) + eps)
+                return (normed * groupedWeight).reshaped(inputShape).asType(inputs.dtype)
+            }
+            // Ungrouped case (q_norm/k_norm, indexer layernorms): a single
+            // fused kernel replaces the manual square/mean/rsqrt/mul chain,
+            // and MLXFast.rmsNorm handles its own internal precision, so no
+            // explicit float32 upcast is needed here either.
+            return MLXFast.rmsNorm(inputs, weight: effectiveWeight, eps: eps)
+        }
         let inputShape = inputs.shape
         var values = inputs.asType(.float32)
         if let groupSize {
@@ -119,5 +151,18 @@ public final class Qwen4ExpRMSNorm: Module {
             values = values * (1 + weight.asType(.float32))
         }
         return values.reshaped(inputShape).asType(inputs.dtype)
+    }
+
+    /// F2 (P2-fusion): bake this checkpoint's `1 + weight` convention into a
+    /// cached array once, so `callAsFunction` never adds 1 or upcasts the
+    /// weight again. Idempotent; safe to call unconditionally — callers gate
+    /// it on `Qwen4ExpFusionLevel`, not this method. Must run after any
+    /// convention correction (`Qwen4ExpWeightSanitizer`) has already been
+    /// applied to `weight`, i.e. after `Module.update(parameters:)`.
+    public func precomputeEffectiveWeight() {
+        guard effectiveWeight == nil else { return }
+        let baked = (1 + weight.asType(.float32)).asType(weight.dtype)
+        eval(baked)
+        effectiveWeight = baked
     }
 }

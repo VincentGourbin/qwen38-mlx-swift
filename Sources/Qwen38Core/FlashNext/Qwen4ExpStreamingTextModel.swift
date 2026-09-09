@@ -31,7 +31,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         residentEvaluationInterval: Int = 1,
         profileLayers: Bool = false,
         residentAsyncEval: Bool = false,
-        uncachedIO: Bool = true
+        uncachedIO: Bool = true,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) throws {
         let loadedGlobal = try Qwen4ExpGlobalCheckpointLoader.load(
             from: directory, materialize: materializeGlobal, uncachedIO: uncachedIO)
@@ -43,7 +44,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             residentEvaluationInterval: residentEvaluationInterval,
             profileLayers: profileLayers,
             residentAsyncEval: residentAsyncEval,
-            uncachedIO: uncachedIO)
+            uncachedIO: uncachedIO,
+            fusionLevel: fusionLevel)
         self.configuration = decoder.configuration
     }
 
