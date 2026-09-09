@@ -674,7 +674,11 @@ struct FlashGenerateProbe: AsyncParsableCommand {
                 predictor: loadedMTP.model,
                 options: .init(maxNewTokens: maxNewTokens, stopTokenIDs: stopTokens),
                 blockSize: mtpBlockSize,
-                profiler: profiler)
+                profiler: profiler,
+                // PM1: reuse --profile-layers as the opt-in gate for the
+                // "MTP …" MLXProfiler phases (same ~4.7 ms/boundary cost as
+                // "Flash couche N" — not paid unless explicitly asked for).
+                profileMTP: profileLayers)
             let decoded = tokenizer.decode(
                 tokens: result.tokenIDs.map(Int.init), skipSpecialTokens: false)
             print("mode : MTP Flash-Next local · bloc \(mtpBlockSize)")
@@ -689,6 +693,10 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             if let rate = result.stats.acceptanceRate {
                 print("accept rate MTP : \(String(format: "%.1f%%", rate * 100))")
             }
+            let timings = result.stepTimings
+            print(
+                "MTP step timings (ContinuousClock, cumulé) : draftBlock \(String(format: "%.3fs", timings.draftBlock)) · snapshot \(String(format: "%.3fs", timings.snapshot)) · verify \(String(format: "%.3fs", timings.verifyForward)) · targetIDs \(String(format: "%.3fs", timings.targetIDs)) · restore+replay \(String(format: "%.3fs", timings.restoreAndReplay)) · commit \(String(format: "%.3fs", timings.commit)) · total \(String(format: "%.3fs", timings.total))"
+            )
             if let profileSession {
                 profileSession.metadata["mtp"] = "true"
                 profileSession.metadata["prompt_tokens"] = String(result.promptTokenCount)
@@ -701,6 +709,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
                 profileSession.metadata["layer_visits"] = String(result.layerVisitCount)
                 profileSession.metadata["layer_load_seconds"] = String(format: "%.6f", result.layerLoadTime)
                 profileSession.metadata["layer_forward_seconds"] = String(format: "%.6f", result.layerForwardTime)
+                profileSession.metadata["mtp_step_draft_block_seconds"] = String(format: "%.6f", timings.draftBlock)
+                profileSession.metadata["mtp_step_snapshot_seconds"] = String(format: "%.6f", timings.snapshot)
+                profileSession.metadata["mtp_step_verify_seconds"] = String(format: "%.6f", timings.verifyForward)
+                profileSession.metadata["mtp_step_target_ids_seconds"] = String(format: "%.6f", timings.targetIDs)
+                profileSession.metadata["mtp_step_restore_replay_seconds"] = String(format: "%.6f", timings.restoreAndReplay)
+                profileSession.metadata["mtp_step_commit_seconds"] = String(format: "%.6f", timings.commit)
+                profileSession.metadata["mtp_step_total_seconds"] = String(format: "%.6f", timings.total)
             }
         } else {
             let result = try generator.generate(

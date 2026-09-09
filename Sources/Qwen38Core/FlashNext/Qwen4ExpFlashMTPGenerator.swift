@@ -18,6 +18,58 @@ public struct Qwen4ExpFlashMTPGenerationStats: Sendable, Equatable {
     }
 }
 
+/// PM1 (2026-09-09): cumulative wall time per phase of `generateMTP`,
+/// measured with `ContinuousClock` — independent of `MLXProfiler` and always
+/// on (no IOKit GPU sample, no `rusage`, unlike `profiler.start`/`.end` whose
+/// ~4.7 ms per boundary made per-layer profiling opt-in, see
+/// `Qwen4ExpStreamingDecoder.profileLayers`). This is the direct answer to the
+/// V54 question "where do the ~880s outside any profiled phase go": every
+/// step between two `model.forward` calls is now individually timed.
+public struct Qwen4ExpFlashMTPStepTimings: Sendable, Equatable {
+    /// `engine.draftBlock` — drafter forward(s) + greedy sampling of the
+    /// speculative suffix.
+    public var draftBlock: TimeInterval = 0
+    /// `model.snapshot()` — copy of every live target cache before a
+    /// verification forward that might be rolled back.
+    public var snapshot: TimeInterval = 0
+    /// The target's verification `forward` over `[bonus, drafts]`.
+    public var verifyForward: TimeInterval = 0
+    /// Extracting one greedy token id per verified position from the
+    /// verification logits (`targetIDs`).
+    public var targetIDs: TimeInterval = 0
+    /// `model.restore(...)` plus the replay forward over the accepted
+    /// prefix, only paid on a rollback round.
+    public var restoreAndReplay: TimeInterval = 0
+    /// `engine.commit` — reconciling the drafter's private cache.
+    public var commit: TimeInterval = 0
+
+    public init(
+        draftBlock: TimeInterval = 0, snapshot: TimeInterval = 0,
+        verifyForward: TimeInterval = 0, targetIDs: TimeInterval = 0,
+        restoreAndReplay: TimeInterval = 0, commit: TimeInterval = 0
+    ) {
+        self.draftBlock = draftBlock
+        self.snapshot = snapshot
+        self.verifyForward = verifyForward
+        self.targetIDs = targetIDs
+        self.restoreAndReplay = restoreAndReplay
+        self.commit = commit
+    }
+
+    public var total: TimeInterval {
+        draftBlock + snapshot + verifyForward + targetIDs + restoreAndReplay + commit
+    }
+
+    fileprivate mutating func add(_ other: Qwen4ExpFlashMTPStepTimings) {
+        draftBlock += other.draftBlock
+        snapshot += other.snapshot
+        verifyForward += other.verifyForward
+        targetIDs += other.targetIDs
+        restoreAndReplay += other.restoreAndReplay
+        commit += other.commit
+    }
+}
+
 public struct Qwen4ExpFlashMTPGenerationResult: Sendable {
     public let tokenIDs: [Int32]
     public let promptTokenCount: Int
@@ -26,12 +78,15 @@ public struct Qwen4ExpFlashMTPGenerationResult: Sendable {
     public let timeToFirstToken: TimeInterval?
     public let stats: Qwen4ExpFlashMTPGenerationStats
     public let layerReports: [[Qwen4ExpStreamingLayerReport]]
+    /// PM1: cumulative per-step wall time, see `Qwen4ExpFlashMTPStepTimings`.
+    public let stepTimings: Qwen4ExpFlashMTPStepTimings
 
     public init(
         tokenIDs: [Int32], promptTokenCount: Int, prefillTime: TimeInterval,
         generationTime: TimeInterval, timeToFirstToken: TimeInterval?,
         stats: Qwen4ExpFlashMTPGenerationStats,
-        layerReports: [[Qwen4ExpStreamingLayerReport]]
+        layerReports: [[Qwen4ExpStreamingLayerReport]],
+        stepTimings: Qwen4ExpFlashMTPStepTimings = .init()
     ) {
         self.tokenIDs = tokenIDs
         self.promptTokenCount = promptTokenCount
@@ -40,6 +95,7 @@ public struct Qwen4ExpFlashMTPGenerationResult: Sendable {
         self.timeToFirstToken = timeToFirstToken
         self.stats = stats
         self.layerReports = layerReports
+        self.stepTimings = stepTimings
     }
 
     public var layerLoadTime: TimeInterval {
@@ -69,7 +125,14 @@ public extension Qwen4ExpGreedyGenerator {
         predictor: Qwen4ExpMTPPredictor,
         options: Qwen4ExpGreedyGenerationOptions = .init(),
         blockSize: Int = 2,
-        profiler: MLXProfiler = .shared
+        profiler: MLXProfiler = .shared,
+        // PM1 (2026-09-09): opt-in `MLXProfiler` phases around each step of
+        // the round loop, mirroring `Qwen4ExpStreamingDecoder.profileLayers`
+        // (~4.7 ms per start/end boundary — not paid unless explicitly asked
+        // for). The cheap `ContinuousClock` totals in
+        // `Qwen4ExpFlashMTPStepTimings` are always collected regardless of
+        // this flag.
+        profileMTP: Bool = false
     ) throws -> Qwen4ExpFlashMTPGenerationResult {
         guard !promptTokenIDs.isEmpty else {
             throw Qwen4ExpGreedyGenerationError.emptyPrompt
@@ -115,6 +178,7 @@ public extension Qwen4ExpGreedyGenerator {
         var lastHidden = prefill.preMixerHidden[0..., (-1)..., 0...]
         var reports = [prefill.reports]
         var stats = Qwen4ExpFlashMTPGenerationStats()
+        var stepTimings = Qwen4ExpFlashMTPStepTimings()
         let firstTokenTime = Date().timeIntervalSince(started)
         profiler.startGeneration()
         let generationStarted = Date()
@@ -130,6 +194,8 @@ public extension Qwen4ExpGreedyGenerator {
                 blockSize: blockSize)
             guard requestedDrafts > 0 else { break }
 
+            if profileMTP { profiler.start("MTP draftBlock") }
+            let draftBlockStart = ContinuousClock.now
             let drafts = try engine.draftBlock(
                 lastToken: bonus,
                 lastHidden: lastHidden,
@@ -137,8 +203,17 @@ public extension Qwen4ExpGreedyGenerator {
                 state: state)
             eval(drafts)
             let draftIDs = drafts.flattened().asArray(Int32.self)
+            stepTimings.draftBlock += (ContinuousClock.now - draftBlockStart).seconds
+            if profileMTP { profiler.end("MTP draftBlock") }
 
+            if profileMTP { profiler.start("MTP snapshot") }
+            let snapshotStart = ContinuousClock.now
             let targetSnapshot = model.snapshot()
+            stepTimings.snapshot += (ContinuousClock.now - snapshotStart).seconds
+            if profileMTP { profiler.end("MTP snapshot") }
+
+            if profileMTP { profiler.start("MTP verify") }
+            let verifyStart = ContinuousClock.now
             let verifyTokens = concatenated([
                 bonus.reshaped([1, 1]), drafts
             ], axis: 1).asType(.int32)
@@ -147,10 +222,18 @@ public extension Qwen4ExpGreedyGenerator {
             eval(verification.preMixerHidden)
             recordNGramCacheStats(profiler)
             reports.append(verification.reports)
+            stepTimings.verifyForward += (ContinuousClock.now - verifyStart).seconds
+            if profileMTP { profiler.end("MTP verify") }
+
+            if profileMTP { profiler.start("MTP targetIDs") }
+            let targetIDsStart = ContinuousClock.now
             let targetIDs = (0 ..< verifyTokens.dim(1)).map { index in
                 greedyToken(from: verification.logits[0..., index, 0...])
                     .item(Int32.self)
             }
+            stepTimings.targetIDs += (ContinuousClock.now - targetIDsStart).seconds
+            if profileMTP { profiler.end("MTP targetIDs") }
+
             let walk = Qwen38SpeculativeWalk.walk(
                 drafts: draftIDs, targets: targetIDs,
                 budget: options.maxNewTokens - output.count)
@@ -158,6 +241,8 @@ public extension Qwen4ExpGreedyGenerator {
 
             let hiddenForCommit: MLXArray
             if walk.accepted < draftIDs.count {
+                if profileMTP { profiler.start("MTP restore+replay") }
+                let restoreStart = ContinuousClock.now
                 model.restore(targetSnapshot)
                 let replayTokens = concatenated([
                     bonus.reshaped([1, 1]),
@@ -170,16 +255,22 @@ public extension Qwen4ExpGreedyGenerator {
                 hiddenForCommit = replay.preMixerHidden
                 stats.rollbacks += 1
                 stats.replayedTokens += replayTokens.dim(1)
+                stepTimings.restoreAndReplay += (ContinuousClock.now - restoreStart).seconds
+                if profileMTP { profiler.end("MTP restore+replay") }
             } else {
                 hiddenForCommit = verification.preMixerHidden
             }
 
+            if profileMTP { profiler.start("MTP commit") }
+            let commitStart = ContinuousClock.now
             try engine.commit(
                 targetHidden: hiddenForCommit,
                 draftTokens: drafts,
                 acceptedCount: walk.accepted,
                 finalToken: finalToken,
                 state: state)
+            stepTimings.commit += (ContinuousClock.now - commitStart).seconds
+            if profileMTP { profiler.end("MTP commit") }
 
             stats.rounds += 1
             stats.proposedTokens += draftIDs.count
@@ -208,13 +299,21 @@ public extension Qwen4ExpGreedyGenerator {
             generationTime: Date().timeIntervalSince(generationStarted),
             timeToFirstToken: firstTokenTime,
             stats: stats,
-            layerReports: reports)
+            layerReports: reports,
+            stepTimings: stepTimings)
     }
 
     private func greedyToken(from logits: MLXArray) -> MLXArray {
         let token = ArgMaxSampler().sample(logits: logits)
         eval(token)
         return token
+    }
+}
+
+private extension Duration {
+    var seconds: Double {
+        let components = self.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }
 
