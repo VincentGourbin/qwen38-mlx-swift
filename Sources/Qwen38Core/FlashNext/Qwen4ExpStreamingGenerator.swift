@@ -96,12 +96,19 @@ public struct Qwen4ExpGenerationSummary: Sendable, Equatable {
     public let activeMemoryBytes: Int
     public let peakMemoryBytes: Int
     public let ngramCacheStats: Qwen4ExpNGramCacheStats
+    /// P4.2: cumulative end-of-token cost over every decode step (excludes
+    /// the prefill's own lm_head/sample) — `ContinuousClock`, always on.
+    public let lmHeadTime: TimeInterval
+    public let samplerSampleTime: TimeInterval
+    public let itemTime: TimeInterval
 
     public init(
         tokenIDs: [Int32], promptTokenCount: Int, timeToFirstToken: TimeInterval?,
         prefillTime: TimeInterval, decodeTime: TimeInterval, layerVisitCount: Int,
         layerLoadTime: TimeInterval, activeMemoryBytes: Int, peakMemoryBytes: Int,
-        ngramCacheStats: Qwen4ExpNGramCacheStats
+        ngramCacheStats: Qwen4ExpNGramCacheStats,
+        lmHeadTime: TimeInterval = 0, samplerSampleTime: TimeInterval = 0,
+        itemTime: TimeInterval = 0
     ) {
         self.tokenIDs = tokenIDs
         self.promptTokenCount = promptTokenCount
@@ -113,6 +120,9 @@ public struct Qwen4ExpGenerationSummary: Sendable, Equatable {
         self.activeMemoryBytes = activeMemoryBytes
         self.peakMemoryBytes = peakMemoryBytes
         self.ngramCacheStats = ngramCacheStats
+        self.lmHeadTime = lmHeadTime
+        self.samplerSampleTime = samplerSampleTime
+        self.itemTime = itemTime
     }
 }
 
@@ -214,12 +224,22 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
         var logits = prefill.logits[0..., -1, 0...]
         var firstTokenTime: TimeInterval?
         var generationStarted = false
+        // P4.2: end-of-token cost, ContinuousClock only (always on, no
+        // MLXProfiler phase boundary — see `lastLMHeadDuration`).
+        var lmHeadTimeTotal: TimeInterval = 0
+        var samplerSampleTimeTotal: TimeInterval = 0
+        var itemTimeTotal: TimeInterval = 0
 
         while tokenIDs.count < options.maxNewTokens {
             if Task.isCancelled { break }
             // Materialize the token eagerly (piège 11) — no deferred graph
             // survives across autoregressive steps.
-            let token = Int32(sampler.sample(logits: logits).item(Int32.self))
+            let sampleStart = ContinuousClock.now
+            let sampled = sampler.sample(logits: logits)
+            samplerSampleTimeTotal += (ContinuousClock.now - sampleStart).seconds
+            let itemStart = ContinuousClock.now
+            let token = Int32(sampled.item(Int32.self))
+            itemTimeTotal += (ContinuousClock.now - itemStart).seconds
             if !generationStarted {
                 generationStarted = true
                 firstTokenTime = Date().timeIntervalSince(started)
@@ -237,6 +257,7 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
 
             let step = try model.forward(inputIDs: MLXArray([token]).reshaped([1, 1]))
             eval(step.logits)
+            lmHeadTimeTotal += model.lastLMHeadDuration
             recordNGramCacheStats(profiler)
             logits = step.logits[0..., -1, 0...]
             layerVisitCount += step.reports.count
@@ -257,7 +278,10 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
             layerLoadTime: layerLoadTime,
             activeMemoryBytes: Memory.activeMemory,
             peakMemoryBytes: Memory.peakMemory,
-            ngramCacheStats: model.ngramCacheStats())
+            ngramCacheStats: model.ngramCacheStats(),
+            lmHeadTime: lmHeadTimeTotal,
+            samplerSampleTime: samplerSampleTimeTotal,
+            itemTime: itemTimeTotal)
         continuation.yield(.finished(summary))
     }
 }
@@ -279,5 +303,12 @@ extension Qwen4ExpStreamingGenerator {
                 "entries": Double(stats.entries),
                 "hit_rate": stats.hitRate ?? 0,
             ])
+    }
+}
+
+private extension Duration {
+    var seconds: Double {
+        let components = self.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

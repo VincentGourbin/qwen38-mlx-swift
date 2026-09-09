@@ -21,6 +21,12 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
     public let global: Qwen4ExpGlobalTextModel
     public let decoder: Qwen4ExpStreamingDecoder
     public let globalLoadReport: Qwen4ExpGlobalLoadReport
+    /// P4.2: wall time of the last `forward` call's end-of-token segment —
+    /// hyper-stream reduction + `lm_head` (248 320 × 2 560, quantized) +
+    /// the blocking `eval` that materializes `logits`. `ContinuousClock`
+    /// only (no `MLXProfiler` phase, ~4.7 ms/boundary — P0-c): cheap enough
+    /// to leave on unconditionally, like `Qwen4ExpFlashMTPStepTimings`.
+    public private(set) var lastLMHeadDuration: TimeInterval = 0
 
     private var logicalOffset = 0
 
@@ -96,9 +102,11 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             materializeLayers: materializeLayers,
             verificationCapture: verificationCapture,
             onLayerVisited: onLayerVisited)
+        let lmHeadStart = ContinuousClock.now
         let reduced = global.reduceHyperStreams(result.output)
         let output = global.logits(from: reduced)
         eval(output)
+        lastLMHeadDuration = (ContinuousClock.now - lmHeadStart).seconds
         logicalOffset += inputIDs.dim(1)
         return (output, result.output, result.reports)
     }
@@ -150,5 +158,12 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             committedNewTokens: committedNewTokens,
             totalNewTokens: totalNewTokens)
         logicalOffset -= (totalNewTokens - committedNewTokens)
+    }
+}
+
+private extension Duration {
+    var seconds: Double {
+        let components = self.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

@@ -1191,6 +1191,9 @@ struct FlashChatProbe: AsyncParsableCommand {
                     print(
                         "couches: \(summary.layerVisitCount) visites · load cumulé \(String(format: "%.3fs", summary.layerLoadTime))"
                     )
+                    print(
+                        "P4.2 fin de token (cumulé) : lm_head \(String(format: "%.4fs", summary.lmHeadTime)) · sampler.sample \(String(format: "%.4fs", summary.samplerSampleTime)) · .item() \(String(format: "%.4fs", summary.itemTime))"
+                    )
                     if let profileSession {
                         profileSession.metadata["\(label)_prompt_tokens"] = String(
                             summary.promptTokenCount)
