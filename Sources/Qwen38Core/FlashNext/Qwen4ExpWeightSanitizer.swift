@@ -21,6 +21,11 @@ public enum Qwen4ExpWeightSanitizer {
         "norm_key.weight",
         "norm_query.weight",
         "norm_conv.weight",
+        // MTP head (2026-09-09, verified against the official HF BF16 shards):
+        // both pre-fc norms are zero-centered too and shifted by exactly +1.000
+        // in the Vontra checkpoint (HF means -0.764 / -0.328).
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
     ]
 
     /// Returns the MLX tree key for a Transformers or converted checkpoint

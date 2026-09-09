@@ -229,6 +229,16 @@ public enum Qwen4ExpMTPLoader {
             }
         }
 
+        // 2026-09-09 : the MTP head has the same zero-centered norms as the
+        // decoder layers (hc_norm ×3, q/k_norm, indexer q/k layernorm) and the
+        // Vontra converter shifted them by +1 too (means +1.1 … +4.8 in the
+        // checkpoint). The layer/global loaders already correct this (piège
+        // §6.3-12); the MTP loader did not, which is the likely cause of the
+        // 8-24 % acceptance measured in P-MTP PM3. Anchor and detection are
+        // the same as for the decoder, so already-correct checkpoints are
+        // left untouched.
+        let normCorrection = Qwen4ExpWeightSanitizer.correctShiftedZeroCenteredNormWeights(weights)
+        weights = normCorrection.weights
         let quantization = Qwen4ExpQuantizationSpec(configuration.quantization)
         let expertsQuantization = Qwen4ExpQuantizationSpec.experts(from: configuration.quantization)
         let model = Qwen4ExpMTPPredictor(

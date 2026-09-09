@@ -2255,3 +2255,38 @@ round-trip, déjà réduit à ~1-3 % du budget.
    spéculatif pour un gain mesuré <1,5 %.
 4. **Aucune ligne BENCHMARKS.md** : la consigne ne le demande que si PM3
    branche le MTP en production, ce qui n'est pas le cas.
+
+## 2026-09-09 — P-MTP (suite) : la tête MTP tournait avec les normes Vontra non corrigées
+
+Après le verdict PM3 (24 % d'acceptation, MTP non branché), vérification de
+la tête MTP contre les shards BF16 officiels (`Scripts/hf-cache`, requêtes
+HTTP par plage, même méthode que la revue du 2026-09-02) : **les neuf normes
+de la tête MTP sont décalées de +1,000** dans le checkpoint Vontra
+(`hc_norm` ×3, `q_norm`/`k_norm`, indexer `q/k_layernorm`, et les deux
+`pre_fc_norm_embedding`/`pre_fc_norm_hidden`, moyennes HF −0,764 / −0,328).
+Deux trous : `Qwen4ExpMTPLoader` n'appelait pas
+`correctShiftedZeroCenteredNormWeights` (seuls les loaders couches/globaux le
+faisaient), et les suffixes `pre_fc_norm_*` manquaient à la liste du
+sanitizer. L'entrée du drafter était donc amplifiée ×5 et ×2,5. Le même audit
+sur les couches 1 et 3 et les globaux du modèle principal confirme que tout y
+est couvert (`linear_attn.norm` non décalée, comme attendu).
+
+| Variante (3-bit, 32 tokens, résident + `asyncEval`) | decode | acceptés / proposés | taux |
+|---|---|---|---|
+| Greedy | 5,23 s | — | — |
+| MTP bloc 2, avant correctif | 8,08 s | — | 24,0 % |
+| MTP bloc 2, loader corrigé (7 normes) | 9,17 s | 7/24 | 29,2 % |
+| **MTP bloc 2, loader + `pre_fc_norm`** | **6,22 s** | 10/21 | **47,6 %** |
+| MTP bloc 3, idem | 8,32 s | 11/39 | 28,2 % |
+| MTP bloc 4, idem | 9,06 s | 11/57 | 19,3 % |
+
+IDs identiques au greedy dans tous les cas. Le MTP reste plus lent que le
+greedy parce que chaque rejet coûte un **rejeu** du préfixe accepté
+(`model.restore` + `model.forward`, `Qwen4ExpFlashMTPGenerator.swift:249-254`)
+: avec ~50 % d'acceptation, 1 round ≈ 1,5 forward cible pour 1,5 token, soit
+le prix du greedy. Le levier suivant est structurel : vérifier sans rejeu, en
+gardant les états GDN par token pendant le forward de vérification (le kernel
+upstream `gatedDeltaUpdate` ne rend que l'état final,
+`Vendor/…/GatedDelta.swift:285`) et en tronquant les caches QSA (`trim`).
+Reste à mesurer l'acceptation sur le 4-bit pour savoir si le 3-bit limite le
+drafter.
