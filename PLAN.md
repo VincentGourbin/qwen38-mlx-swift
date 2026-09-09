@@ -369,6 +369,20 @@ Constat (corrigé le 2026-09-07 par relecture de la trace V54, voir RÉPONSE « 
 | PM2 | Corriger dans l'ordre de coût mesuré : (a) `targetIDs` : un seul `argMax(axis: -1)` + `asArray(Int32.self)` au lieu d'un `.item()` par position ; (b) `greedyToken` du `DraftEngine` (ligne ~265) sans `eval` ⇒ matérialiser le token retourné ; (c) `model.snapshot()` à chaque round : mesurer `copy()` des 48 caches ; si dominant, snapshotter seulement les caches QSA (les GDN ont `GDNStateSnapshot`) ou copier paresseusement. | decode MTP ≤ 1,2 × decode greedy pour le prompt de référence, 8 tokens, ≥ 3/5 acceptés |
 | PM3 | Si PM2 atteint son critère : MTP Flash-Next opt-in dans la GUI/serveur (`mtpState = .active`, toggle réactivé). Sinon : reste hors catalogue, le plan livre sans MTP (dégradé accepté en rév. 3). | décision consignée dans `log.md` |
 
+**Statut (2026-09-09, fait)** : PM1/PM2/PM3 exécutées sur le checkpoint
+3-bit `e3bit-MTP`. PM1 a résorbé la question de V54 : le decode instrumenté
+n'a plus de temps fantôme (somme des 6 phases ≈ decode total, écart
+≈0,01 %). PM2 (a)/(b) appliquées et mesurées (effet dans le bruit, coût
+déjà <3 % du budget) ; (c)/(d) mesurées/vérifiées sans changement de code
+nécessaire (snapshot 0,05 % du budget, chemin asyncEval déjà partagé avec
+le greedy) ; (e) partiellement atteint (2 syncs/round, pas 1 — assumé).
+PM3 : **MTP non branché** — decode MTP reste 1,5-2× plus lent que le
+greedy résident (5,2-5,3s vs 8,08-10,71s pour 32 tokens, blocs 2/3/4)
+malgré des IDs identiques au greedy à chaque bloc testé ; cause racine :
+taux d'acceptation du drafter 1 couche trop bas sur ce prompt/checkpoint
+(24 %/12 %/8 % pour blocs 2/3/4), pas un problème de bookkeeping hôte.
+Détail et tableau : `docs/knowledge/log.md` 2026-09-09 « P-MTP ».
+
 ### 6.3 Checklist de pièges (contrat de revue — cocher les 14)
 
 1. `QuantizedLinear.weight.dtype` = uint32 packé → caster les activations via `computeDType` (scales).

@@ -225,12 +225,21 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         let preset = Qwen4ExpSamplingPreset.custom(
             temperature: options.temperature, topP: options.topP, topK: options.topK)
         if options.mtp.enabled {
-            // Flash-Next MTP is a separate, opt-in chantier (P-MTP) not yet
-            // wired into the runtime — log and ignore rather than fail the
-            // request (H3.2: "options.mtp ignoré, un log, pas d'erreur").
+            // P-MTP (2026-09-09, PM3): measured, not wired in. PM1 showed the
+            // decode budget is 97% verify+restore/replay forward compute, not
+            // host bookkeeping (PM2's targetIDs/greedyToken fixes moved <1%
+            // of the total). The 1-layer drafter's acceptance rate on this
+            // checkpoint/prompt (24% at block size 2, worse at 3/4) is too
+            // low for speculative decoding to pay off: a rejected round
+            // re-does almost as much target forward work as it saved, so
+            // decode is 1.5-2x SLOWER than greedy, not faster — see
+            // docs/knowledge/log.md 2026-09-09 "P-MTP". Log and ignore
+            // rather than fail the request (H3.2: "options.mtp ignoré, un
+            // log, pas d'erreur").
             FileHandle.standardError.write(
                 Data(
-                    "qwen38: Flash-Next ignore options.mtp (P-MTP en chantier)\n".utf8))
+                    "qwen38: Flash-Next ignore options.mtp (P-MTP mesuré non rentable, voir log.md 2026-09-09)\n"
+                        .utf8))
         }
 
         let profiler = MLXProfiler.shared

@@ -2106,3 +2106,152 @@ débit.
    groupé, 4 appels par couche QSA, 0 en GDN ; F4 : −1 upcast par appel MoE)
    n'a pas été mesuré empiriquement par `sample` — reporté tel quel dans le
    rapport final comme estimation analytique, pas une mesure.
+
+## 2026-09-09 — P-MTP : goulot du générateur MTP Flash-Next
+
+Reprise du fil laissé ouvert par V54 (~880s hors de toute phase profilée sur
+1618s pour 8 tokens, checkpoint Vontra 4-bit, avant `residentAsyncEval`/P1).
+Objectif : instrumenter `Qwen4ExpFlashMTPGenerator.generateMTP` (PM1),
+corriger dans l'ordre du coût mesuré (PM2), puis décider si le MTP local
+passe en production (PM3). Tout mesuré sur le checkpoint 3-bit
+`/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`, Release,
+`--resident-layers --resident-async`, prompt de référence.
+
+### PM1 — instrumentation
+
+`Qwen4ExpFlashMTPStepTimings` (`ContinuousClock`, toujours actif — pas de
+`rusage`/échantillon IOKit, donc pas de coût comme les `MLXProfiler`
+`start`/`end`) ajouté autour des six étapes de la boucle : `draftBlock`,
+`snapshot`, `verify` (forward de vérification), `targetIDs`, `restore+replay`,
+`commit`. Les mêmes six étapes sont exposées comme phases `MLXProfiler`
+derrière `profileMTP` (réutilise `--profile-layers` côté CLI — même logique
+de coût que `Flash couche N`, ~4,7 ms par frontière, pas payé par défaut).
+`flash-generate-probe --mtp` imprime le détail cumulé et l'ajoute aux
+métadonnées de trace.
+
+**Résultat de PM1 (la question de V54 est tranchée)** : sur ce checkpoint et
+avec le code actuel (post-V54, P1, P2-code, P2-mem, P2-fusion), il n'y a
+**plus de temps fantôme** — la somme des six phases égale le `decode` mesuré
+à la milliseconde près (ex. bloc 2 : total 8,212s vs `decode: 8,213s`, écart
+≈0,01 %, très en dessous du seuil de 5 %). Le « ~880s manquants » de V54
+était spécifique à l'ancien chemin (checkpoint 4-bit Vontra, sans
+`residentAsyncEval`, sans le retrait du masque causal QSA superflu en
+décodage à un token de P2-code (e)) : les correctifs faits pour d'autres
+chantiers (P1/P2) l'ont résorbé avant même que PM1 ne tourne.
+
+### PM2 — corrections
+
+Ventilation mesurée (bloc 2, 32 tokens, 25 rounds) : `verify` 4,72s (57 %),
+`restore+replay` 3,28s (40 %), `commit` 0,12s, `draftBlock` 0,08s, `targetIDs`
+0,01s, `snapshot` 0,004s. **97 % du temps est dans les deux forwards du
+target** (vérification + rejeu) — pas dans le bookkeeping hôte.
+
+- **(a) targetIDs** : remplacé la boucle `(0..<verifyTokens.dim(1)).map {
+  ... .item(Int32.self) }` (un sync CPU par position vérifiée, suspect #3 de
+  V54) par un seul `argMax(verification.logits, axis: -1).asArray(Int32.self)`
+  — un seul host sync pour tout le round, résultat bit-identique (argMax par
+  position est exactement ce que faisait la boucle, juste batché).
+- **(b) `Qwen4ExpFlashMTPDraftEngine.greedyToken`** (suspect #2 de V54)
+  matérialise désormais son token (`eval(token)`) au lieu de le laisser
+  paresseux. Effet mesuré : le coût ne disparaît pas, il se **déplace au bon
+  endroit** — `draftBlock` 0,076s→0,001s, `commit` 0,119s→0,191s, total
+  inchangé (8,21s→8,08s, dans le bruit). C'était bien un problème
+  d'attribution (le lm_head 248K-vocab quantifié débité au round suivant au
+  lieu du round qui le déclenche), pas un problème de volume.
+- **(c) `model.snapshot()`** : mesuré, **pas dominant** (0,004s / 8,08s soit
+  0,05 %) — confirme que `KVCache.copy()` (une slice `[.ellipsis]`, donc un
+  nœud de graphe paresseux, pas une copie GPU immédiate) est bon marché tant
+  que les caches source sont déjà matérialisés par le dernier `eval` de
+  couche du round précédent. **Aucun changement de code** : rien à
+  snapshotter sélectivement (QSA seul / `GDNStateSnapshot`) puisque le
+  snapshot complet n'est pas le goulot.
+- **(d) chemin `asyncEval`** : vérifié par lecture — `verify` et
+  `restore+replay` passent par `model.forward`, qui applique exactement la
+  même logique `shouldEvaluate`/`residentAsyncEval` que le chemin greedy
+  (`Qwen4ExpStreamingDecoder.forward`, `visitIndex == layerIndices.count - 1`
+  force toujours l'`eval` de la dernière couche, quel que soit l'appelant).
+  Les `eval(verification.logits)`/`eval(verification.preMixerHidden)`/
+  `eval(replay.preMixerHidden)` explicites dans `generateMTP` sont
+  redondants (les valeurs sont déjà matérialisées par `model.forward` avant
+  de revenir), mais un `eval` sur un tableau déjà évalué est un no-op bon
+  marché, pas un point de blocage supplémentaire — **aucun changement de
+  code**, laissés pour la clarté défensive existante.
+- **(e) au plus un `.item()`/`asArray` par round** : atteint **deux** appels
+  par round (le `asArray` de `draftIDs` dans `draftBlock`, le nouveau
+  `asArray` de `targetIDs`), pas un seul. Ramener à un seul sync exigerait de
+  faire la comparaison drafts/targets et le calcul du walk spéculatif
+  entièrement sur device (comparaison élément-à-élément, `argmin` pour la
+  position de rejet), une réécriture de `Qwen38SpeculativeWalk` hors
+  périmètre du gain mesuré : les deux syncs actuels coûtent ensemble
+  0,08-0,09s / 8,08s (≈1 %), loin derrière `verify`+`restore+replay` (97 %).
+  **Écart assumé à la lettre de la consigne**, documenté plutôt qu'appliqué
+  au prix d'un risque de régression sur la logique d'acceptation/rejet.
+
+### PM3 — décision : MTP local **non branché**
+
+Tableau (Release, résident + async, prompt de référence, IDs comparés au
+greedy `--temperature 0`) :
+
+| Étape | decode (32 tokens) | s/token | acceptés/proposés | rounds | rollbacks | IDs = greedy |
+|---|---|---|---|---|---|---|
+| Greedy (référence, moyenne de 3 runs stables) | 5,17-5,33s | ≈0,163-0,167 | — | — | — | — |
+| MTP bloc 2, avant PM2 | 8,21-8,52s | 0,26 | 6/25 (24,0 %) | 25 | 19 | oui |
+| MTP bloc 2, après PM2 (a)+(b) | 8,08s | 0,25 | 6/25 (24,0 %) | 25 | 19 | oui |
+| MTP bloc 3, avant PM2 | 10,32s | 0,32 | 6/49 (12,2 %) | 25 | 25 | oui |
+| MTP bloc 4, avant PM2 | 10,71s | 0,33 | 6/72 (8,3 %) | 25 | 25 | oui |
+| MTP bloc 2, 8 tokens (référence V54) | 2,19s vs greedy 1,42s | 0,27 vs 0,18 | 2/6 (33,3 %) | 6 | 4 | oui |
+
+**Correction méthodologique découverte pendant la campagne** : le premier
+run greedy de la session a mesuré 13,36s (0,42 s/token) — un artefact de
+démarrage (premier process de la session après le build, cache disque/Metal
+froid), pas représentatif. Trois runs greedy ultérieurs sous conditions
+stables (machine par ailleurs idle) convergent à 5,17-5,33s. Le tableau
+ci-dessus utilise cette plage stable comme référence ; comparer au premier
+run isolé aurait fait paraître le MTP artificiellement compétitif (8,5s vs
+13,4s ⇒ 0,64×) alors que la comparaison à conditions égales donne 8,08s vs
+5,2-5,3s ⇒ **1,5-1,6×, au-delà du seuil ×1,2 de la consigne**, à tous les
+blocs testés (2, 3 et 4 — le bloc 2 reste le meilleur, le taux d'acceptation
+se dégrade avec la taille du bloc : 24 % → 12 % → 8 %).
+
+**Root cause, pas un bug de code** : PM1/PM2 ont établi que le temps est
+dans `verify`+`restore+replay` (97 %), c'est-à-dire dans le forward réel du
+target — pas dans le bookkeeping hôte que P-MTP visait à corriger. Avec un
+taux d'acceptation de 8-24 % sur ce prompt/checkpoint, un round rejeté
+calcule presque autant de positions de forward (`verify` + `restore+replay`)
+qu'un round accepté en aurait économisé : sur 32 tokens en bloc 2, le MTP a
+calculé 69 positions de forward cible (50 vérifiées + 19 rejouées) contre 32
+pour le greedy — 2,16× plus de travail brut — pour un gain de host-overhead
+par appel qui ne compense pas cet excédent de calcul une fois la baseline
+greedy mesurée dans des conditions stables. Ce n'est donc pas un problème
+d'implémentation résiduel (le P-MTP ~880s de V54 a bien été résorbé, PM1 le
+prouve) mais une question de **qualité du drafter MTP à une couche sur ce
+checkpoint** : à ce taux d'acceptation, la spéculation coûte plus cher
+qu'elle ne rapporte, quel que soit le bloc testé.
+
+**Décision** : le MTP local Flash-Next (`Qwen4ExpFlashMTPGenerator`) reste
+**hors catalogue** — `options.mtp` continue d'être ignoré avec un log dans
+`Qwen38FlashNextEngine.runGenerationStream` (message mis à jour pour
+référencer cette conclusion au lieu de « chantier en cours »), le toggle GUI
+reste désactivé, le serveur continue d'ignorer `"mtp": true` sans erreur
+(comportement H3.2 inchangé). Rouvrir ce chantier n'a de sens que si un
+futur drafter MTP (plus de couches, meilleur entraînement, ou un autre
+checkpoint) atteint un taux d'acceptation nettement supérieur à 50 % sur des
+prompts réels — pas en continuant à optimiser le bookkeeping hôte du
+round-trip, déjà réduit à ~1-3 % du budget.
+
+### Écarts à la consigne P-MTP
+
+1. **PM2 (a) et (b) committés ensemble**, pas en deux commits séparés comme
+   la lettre du plan le suggère — les deux sont mécaniques, sans risque
+   mutuel, et leur effet individuel est de toute façon dans le bruit de
+   mesure (voir ci-dessus) ; les séparer aurait ajouté deux runs de ~70s
+   sans information supplémentaire.
+2. **PM2 (c) et (d) : aucun commit** — les deux se concluent par « mesuré/
+   vérifié, pas dominant, aucun changement de code », conformément à
+   « chaque hypothèse : confirmée / écartée + chiffre » (P2 §6.2) plutôt
+   qu'à un changement de code systématique.
+3. **PM2 (e) non atteint à la lettre** (deux syncs par round, pas un) —
+   assumé et chiffré ci-dessus plutôt qu'un refactor plus risqué du walk
+   spéculatif pour un gain mesuré <1,5 %.
+4. **Aucune ligne BENCHMARKS.md** : la consigne ne le demande que si PM3
+   branche le MTP en production, ce qui n'est pas le cas.
