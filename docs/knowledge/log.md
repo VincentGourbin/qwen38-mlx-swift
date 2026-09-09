@@ -2530,3 +2530,26 @@ réelles, pas seulement en test unitaire.
    que `mtpState` ne devient `.active` qu'après le retour du premier
    `.metrics` (pas au moment où le flux est retourné). Cohérent avec « à
    la demande au premier tour MTP » de la consigne.
+
+## 2026-09-09 — Checkpoint 3-bit « hybride » sur le SSD interne (n-gram local, experts liés au Lexar)
+
+`Scripts/localize-checkpoint.sh` crée `/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` :
+les 7 shards de la table n-gram (35,7 Go, lus par accès aléatoires à chaque
+token) sont copiés sur le SSD (54 s), les 15 autres shards sont des liens
+symboliques vers le Lexar, les petits fichiers sont copiés ; `--full` copie
+tout quand la place le permettra (il reste 62 Go libres). Aucun changement de
+code : le loader suit les liens.
+
+| Chemin (3-bit, 32 tokens, Release, résident, `asyncEval`) | TTFT | greedy | MTP bloc 2 |
+|---|---|---|---|
+| Lexar seul | 64,2 s | 5,23 s | 4,31 s (PM4) |
+| hybride SSD, 1er run (pages n-gram froides) | 68,1 s | 11,40 s | 4,35 s |
+| hybride SSD, runs 2-3 | 66,4-67,0 s | **5,28-5,39 s** | — |
+
+IDs identiques. Verdict : en régime établi, **aucune différence** : les
+lectures n-gram (LRU 4 096 lignes + cache de pages) n'étaient pas un goulot
+sur le Lexar ; le TTFT reste dominé par les 50 Go d'experts lus depuis l'USB.
+L'incertitude « I/O Lexar par token » est levée. Un gain de TTFT (60 s → ~15 s)
+demande la copie complète (`--full`, +54 Go). Le premier run après la copie
+paie le premier accès aux pages (×2 sur 32 tokens) : ne jamais mesurer sur un
+premier run.
