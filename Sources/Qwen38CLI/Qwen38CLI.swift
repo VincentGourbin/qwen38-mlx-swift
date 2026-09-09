@@ -1217,6 +1217,13 @@ struct FlashChatProbe: AsyncParsableCommand {
         print("MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))")
         print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
         let ngramCacheStats = model.ngramCacheStats()
+        if profileLayers {
+            print(
+                "P4.5 n-gram : \(ngramCacheStats.hits) hits · \(ngramCacheStats.misses) misses · "
+                    + "miss cumulé \(String(format: "%.4fs", ngramCacheStats.missDuration)) · "
+                    + "moyenne/miss \(ngramCacheStats.meanMissDuration.map { String(format: "%.5fs", $0) } ?? "n/a")"
+            )
+        }
         if let profileSession {
             profileSession.metadata["ngram_cache_hits"] = String(ngramCacheStats.hits)
             profileSession.metadata["ngram_cache_misses"] = String(ngramCacheStats.misses)

@@ -9,11 +9,18 @@ public struct Qwen4ExpNGramCacheStats: Sendable, Equatable {
     public var hits: Int
     public var misses: Int
     public var entries: Int
+    /// P4.5: cumulative wall time spent in the uncached row read (mmap
+    /// touch on a miss — cold Lexar pages vs already-faulted-in pages) that
+    /// backs every miss counted above. `ContinuousClock`, always on.
+    public var missDuration: TimeInterval
 
-    public init(hits: Int = 0, misses: Int = 0, entries: Int = 0) {
+    public init(
+        hits: Int = 0, misses: Int = 0, entries: Int = 0, missDuration: TimeInterval = 0
+    ) {
         self.hits = hits
         self.misses = misses
         self.entries = entries
+        self.missDuration = missDuration
     }
 
     public var lookups: Int { hits + misses }
@@ -21,6 +28,12 @@ public struct Qwen4ExpNGramCacheStats: Sendable, Equatable {
     public var hitRate: Double? {
         guard lookups > 0 else { return nil }
         return Double(hits) / Double(lookups)
+    }
+
+    /// Average wall time per miss (P4.5's "latence d'un miss").
+    public var meanMissDuration: TimeInterval? {
+        guard misses > 0 else { return nil }
+        return missDuration / Double(misses)
     }
 }
 
@@ -86,15 +99,18 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         public let hits: Int
         public let misses: Int
         public let entries: Int
+        public let missDuration: TimeInterval
 
-        fileprivate init(hits: Int, misses: Int, entries: Int) {
+        fileprivate init(hits: Int, misses: Int, entries: Int, missDuration: TimeInterval) {
             self.hits = hits
             self.misses = misses
             self.entries = entries
+            self.missDuration = missDuration
         }
 
         public var publicStats: Qwen4ExpNGramCacheStats {
-            Qwen4ExpNGramCacheStats(hits: hits, misses: misses, entries: entries)
+            Qwen4ExpNGramCacheStats(
+                hits: hits, misses: misses, entries: entries, missDuration: missDuration)
         }
     }
 
@@ -122,6 +138,10 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         private var order: [CachedRowKey] = []
         private var hits = 0
         private var misses = 0
+        /// P4.5: cumulative wall time of the uncached reads that back every
+        /// miss above (recorded by the caller via `recordMissDuration`,
+        /// since the actual mmap-backed read happens outside this lock).
+        private var missDuration: TimeInterval = 0
 
         init(capacity: Int) {
             precondition(capacity > 0)
@@ -153,7 +173,18 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         func stats() -> CacheStats {
             lock.lock()
             defer { lock.unlock() }
-            return CacheStats(hits: hits, misses: misses, entries: values.count)
+            return CacheStats(
+                hits: hits, misses: misses, entries: values.count, missDuration: missDuration)
+        }
+
+        /// P4.5: called once per batch of uncached rows actually fetched
+        /// (`readPackedRows`/`readUInt16Rows`), with the wall time of that
+        /// fetch — cold Lexar pages the first time a shard's mmap region is
+        /// touched, already-faulted-in pages afterwards.
+        func recordMissDuration(_ duration: TimeInterval) {
+            lock.lock()
+            defer { lock.unlock() }
+            missDuration += duration
         }
 
         private func value<T>(
@@ -305,7 +336,9 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             }
         }
         if !missing.isEmpty {
+            let missStart = ContinuousClock.now
             let fetched = readPackedRowsUncached(location, rows: missing)
+            rowCache.recordMissDuration((ContinuousClock.now - missStart).seconds)
             for (index, row) in missing.enumerated() {
                 rowCache.storePacked(
                     Array(fetched[index * width ..< (index + 1) * width]),
@@ -394,7 +427,9 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             }
         }
         if !missing.isEmpty {
+            let missStart = ContinuousClock.now
             let fetched = readUInt16RowsUncached(location, rows: missing)
+            rowCache.recordMissDuration((ContinuousClock.now - missStart).seconds)
             for (index, row) in missing.enumerated() {
                 rowCache.storeHalf(
                     Array(fetched[index * width ..< (index + 1) * width]),
@@ -885,5 +920,12 @@ public final class Qwen4ExpPLELayer: Module {
 
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats? {
         pleEmbedding.cacheStats()
+    }
+}
+
+private extension Duration {
+    var seconds: Double {
+        let components = self.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }
