@@ -806,9 +806,13 @@ func qwen4ExpQSAKVCacheTracksIndexerState() {
     let keys = MLXArray.zeros([1, 2, 3, 256], dtype: .float16)
     let values = MLXArray.zeros([1, 2, 3, 256], dtype: .float16)
     _ = cache.update(keys: keys, values: values)
+    // PM4.2 (P-MTP suite): distinct per-position values (not all-zero) so a
+    // `trim` that drops the wrong end (oldest vs. newest) is observable, not
+    // just its count.
     cache.updateIndexer(
-        keys: MLXArray.zeros([1, 3, 128], dtype: .float16),
-        positions: MLXArray.zeros([1, 3], dtype: .int32))
+        keys: MLXArray([Float(10), 20, 30]).reshaped([1, 3, 1])
+            * MLXArray.ones([1, 3, 128]),
+        positions: MLXArray([Int32(10), 11, 12]).reshaped([1, 3]))
 
     #expect(cache.offset == 3)
     #expect(cache.indexerTokenCount == 3)
@@ -823,6 +827,14 @@ func qwen4ExpQSAKVCacheTracksIndexerState() {
     #expect(cache.trim(1) == 1)
     #expect(cache.offset == 2)
     #expect(cache.indexerTokenCount == 2)
+    // PM4.2 bug fix: `trim(n)` removes the `n` most recently appended
+    // positions (matching `mainCache`'s K/V, which just shrinks `offset`),
+    // so the two oldest indexer rows (position 10, 11) must survive, not
+    // the two newest. The previous implementation kept [11, 12] instead.
+    let remainingPositions = cache.indexerPositionsView!.asArray(Int32.self)
+    #expect(remainingPositions == [10, 11])
+    let remainingKeyLead = cache.indexerKeysView![0..., 0..., 0].asArray(Float.self)
+    #expect(remainingKeyLead == [10, 20])
 }
 
 @Test("PM4.1 : gatedDeltaUpdateWithStates égale T forwards à un token, y égale le kernel upstream")
@@ -873,6 +885,154 @@ func qwen4ExpGatedDeltaUpdateWithStatesMatchesSingleStepForwards() {
     eval(referenceY)
     let yDiff = MLX.abs(yBatched.asType(.float32) - referenceY.asType(.float32)).max().item(Float.self)
     #expect(yDiff < 1e-3, "sortie y : écart \(yDiff) vs kernel upstream par étape")
+}
+
+@Test("PM4.2 : la reconstruction du cache GDN par capture égale un forward direct sur le préfixe accepté")
+func qwen4ExpGDNVerificationCaptureRollbackMatchesDirectForward() {
+    MLXRandom.seed(4_020_1)
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 1,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [2], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+    let gdn = Qwen4ExpGatedDeltaNet(configuration: configuration)
+
+    // Prime the cache with two "already committed" tokens so the recurrent
+    // state and conv window are not the trivial zero initial state — this
+    // matches a mid-conversation MTP round, not just the first one.
+    let primerCache = MambaCache()
+    _ = gdn(MLXRandom.normal([1, 2, 8]), cache: primerCache)
+    eval(primerCache[0]!, primerCache[1]!)
+    let primedState = primerCache.state
+
+    let verifyInput = MLXRandom.normal([1, 3, 8])
+    eval(verifyInput)
+    let committed = 1
+
+    // Branch A: verification forward over all 3 new tokens with a capture
+    // sink, then reconstruct the cache after only `committed` of them using
+    // exactly the formulas `Qwen4ExpStreamingDecoder.rollbackVerification`
+    // applies.
+    let verifyCache = MambaCache()
+    verifyCache.state = primedState
+    let capture = Qwen4ExpVerificationCapture()
+    let sink = Qwen4ExpVerificationSink(layerIndex: 0, capture: capture)
+    _ = gdn(verifyInput, cache: verifyCache, verificationSink: sink)
+    for (slot, entry) in capture.entries[0] ?? [:] {
+        switch entry {
+        case .window(let source, let length):
+            verifyCache[slot] = contiguous(
+                source[0..., committed ..< (committed + length)])
+        case .stateAtIndex(let source):
+            verifyCache[slot] = contiguous(source[0..., committed - 1])
+        }
+    }
+    eval(verifyCache[0]!, verifyCache[1]!)
+
+    // Branch B (ground truth): forward only the accepted prefix directly
+    // from the same primed state.
+    let directCache = MambaCache()
+    directCache.state = primedState
+    _ = gdn(verifyInput[0..., 0 ..< committed, 0...], cache: directCache)
+    eval(directCache[0]!, directCache[1]!)
+
+    let convDiff = MLX.abs(verifyCache[0]! - directCache[0]!).max().item(Float.self)
+    let stateDiff = MLX.abs(verifyCache[1]! - directCache[1]!).max().item(Float.self)
+    #expect(convDiff < 1e-5, "fenêtre conv1d reconstruite : écart \(convDiff)")
+    #expect(stateDiff < 1e-5, "état récurrent reconstruit : écart \(stateDiff)")
+}
+
+@Test("PM4.2 : la reconstruction du cache PLE par capture égale un forward direct sur le préfixe accepté")
+func qwen4ExpPLEVerificationCaptureRollbackMatchesDirectForward() {
+    MLXRandom.seed(4_020_3)
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 1,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 5,
+      "split_ngram_parts": 2, "heads_per_ngram": 2, "ple_embed_dim": 8,
+      "make_ngram_vocab_size_divisible_by": 4, "eos_token_id": 0,
+      "ple_layer_ids": [2], "ple_conv_kernel_size": 4,
+      "vocab_size": 16, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+    let ple = Qwen4ExpPLELayer(configuration: configuration, layerIndex: 1, pleLayerIndex: 0)
+
+    // Prime the cache with two "already committed" tokens (both the short
+    // conv window, slot 2, and the raw-ID n-gram history, slot 3, are
+    // non-trivial). Written directly into slots 2/3 — unlike GDN's
+    // `MambaCache` (slots 0/1 fully populated), a PLE-only cache leaves
+    // slots 0/1 empty, so `ArraysCache.state`'s array-compaction getter/
+    // setter would silently misplace these values onto the wrong slots.
+    let primerCache = ArraysCache(size: 4)
+    _ = ple(
+        hiddenStates: MLXRandom.normal([1, 2, 32]),
+        inputIDs: MLXArray([Int32(1), 2]).reshaped([1, 2]), cache: primerCache)
+    eval(primerCache[2]!, primerCache[3]!)
+
+    let verifyHidden = MLXRandom.normal([1, 3, 32])
+    let verifyIDs = MLXArray([Int32(3), 4, 5]).reshaped([1, 3])
+    eval(verifyHidden)
+    let committed = 1
+
+    let verifyCache = ArraysCache(size: 4)
+    verifyCache[2] = primerCache[2]
+    verifyCache[3] = primerCache[3]
+    let capture = Qwen4ExpVerificationCapture()
+    let sink = Qwen4ExpVerificationSink(layerIndex: 0, capture: capture)
+    _ = ple(
+        hiddenStates: verifyHidden, inputIDs: verifyIDs, cache: verifyCache,
+        verificationSink: sink)
+    for (slot, entry) in capture.entries[0] ?? [:] {
+        switch entry {
+        case .window(let source, let length):
+            verifyCache[slot] = contiguous(
+                source[0..., committed ..< (committed + length)])
+        case .stateAtIndex:
+            Issue.record("PLE ne doit produire que des entrées .window (pas de récurrence)")
+        }
+    }
+    eval(verifyCache[2]!, verifyCache[3]!)
+
+    let directCache = ArraysCache(size: 4)
+    directCache[2] = primerCache[2]
+    directCache[3] = primerCache[3]
+    _ = ple(
+        hiddenStates: verifyHidden[0..., 0 ..< committed, 0...],
+        inputIDs: verifyIDs[0..., 0 ..< committed], cache: directCache)
+    eval(directCache[2]!, directCache[3]!)
+
+    let convDiff = MLX.abs(verifyCache[2]! - directCache[2]!).max().item(Float.self)
+    #expect(convDiff < 1e-5, "fenêtre short-conv reconstruite : écart \(convDiff)")
+    #expect(
+        verifyCache[3]!.asArray(Int32.self) == directCache[3]!.asArray(Int32.self),
+        "fenêtre d'historique n-gram reconstruite diffère du forward direct")
 }
 
 @Test("QSA retombe sur le masque causal avant le budget puis sélectionne les blocs")

@@ -609,7 +609,10 @@ public final class Qwen4ExpNGramEmbedding: Module {
         super.init()
     }
 
-    public func callAsFunction(_ inputIDs: MLXArray, cache: ArraysCache? = nil) -> MLXArray {
+    public func callAsFunction(
+        _ inputIDs: MLXArray, cache: ArraysCache? = nil,
+        verificationSink: Qwen4ExpVerificationSink? = nil
+    ) -> MLXArray {
         precondition(inputIDs.ndim == 2)
         let input = inputIDs.asType(.int64)
         let batch = input.dim(0)
@@ -625,6 +628,12 @@ public final class Qwen4ExpNGramEmbedding: Module {
         if let cache {
             cache[3] = contiguous(history[.ellipsis, (-contextLength)...])
         }
+        // PM4.2: `history` is a pure concatenation of the old ID window and
+        // the new tokens — no recurrence beyond that — so any prefix window
+        // can be read back after the walk decides how many new tokens were
+        // committed. See `Qwen4ExpVerificationCapture`.
+        verificationSink?.record(
+            slot: 3, entry: .window(source: history, length: contextLength))
 
         var shifted: [MLXArray] = []
         for shift in 0 ..< ngramSize {
@@ -836,11 +845,12 @@ public final class Qwen4ExpPLELayer: Module {
         hiddenStates: MLXArray,
         inputIDs: MLXArray,
         cache: ArraysCache? = nil,
-        mask: MLXArray? = nil
+        mask: MLXArray? = nil,
+        verificationSink: Qwen4ExpVerificationSink? = nil
     ) -> MLXArray {
         let batch = hiddenStates.dim(0)
         let sequence = hiddenStates.dim(1)
-        let embeddings = pleEmbedding(inputIDs, cache: cache)
+        let embeddings = pleEmbedding(inputIDs, cache: cache, verificationSink: verificationSink)
         let keys = normKey(keyProj(embeddings)).reshaped(
             [batch, sequence, streamCount, hiddenSize])
         let values = valueProj(embeddings)
@@ -862,6 +872,13 @@ public final class Qwen4ExpPLELayer: Module {
         if let cache {
             cache[2] = contiguous(
                 convInput[0..., (-shortConvStateLength)..., 0...])
+        }
+        if shortConvStateLength > 0 {
+            // PM4.2: same reasoning as the ID history above — `convInput` is
+            // a plain concatenation, any prefix window is a valid rollback
+            // target.
+            verificationSink?.record(
+                slot: 2, entry: .window(source: convInput, length: shortConvStateLength))
         }
         return gated + silu(conv1d(convInput))
     }

@@ -56,6 +56,13 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         visionEmbeddings: MLXArray? = nil,
         imageTokenID: Int32? = nil,
         materializeLayers: Bool = true,
+        // PM4.2 (P-MTP suite): pass a fresh `Qwen4ExpVerificationCapture()`
+        // to make this an MTP verification forward. Every GDN/PLE layer
+        // records into it the materials `rollbackVerification` needs to
+        // undo a partially rejected draft block without replaying this
+        // forward. `nil` (every other caller) is the original path,
+        // unchanged.
+        verificationCapture: Qwen4ExpVerificationCapture? = nil,
         onLayerVisited: (@Sendable (Int) -> Void)? = nil
     ) throws -> (
         logits: MLXArray,
@@ -85,6 +92,7 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             layerIndices: selectedLayers,
             positionIDs: positions,
             materializeLayers: materializeLayers,
+            verificationCapture: verificationCapture,
             onLayerVisited: onLayerVisited)
         let reduced = global.reduceHyperStreams(result.output)
         let output = global.logits(from: reduced)
@@ -118,5 +126,27 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
     public func restore(_ snapshot: Qwen4ExpStreamingTextModelSnapshot) {
         decoder.restore(snapshot.decoder)
         logicalOffset = snapshot.logicalOffset
+    }
+
+    /// PM4.2 (P-MTP suite): undo the rejected tail of the last verification
+    /// forward without replaying it. `capture` must be the object passed to
+    /// that forward's `verificationCapture:`; `totalNewTokens` is the number
+    /// of new positions it fed (`inputIDs.dim(1)` of that call);
+    /// `committedNewTokens` (>= 1, the bonus token is always kept) is how
+    /// many of those the speculative walk actually accepted. Adjusts every
+    /// GDN/PLE/QSA cache (`Qwen4ExpStreamingDecoder.rollbackVerification`)
+    /// and rewinds the M-RoPE clock (`logicalOffset`) by the same rejected
+    /// count so the next round's positions stay correct. A no-op when
+    /// nothing was rejected.
+    public func rollbackVerification(
+        capture: Qwen4ExpVerificationCapture,
+        committedNewTokens: Int,
+        totalNewTokens: Int
+    ) {
+        decoder.rollbackVerification(
+            capture: capture,
+            committedNewTokens: committedNewTokens,
+            totalNewTokens: totalNewTokens)
+        logicalOffset -= (totalNewTokens - committedNewTokens)
     }
 }

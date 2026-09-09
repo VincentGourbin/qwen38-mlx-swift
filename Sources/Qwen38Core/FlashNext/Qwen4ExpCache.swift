@@ -138,10 +138,20 @@ public final class Qwen4ExpQSAKVCache: KVCache, @unchecked Sendable {
     public func trim(_ n: Int) -> Int {
         let trimmed = mainCache.trim(n)
         offset = mainCache.offset
+        // PM4.2 (P-MTP suite) bug fix: `trim` removes the `n` most recently
+        // appended positions (matching `mainCache.trim`, which just shrinks
+        // `offset` — the newest K/V rows fall out of the visible range).
+        // The indexer side-channel must drop the same *tail*, not the head:
+        // the previous `[indexerTrimmed...]` kept the newest rows and
+        // dropped the oldest ones, silently reordering the indexer's
+        // timeline on every rollback. No prior caller exercised a nonzero
+        // rollback against nonzero indexer state, so this went unnoticed —
+        // see `qwen4ExpQSAKVCacheTracksIndexerState` (only checked counts).
         let indexerTrimmed = min(trimmed, indexerTokenCount)
         if indexerTrimmed > 0 {
-            indexerKeys = indexerKeys?[.ellipsis, indexerTrimmed..., 0...]
-            indexerPositions = indexerPositions?[.ellipsis, indexerTrimmed...]
+            let keep = indexerTokenCount - indexerTrimmed
+            indexerKeys = indexerKeys?[.ellipsis, ..<keep, 0...]
+            indexerPositions = indexerPositions?[.ellipsis, ..<keep]
         }
         return trimmed
     }

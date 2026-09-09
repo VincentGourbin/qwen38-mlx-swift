@@ -116,6 +116,11 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         layerIndices: [Int],
         positionIDs: MLXArray? = nil,
         materializeLayers: Bool = true,
+        // PM4.2 (P-MTP suite): non-nil only for an MTP verification forward.
+        // Every GDN/PLE layer visited records into it the materials needed
+        // to roll its `ArraysCache` back to any prefix of the newly fed
+        // tokens — see `rollbackVerification` and `Qwen4ExpVerificationCapture`.
+        verificationCapture: Qwen4ExpVerificationCapture? = nil,
         onLayerVisited: (@Sendable (Int) -> Void)? = nil
     ) throws -> (output: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
         precondition(hiddenStates.ndim == 3)
@@ -202,13 +207,17 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     keyLength: cache.offset + inputIDs.dim(1), offset: cache.offset)
             }
 
+            let verificationSink = verificationCapture.map {
+                Qwen4ExpVerificationSink(layerIndex: layerIndex, capture: $0)
+            }
             let forwardStart = ContinuousClock.now
             let output = loaded.layer(
                 hidden,
                 inputIDs: inputIDs,
             mask: attentionMask,
             cache: cache,
-            positionIDs: positionIDs)
+            positionIDs: positionIDs,
+            verificationSink: verificationSink)
             if profileLayers, let currentNGramStats = loaded.layer.ngramCacheStats() {
                 observeNGramCache(layerIndex: layerIndex, current: currentNGramStats)
             }
@@ -281,6 +290,52 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     public func restore(_ snapshot: Qwen4ExpStreamingDecoderSnapshot) {
         caches = snapshot.caches.mapValues { $0.copy() }
         Memory.clearCache()
+    }
+
+    /// PM4.2 (P-MTP suite): roll every cache touched by the last
+    /// verification forward back to the state after exactly
+    /// `committedNewTokens` of the `totalNewTokens` tokens that forward fed,
+    /// without replaying any forward pass.
+    ///
+    /// - GDN/PLE (`ArraysCache`): reconstructed from `capture.entries`, a
+    ///   cheap host-side slice of tensors the verification forward already
+    ///   materialized (see `Qwen4ExpVerificationCapture`).
+    /// - QSA (`Qwen4ExpQSAKVCache`): `trim(rejected)` — its backing arrays
+    ///   only ever grow and the visible length is tracked by `offset`, so no
+    ///   capture is needed.
+    /// A no-op when nothing was rejected.
+    public func rollbackVerification(
+        capture: Qwen4ExpVerificationCapture,
+        committedNewTokens: Int,
+        totalNewTokens: Int
+    ) {
+        let rejected = totalNewTokens - committedNewTokens
+        guard rejected > 0 else { return }
+        precondition(committedNewTokens >= 1, "Le token bonus doit toujours être conservé")
+
+        for (layerIndex, slots) in capture.entries {
+            guard let arrayCache = caches[layerIndex] as? ArraysCache else { continue }
+            for (slot, entry) in slots {
+                switch entry {
+                case .window(let source, let length):
+                    // Only axis 1 (the token axis) is indexed explicitly;
+                    // trailing feature axes (present for GDN/PLE-conv
+                    // sources, absent for PLE's 2-D raw-ID history) are
+                    // implicitly kept in full, matching the `q[0..., t]`
+                    // convention used throughout the ops fallback this
+                    // mirrors.
+                    arrayCache[slot] = contiguous(
+                        source[0..., committedNewTokens ..< (committedNewTokens + length)])
+                case .stateAtIndex(let source):
+                    arrayCache[slot] = contiguous(source[0..., committedNewTokens - 1])
+                }
+            }
+        }
+        for cache in caches.values {
+            if let qsaCache = cache as? Qwen4ExpQSAKVCache {
+                qsaCache.trim(rejected)
+            }
+        }
     }
 
     /// Release the optional resident decoder weights while keeping the decoder

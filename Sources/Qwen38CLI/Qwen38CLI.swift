@@ -695,7 +695,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             }
             let timings = result.stepTimings
             print(
-                "MTP step timings (ContinuousClock, cumulé) : draftBlock \(String(format: "%.3fs", timings.draftBlock)) · snapshot \(String(format: "%.3fs", timings.snapshot)) · verify \(String(format: "%.3fs", timings.verifyForward)) · targetIDs \(String(format: "%.3fs", timings.targetIDs)) · restore+replay \(String(format: "%.3fs", timings.restoreAndReplay)) · commit \(String(format: "%.3fs", timings.commit)) · total \(String(format: "%.3fs", timings.total))"
+                "MTP step timings (ContinuousClock, cumulé) : draftBlock \(String(format: "%.3fs", timings.draftBlock)) · verify \(String(format: "%.3fs", timings.verifyForward)) · targetIDs \(String(format: "%.3fs", timings.targetIDs)) · rollback \(String(format: "%.3fs", timings.rollback)) · commit \(String(format: "%.3fs", timings.commit)) · total \(String(format: "%.3fs", timings.total))"
             )
             if let profileSession {
                 profileSession.metadata["mtp"] = "true"
@@ -710,10 +710,9 @@ struct FlashGenerateProbe: AsyncParsableCommand {
                 profileSession.metadata["layer_load_seconds"] = String(format: "%.6f", result.layerLoadTime)
                 profileSession.metadata["layer_forward_seconds"] = String(format: "%.6f", result.layerForwardTime)
                 profileSession.metadata["mtp_step_draft_block_seconds"] = String(format: "%.6f", timings.draftBlock)
-                profileSession.metadata["mtp_step_snapshot_seconds"] = String(format: "%.6f", timings.snapshot)
                 profileSession.metadata["mtp_step_verify_seconds"] = String(format: "%.6f", timings.verifyForward)
                 profileSession.metadata["mtp_step_target_ids_seconds"] = String(format: "%.6f", timings.targetIDs)
-                profileSession.metadata["mtp_step_restore_replay_seconds"] = String(format: "%.6f", timings.restoreAndReplay)
+                profileSession.metadata["mtp_step_rollback_seconds"] = String(format: "%.6f", timings.rollback)
                 profileSession.metadata["mtp_step_commit_seconds"] = String(format: "%.6f", timings.commit)
                 profileSession.metadata["mtp_step_total_seconds"] = String(format: "%.6f", timings.total)
             }

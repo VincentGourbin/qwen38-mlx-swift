@@ -89,7 +89,15 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     public func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: ArraysCache? = nil
+        cache: ArraysCache? = nil,
+        // PM4.1/PM4.2 (P-MTP suite): non-nil only for the MTP verification
+        // forward. When set, the recurrence keeps every per-token state
+        // (`gatedDeltaUpdateWithStates`) and records the conv1d window and
+        // the state stack so a later partial rejection can roll `cache`
+        // back to any prefix without replaying this forward. `nil` (every
+        // other caller: prefill, greedy decode, drafting) is the original,
+        // unmodified path.
+        verificationSink: Qwen4ExpVerificationSink? = nil
     ) -> MLXArray {
         precondition(inputs.ndim == 3)
         let batch = inputs.dim(0)
@@ -155,10 +163,33 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         // is especially visible when a recurrent cache is already warm.
         let kNormed = k * MLX.rsqrt((k * k).sum(axis: -1, keepDims: true) + 1e-6)
 
-        let (out, state) = gatedDeltaUpdate(
-            q: qNormed, k: kNormed, v: v, a: a, b: b,
-            aLog: aLog, dtBias: dtBias,
-            state: cache?[1], mask: mask)
+        let out: MLXArray
+        let state: MLXArray
+        if let verificationSink {
+            // PM4.1: keep every per-token state so a rejection can roll this
+            // cache back to any prefix of the T new tokens without a replay
+            // forward. `states[:, T-1]` is exactly the final state
+            // `gatedDeltaUpdate` would have produced, so the full-accept
+            // path (no rollback) is bit-identical to before.
+            let (y, states) = gatedDeltaUpdateWithStates(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias,
+                state: cache?[1], mask: mask)
+            out = y
+            state = states[0..., -1]
+            verificationSink.record(
+                slot: 1, entry: .stateAtIndex(source: states))
+            if convKernelSize > 1 {
+                verificationSink.record(
+                    slot: 0,
+                    entry: .window(source: convInput, length: convKernelSize - 1))
+            }
+        } else {
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias,
+                state: cache?[1], mask: mask)
+        }
         if captureParity {
             lastParityCapture = [
                 "q_normed": qNormed, "k_normed": kNormed,

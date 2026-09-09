@@ -74,7 +74,11 @@ public final class Qwen4ExpDecoderLayer: Module {
         inputIDs: MLXArray,
         mask: MLXArray? = nil,
         cache: (any KVCache)? = nil,
-        positionIDs: MLXArray? = nil
+        positionIDs: MLXArray? = nil,
+        // PM4.2 (P-MTP suite): non-nil only during an MTP verification
+        // forward; forwarded to the GDN/PLE branches so they can record the
+        // materials needed for a replay-free rollback.
+        verificationSink: Qwen4ExpVerificationSink? = nil
     ) -> MLXArray {
         precondition(hiddenStates.ndim == 3)
         precondition(hiddenStates.dim(-1) == attnHyperConnection.streamCount *
@@ -86,7 +90,8 @@ public final class Qwen4ExpDecoderLayer: Module {
                 preconditionFailure("La PLE Flash-Next exige un ArraysCache")
             }
             state = state + ple(
-                hiddenStates: state, inputIDs: inputIDs, cache: arrayCache, mask: mask)
+                hiddenStates: state, inputIDs: inputIDs, cache: arrayCache, mask: mask,
+                verificationSink: verificationSink)
         }
 
         let attentionMix = attnHyperConnection(state)
@@ -95,7 +100,9 @@ public final class Qwen4ExpDecoderLayer: Module {
             guard let linearAttn, let arrayCache = cache as? ArraysCache else {
                 preconditionFailure("Une couche linear_attention exige un ArraysCache")
             }
-            attentionBranch = linearAttn(attentionMix.mixedInput, mask: mask, cache: arrayCache)
+            attentionBranch = linearAttn(
+                attentionMix.mixedInput, mask: mask, cache: arrayCache,
+                verificationSink: verificationSink)
         } else {
             guard let selfAttn, let qsaCache = cache as? Qwen4ExpQSAKVCache else {
                 preconditionFailure("Une couche full_attention exige un cache QSA")
