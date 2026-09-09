@@ -276,7 +276,13 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         // continuation isn't wired into the drafter (see its doc comment).
         let requestedMTP = options.mtp.enabled
         let hasImage = built.visionEmbeddings != nil
-        if requestedMTP && !hasImage {
+        // The local MTP path is greedy-only: honour it only when the caller
+        // asked for greedy decoding (same rule as the 27B path, where MTP
+        // requires `temperature == 0`). The server defaults `mtp` to true
+        // when the field is omitted, so without this guard a sampled request
+        // (temperature 0.7, presets) would silently become greedy.
+        let isGreedy = options.temperature <= 0
+        if requestedMTP && !hasImage && isGreedy {
             return runMTPGenerationStream(
                 built: built, options: options, continueConversation: continueConversation,
                 inputDescription: inputDescription, currentTurnIndex: currentTurnIndex,
@@ -286,6 +292,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             FileHandle.standardError.write(
                 Data(
                     "qwen38: Flash-Next ignore options.mtp pour ce tour (image présente, MTP local texte seul)\n"
+                        .utf8))
+        } else if requestedMTP && !isGreedy {
+            FileHandle.standardError.write(
+                Data(
+                    "qwen38: Flash-Next ignore options.mtp pour ce tour (échantillonnage demandé, MTP local greedy seul)\n"
                         .utf8))
         }
 
@@ -325,11 +336,18 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 generationTime: summary.decodeTime,
                                 promptTokens: summary.promptTokenCount,
                                 generatedTokens: summary.tokenIDs.count)
-                            let mtpStatus = (requestedMTP && hasImage)
-                                ? Qwen38MTPRunStatus(
+                            let mtpStatus: Qwen38MTPRunStatus
+                            if requestedMTP && hasImage {
+                                mtpStatus = Qwen38MTPRunStatus(
                                     availability: .fallback("MTP Flash-Next : texte seul"),
                                     engine: options.mtp.engine)
-                                : Qwen38MTPRunStatus(availability: .unavailable)
+                            } else if requestedMTP && !isGreedy {
+                                mtpStatus = Qwen38MTPRunStatus(
+                                    availability: .fallback("MTP Flash-Next : greedy seul (température > 0)"),
+                                    engine: options.mtp.engine)
+                            } else {
+                                mtpStatus = Qwen38MTPRunStatus(availability: .unavailable)
+                            }
                             continuation.yield(
                                 .metrics(
                                     Qwen38RunMetrics(
