@@ -3707,3 +3707,20 @@ commandes prêtes (`--fusion-level` câblé jusqu'à `flash-chat-probe`) pour la
 prochaine session avec la machine libre. Détail complet, tableau de mesures
 et écarts assumés : `docs/knowledge/log.md`, « 2026-09-09 — P2-fusion :
 leviers F1-F7 ».
+
+### P-MTP (suite) — PM4 : vérification sans rejeu — 2026-09-09
+
+État : normes de la tête MTP corrigées (loader + suffixes `pre_fc_norm_*`,
+audit HF tenseur par tenseur, `log.md` « P-MTP (suite) ») → acceptation
+24 % → **47,6 %** en bloc 2 sur le 3-bit, IDs identiques au greedy. Le MTP
+reste 20 % plus lent que le greedy parce que chaque rejet rejoue un forward
+sur le préfixe accepté (`Qwen4ExpFlashMTPGenerator.swift:249-254`). La mesure
+d'acceptation sur le 4-bit a été tuée par la mémoire (23 Go d'apps) : à
+refaire sur machine propre, elle dit si le 3-bit limite le drafter.
+
+| # | Tâche | Critère |
+|---|---|---|
+| PM4.1 | États GDN par token : variante `gatedDeltaUpdateWithStates` qui rend, en plus de la sortie, l'état récurrent **après chaque token** (`[B, T, Hv, Dv, Dk]` float32). Deux implémentations : (a) boucle ops (copie de `gatedDeltaOps` upstream, dans notre code, T ≤ 4) ; (b) extension du kernel Metal upstream (buffer de sortie optionnel) si (a) coûte > 1 ms par couche GDN sur le bench. Utilisée uniquement par le forward de vérification MTP. | test : états intermédiaires = états obtenus par T forwards à un token (1e-5) |
+| PM4.2 | Rollback sans rejeu : pendant la vérification, chaque couche conserve ses états par token ; sur rejet à la position k, `MambaCache` reprend l'état après k tokens acceptés et `Qwen4ExpQSAKVCache.trim(rejetés)` tronque K/V + clés indexeur + positions (vérifier que `trim` couvre bien les trois, `Qwen4ExpCache.swift:138`). Plus de `model.restore` + `model.forward` de rejeu ; `snapshot` devient inutile. Le prédicteur MTP (1 couche QSA) subit le même `trim`. Cache n-gram/PLE : vérifier qu'il n'a pas d'état séquentiel à rembobiner (contexte n-gram = fenêtre sur les IDs → recalculé à partir des IDs acceptés). | IDs identiques au greedy sur 32 tokens, blocs 2/3/4 ; `stats.replayedTokens == 0` |
+| PM4.3 | Mesure 3-bit, 32 et 128 tokens : decode MTP bloc 2/3 vs greedy ; cible : **MTP bloc 2 ≤ 0,8 × greedy** à 48 % d'acceptation. Si atteint : brancher (PM3 : `Qwen38FlashNextEngine`, `mtpState = .active`, streaming des tokens acceptés, GUI/serveur honorent le toggle), défaut **off** tant que Vincent n'a pas validé en GUI. | tableau `log.md`, ligne `BENCHMARKS.md` |
+| PM4.4 | Sur machine propre (Vincent) : acceptation bloc 2 sur le 4-bit. | chiffre dans `log.md` |
