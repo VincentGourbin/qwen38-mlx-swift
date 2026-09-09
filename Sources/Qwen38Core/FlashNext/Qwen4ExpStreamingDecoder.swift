@@ -60,7 +60,30 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// layer and GPU busy 82 % (ioreg) instead of ~0 %. Off by default until
     /// P1 has measured it on the real checkpoint; `residentEvaluationInterval`
     /// keeps its meaning (blocking `eval` checkpoints) when this is false.
+    ///
+    /// P4.0 found that this flag, on its own, does nothing at the production
+    /// default `residentEvaluationInterval == 1`: `shouldEvaluate` reduces to
+    /// `(visitIndex + 1) % 1 == 0`, which is `true` for every integer, so the
+    /// blocking `eval` branch fired on *every* layer regardless of this flag
+    /// and the `asyncEval` branch below was dead code. `residentAsyncInterval`
+    /// (P4.1) is the real, separate knob for this flag's own frequency;
+    /// `residentEvaluationInterval` is untouched and stays at 1 everywhere in
+    /// production (piège 11 — it still governs the dangerous fully-deferred
+    /// path taken when this flag is `false`).
     public let residentAsyncEval: Bool
+    /// P4.1: when `residentAsyncEval` is `true`, the number of resident
+    /// layers between blocking `eval` checkpoints — intermediate layers get
+    /// `asyncEval` (dispatched to the GPU immediately, non-blocking) instead.
+    /// This is *not* the same mechanism as `residentEvaluationInterval`
+    /// batching without any eval/asyncEval at all (piège 11's 30-50×
+    /// regression, reconfirmed by P1 variant (iii)): every visited layer
+    /// still gets a real `eval`/`asyncEval` call here, just not always a
+    /// blocking one. The last layer of every visit is always blocking,
+    /// regardless of this value. Default 1 reproduces exactly the blocking-
+    /// every-layer behavior this flag had before P4.1 fixed the dead-code
+    /// bug above, so existing callers that never touch this parameter see no
+    /// behavior change.
+    public let residentAsyncInterval: Int
     /// P2-mem-a: read resident tensors with `pread` behind `fcntl(F_NOCACHE,
     /// 1)` (`Qwen4ExpUncachedTensorReader`) instead of `loadArraysAndMetadata`,
     /// so the 50-80 GB read from the Lexar during a resident load never fill
@@ -88,10 +111,12 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         residentEvaluationInterval: Int = 1,
         profileLayers: Bool = false,
         residentAsyncEval: Bool = false,
+        residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
         fusionLevel: Qwen4ExpFusionLevel = .none
     ) throws {
         precondition(residentEvaluationInterval > 0)
+        precondition(residentAsyncInterval > 0)
         self.directory = directory
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         self.configuration = configuration.textConfiguration
@@ -100,6 +125,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.residentEvaluationInterval = residentEvaluationInterval
         self.profileLayers = profileLayers
         self.residentAsyncEval = residentAsyncEval
+        self.residentAsyncInterval = residentAsyncInterval
         self.uncachedIO = uncachedIO
         self.fusionLevel = fusionLevel
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
@@ -225,10 +251,24 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             // module before that module is released. Resident mode keeps all
             // modules alive and checkpoints the lazy graph periodically. The
             // final layer is always materialized for a stable result.
-            let shouldEvaluate = synchronizeEachLayer ||
-                (layerLoadingMode == .resident &&
-                 ((visitIndex + 1) % residentEvaluationInterval == 0 ||
-                  visitIndex == layerIndices.count - 1))
+            let isLastVisitedLayer = visitIndex == layerIndices.count - 1
+            let shouldEvaluate: Bool
+            if synchronizeEachLayer {
+                shouldEvaluate = true
+            } else if layerLoadingMode == .resident, residentAsyncEval {
+                // P4.1: every visited layer gets a real eval/asyncEval call
+                // below (never a fully-deferred graph — piège 11), but only
+                // every `residentAsyncInterval` layers (and always the last
+                // one) blocks the host. `residentEvaluationInterval` is
+                // deliberately not consulted on this branch.
+                shouldEvaluate =
+                    isLastVisitedLayer || (visitIndex + 1) % residentAsyncInterval == 0
+            } else if layerLoadingMode == .resident {
+                shouldEvaluate =
+                    (visitIndex + 1) % residentEvaluationInterval == 0 || isLastVisitedLayer
+            } else {
+                shouldEvaluate = false
+            }
             if shouldEvaluate {
                 eval(output)
             } else if layerLoadingMode == .resident, residentAsyncEval {

@@ -537,6 +537,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     )
     var residentAsync = false
 
+    @Option(
+        name: .long,
+        help:
+            "P4.1 : avec --resident-async, nombre de couches entre deux `eval` bloquants (les couches intermédiaires reçoivent `asyncEval`) — défaut 1"
+    )
+    var residentAsyncInterval = 1
+
     @Flag(
         name: .long,
         help:
@@ -556,6 +563,9 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         }
         guard residentEvalInterval > 0 else {
             throw ValidationError("--resident-eval-interval doit être positif")
+        }
+        guard residentAsyncInterval > 0 else {
+            throw ValidationError("--resident-async-interval doit être positif")
         }
         if mtp && image != nil {
             throw ValidationError(
@@ -660,6 +670,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             residentEvaluationInterval: residentEvalInterval,
             profileLayers: profileLayers,
             residentAsyncEval: residentAsync,
+            residentAsyncInterval: residentAsyncInterval,
             uncachedIO: !cachedIO)
         profiler.end("Flash globals")
         let generator = Qwen4ExpGreedyGenerator(model: model)
@@ -1049,6 +1060,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var residentAsync = false
 
+    @Option(
+        name: .long,
+        help:
+            "P4.1 : avec --resident-async, nombre de couches entre deux `eval` bloquants (les couches intermédiaires reçoivent `asyncEval`) — défaut 1"
+    )
+    var residentAsyncInterval = 1
+
     @Flag(
         name: .long,
         help:
@@ -1069,6 +1087,9 @@ struct FlashChatProbe: AsyncParsableCommand {
         }
         guard residentEvalInterval > 0 else {
             throw ValidationError("--resident-eval-interval doit être positif")
+        }
+        guard residentAsyncInterval > 0 else {
+            throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
             throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
@@ -1126,6 +1147,7 @@ struct FlashChatProbe: AsyncParsableCommand {
             residentEvaluationInterval: residentEvalInterval,
             profileLayers: profileLayers,
             residentAsyncEval: residentAsync,
+            residentAsyncInterval: residentAsyncInterval,
             uncachedIO: !cachedIO,
             fusionLevel: resolvedFusionLevel)
         profiler.end("Flash globals")

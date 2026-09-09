@@ -31,6 +31,7 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         residentEvaluationInterval: Int = 1,
         profileLayers: Bool = false,
         residentAsyncEval: Bool = false,
+        residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
         fusionLevel: Qwen4ExpFusionLevel = .none
     ) throws {
@@ -44,6 +45,7 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             residentEvaluationInterval: residentEvaluationInterval,
             profileLayers: profileLayers,
             residentAsyncEval: residentAsyncEval,
+            residentAsyncInterval: residentAsyncInterval,
             uncachedIO: uncachedIO,
             fusionLevel: fusionLevel)
         self.configuration = decoder.configuration
