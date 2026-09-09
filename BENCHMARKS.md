@@ -51,6 +51,8 @@ serveur le gardent résident). Détails : `docs/knowledge/log.md` (P1, Q3.3, H6)
 | 2026-09-08 | Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP | 4-bit g32 | 113 Go | 90,9 s | 0,47 s/token (2,1 tok/s) | 75,2 Go | 10/28 · −4,38 | ne tient qu'avec ≤ ~8 Go d'autres apps ; `eval` par couche : 0,60 s/token ; un `eval` différé par token : 2,05 s/token |
 | 2026-09-08 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP (Q3.1) | **3-bit g64** | 84 Go | 60,2 s | **0,22 s/token (4,6 tok/s)** | **56,6 Go** | 10/28 · −4,80 | sortie greedy identique au 4-bit ; H6 8/8 PASS via le serveur (48 tokens ≈ 10 s, image 24 tokens 4,8 s après vision) |
 
+| 2026-09-09 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP — **GUI** (Xcode, Debug), thinking élevé, 2048 max | 3-bit g64 | 84 Go | 48,4 s | **5,4 tok/s** (1 072 tokens en 200 s) · prefill 24,7 tok/s, TTFT 2,39 s (59 tokens) | 52,9 Go | — | démo G-8 : premier tour GUI Flash-Next, MTP en fallback attendu |
+
 Bench synthétique d'une couche (`flash-layer-bench`, Release, poids aléatoires,
 sans checkpoint) : GDN+MoE 5,5 ms/pas, QSA+MoE 5,8 ms/pas en eager ; 4,5 ms
 avec `asyncEval` (GPU 82 % `ioreg`). Debug : 6,5 / 10,3 ms. Le profiler par
