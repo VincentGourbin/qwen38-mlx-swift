@@ -103,9 +103,23 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     /// real checkpoint, `asyncEval` per layer decoded 6 tokens in 2.33 s
     /// against 2.98 s with a blocking `eval` per layer (-22 %) and 10.25 s
     /// with a single deferred `eval` per token. Same peak memory (75.2 GB).
+    ///
+    /// P4.0/P4.1 (2026-09-09) found that P1's `residentAsyncEval` was, on
+    /// its own, a no-op in production: `residentEvaluationInterval == 1`
+    /// made `shouldEvaluate` unconditionally `true`
+    /// (`Qwen4ExpStreamingDecoder`), so every layer still took a blocking
+    /// `eval` regardless of this flag — Metal System Trace on the real
+    /// checkpoint measured only 14.2 % GPU-busy over the prefill+decode
+    /// window, far below the synthetic bench's 82-85 %. `residentAsyncInterval`
+    /// is the real, separate knob P4.1 added; sweeping N=1/2/4/8/12 on the
+    /// real 3-bit checkpoint (32 tokens, 2 runs each, IDs bit-identical to
+    /// greedy in all 10 runs) gave 0.164/0.150/0.144/0.141/0.140 s/token —
+    /// N=8 (-14.4 %) and N=12 (-14.6 %) are within noise of each other with
+    /// diminishing returns past 8, so N=8 (already the reference interval
+    /// used throughout `flash-layer-bench --async-interval`) is the default.
     public init(
         directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true,
-        uncachedIO: Bool = true
+        residentAsyncInterval: Int = 8, uncachedIO: Bool = true
     ) async throws {
         self.sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
@@ -120,6 +134,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         self.model = try Qwen4ExpStreamingTextModel(
             directory: directory, layerLoadingMode: .resident, residentEvaluationInterval: 1,
             profileLayers: profileLayers, residentAsyncEval: residentAsyncEval,
+            residentAsyncInterval: residentAsyncInterval,
             uncachedIO: uncachedIO)
         self.generator = Qwen4ExpStreamingGenerator(model: model)
         self.stopTokenIDs = [
