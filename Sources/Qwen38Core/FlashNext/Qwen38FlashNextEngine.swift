@@ -225,20 +225,26 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         let preset = Qwen4ExpSamplingPreset.custom(
             temperature: options.temperature, topP: options.topP, topK: options.topK)
         if options.mtp.enabled {
-            // P-MTP (2026-09-09, PM3): measured, not wired in. PM1 showed the
-            // decode budget is 97% verify+restore/replay forward compute, not
-            // host bookkeeping (PM2's targetIDs/greedyToken fixes moved <1%
-            // of the total). The 1-layer drafter's acceptance rate on this
-            // checkpoint/prompt (24% at block size 2, worse at 3/4) is too
-            // low for speculative decoding to pay off: a rejected round
-            // re-does almost as much target forward work as it saved, so
-            // decode is 1.5-2x SLOWER than greedy, not faster — see
-            // docs/knowledge/log.md 2026-09-09 "P-MTP". Log and ignore
-            // rather than fail the request (H3.2: "options.mtp ignoré, un
-            // log, pas d'erreur").
+            // P-MTP (2026-09-09, PM3) → P-MTP suite (2026-09-09, PM4):
+            // measured, still not wired in, but for a different and much
+            // smaller reason than PM3's. The Vontra-norm fix (loader +
+            // pre_fc_norm_*) raised block-2 acceptance from 24% to 47.6%,
+            // and PM4.1/PM4.2 removed the verify round's
+            // `model.snapshot()`/`restore()` + replay forward entirely
+            // (per-token GDN states + a capture-based cache rollback instead
+            // — `stats.replayedTokens` is now always 0). Net effect on the
+            // 3-bit checkpoint: block 2 went from ~1.19x SLOWER than greedy
+            // (PM3) to ~0.81-0.86x — genuinely *faster* than greedy at 32
+            // and 128 tokens, bit-identical token ids — but that stays just
+            // short of PLAN.md's ≤0.8x bar for auto-branching (PM4.3, table
+            // in docs/knowledge/log.md 2026-09-09 "P-MTP (suite) : PM4"),
+            // margin ~2-8% depending on run/context length. Blocks 3 and 4
+            // regress further (accept rate falls with block size). Log and
+            // ignore rather than fail the request (H3.2: "options.mtp
+            // ignoré, un log, pas d'erreur").
             FileHandle.standardError.write(
                 Data(
-                    "qwen38: Flash-Next ignore options.mtp (P-MTP mesuré non rentable, voir log.md 2026-09-09)\n"
+                    "qwen38: Flash-Next ignore options.mtp (P-MTP : sans rejeu mais encore ~0,8-0,86x greedy, sous le seuil ≤0,8x — voir log.md 2026-09-09 PM4)\n"
                         .utf8))
         }
 
@@ -304,7 +310,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                         inputDescription: inputDescription,
                                         mtpStatus: Qwen38MTPRunStatus(
                                             availability: .fallback(
-                                                "Flash-Next : MTP local en chantier P-MTP"))
+                                                "Flash-Next : MTP local mesuré ~0,8-0,86x greedy (PM4), sous le seuil ≤0,8x"))
                                     )))
                         }
                     }

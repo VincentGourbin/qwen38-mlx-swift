@@ -3724,3 +3724,20 @@ refaire sur machine propre, elle dit si le 3-bit limite le drafter.
 | PM4.2 | Rollback sans rejeu : pendant la vérification, chaque couche conserve ses états par token ; sur rejet à la position k, `MambaCache` reprend l'état après k tokens acceptés et `Qwen4ExpQSAKVCache.trim(rejetés)` tronque K/V + clés indexeur + positions (vérifier que `trim` couvre bien les trois, `Qwen4ExpCache.swift:138`). Plus de `model.restore` + `model.forward` de rejeu ; `snapshot` devient inutile. Le prédicteur MTP (1 couche QSA) subit le même `trim`. Cache n-gram/PLE : vérifier qu'il n'a pas d'état séquentiel à rembobiner (contexte n-gram = fenêtre sur les IDs → recalculé à partir des IDs acceptés). | IDs identiques au greedy sur 32 tokens, blocs 2/3/4 ; `stats.replayedTokens == 0` |
 | PM4.3 | Mesure 3-bit, 32 et 128 tokens : decode MTP bloc 2/3 vs greedy ; cible : **MTP bloc 2 ≤ 0,8 × greedy** à 48 % d'acceptation. Si atteint : brancher (PM3 : `Qwen38FlashNextEngine`, `mtpState = .active`, streaming des tokens acceptés, GUI/serveur honorent le toggle), défaut **off** tant que Vincent n'a pas validé en GUI. | tableau `log.md`, ligne `BENCHMARKS.md` |
 | PM4.4 | Sur machine propre (Vincent) : acceptation bloc 2 sur le 4-bit. | chiffre dans `log.md` |
+
+**Statut — 2026-09-09** : PM4.1 et PM4.2 faits et testés (77 tests verts) —
+plus aucun `model.snapshot()`/`restore()`/rejeu dans `generateMTP`,
+`stats.replayedTokens` reste à 0, confirmé sur les 12 runs PM4.3 sur le
+3-bit (32 et 128 tokens, blocs 2/3/4, IDs identiques au greedy partout).
+Correctif trouvé au passage : direction de `Qwen4ExpQSAKVCache.trim` sur
+les clés indexeur. **PM4.3 exécutée, cible non atteinte** : bloc 2 passe
+de ~1,19-1,6x plus lent que le greedy à **0,81-0,86x** (mesures répétées,
+32 et 128 tokens) — plus rapide que le greedy, mais au-dessus du seuil
+`≤ 0,8x` requis pour brancher automatiquement (marge 1-8 points selon le
+run/la longueur). Décision : MTP local **reste hors catalogue**
+(`Qwen38FlashNextEngine` ignore toujours `options.mtp`, message mis à
+jour) ; pas de ligne `BENCHMARKS.md` (non branché). Tableau complet et
+détail des écarts : `docs/knowledge/log.md`, « 2026-09-09 — PM4 :
+vérification MTP sans rejeu ». **PM4.4 non exécutée** (hors périmètre de
+cette session : mémoire insuffisante sur cette machine, run précédent
+tué).

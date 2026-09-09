@@ -2290,3 +2290,130 @@ upstream `gatedDeltaUpdate` ne rend que l'état final,
 `Vendor/…/GatedDelta.swift:285`) et en tronquant les caches QSA (`trim`).
 Reste à mesurer l'acceptation sur le 4-bit pour savoir si le 3-bit limite le
 drafter.
+
+## 2026-09-09 — PM4 : vérification MTP sans rejeu
+
+### PM4.1 — états GDN par token
+
+`gatedDeltaUpdateWithStates` (`Sources/Qwen38Core/FlashNext/Qwen4ExpGatedDeltaStates.swift`) :
+réimplémentation locale de la boucle ops de repli de `gatedDeltaUpdate`
+(Vendor/mlx-swift-lm — non modifié, copié plutôt qu'appelé : les symboles
+internes ne sont pas visibles hors du module `MLXLMCommon`), qui rend en
+plus de `y` l'état récurrent après **chaque** token vérifié
+(`[B,T,Hv,Dv,Dk]`). Test (T=3, Dk=32 pour forcer le chemin kernel côté
+référence) : états intermédiaires égaux à 3 forwards à un token (< 1e-5,
+float32), `y` égal au kernel upstream (< 1e-3). Utilisée uniquement quand
+le forward de vérification MTP la demande ; le chemin greedy garde
+`gatedDeltaUpdate` (kernel) inchangé.
+
+### PM4.2 — rollback sans rejeu
+
+`Qwen4ExpVerificationCapture`/`Qwen4ExpVerificationSink` (nouveau) :
+pendant un forward de vérification, chaque couche GDN/PLE enregistre les
+matériaux déjà matérialisés (fenêtre conv1d GDN, historique brut d'IDs
+PLE, short-conv PLE, pile d'états par token PM4.1) permettant de
+reconstruire son `ArraysCache` après *k* tokens acceptés — un simple
+slice host, jamais un forward. `Qwen4ExpStreamingDecoder.rollbackVerification`
+applique ces entrées puis `trim(rejetés)` sur les caches QSA ;
+`Qwen4ExpStreamingTextModel` expose la même méthode et corrige
+`logicalOffset`. `Qwen4ExpFlashMTPGenerator.generateMTP` n'appelle plus
+`model.snapshot()`/`restore()` : sur rejet partiel, le préfixe committé
+est tiré directement de `verification.preMixerHidden` (le modèle est
+causal — la ligne *i* ne dépend d'aucun token à une position > *i*, donc
+identique à ce qu'aurait rendu un forward plus court) et
+`rollbackVerification` remplace le rejeu. `stats.replayedTokens` reste à 0
+dans toutes les mesures ci-dessous ; `rollbacks` continue de compter les
+rejets.
+
+Correctif trouvé au passage : `Qwen4ExpQSAKVCache.trim` tronquait la
+**tête** (les clés indexeur les plus anciennes) au lieu de la **queue**
+(les plus récentes), à rebours de `mainCache.trim` qui ne fait que
+réduire `offset`. Resté invisible jusqu'ici : le seul test existant ne
+vérifiait que le compte après `trim`, pas les valeurs (toutes nulles dans
+sa fixture). Corrigé + test durci avec des valeurs distinctes par
+position.
+
+Cache PLE/n-gram audité : `cache[3]` (fenêtre d'IDs bruts, contexte
+n-gram) et `cache[2]` (short-conv) sont de pures concaténations sans
+récurrence propre au-delà de la concaténation elle-même — rembobinables
+par fenêtre exactement comme le conv1d GDN, câblés dans la capture au même
+titre (pas de justification à les laisser hors du mécanisme).
+
+Tests : 2 tests de reconstruction (GDN, PLE) comparant capture+rollback à
+un forward direct sur le préfixe accepté (< 1e-5), 1 test PM4.1, durcissement
+du test QSA. 77 tests verts (`Scripts/run-tests.sh`), `Scripts/build-release.sh`
+vert.
+
+### PM4.3 — mesure sur le 3-bit
+
+Protocole : préflight (`QWEN38_PREFLIGHT_LIMIT_GB=35 Scripts/preflight-resident.sh
+/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`) → 23,1 Go à
+évincer, PASS. Chaque run sous `caffeinate -dimsu`, Release,
+`--resident-layers --resident-async`, prompt de référence. **IDs identiques
+au greedy dans les 12 runs** (32 et 128 tokens, blocs 2/3/4, comparaison
+égalité stricte à la référence `[2229, 85648, …, 175030]` pour 32 tokens et
+à son extension à 128).
+
+Chaque variante a été relancée plusieurs fois : le tout premier run d'une
+famille de commandes après le build est systématiquement plus lent que les
+suivants (cache disque/Metal encore froid pour cette forme de graphe —
+même effet que documenté le 2026-09-09 pour le greedy seul), donc la
+colonne « decode » ci-dessous moyenne les runs *hors ce premier essai* ;
+le nombre de runs par variante est indiqué.
+
+| Variante | tokens | decode (moyenne, n runs) | s/token | acceptés/proposés | rounds | rejoués | rollbacks | ratio vs greedy | IDs = greedy |
+|---|---|---|---|---|---|---|---|---|---|
+| Greedy | 32 | 5,309s (n=4/5) | 0,166 | — | — | — | — | 1,00 | réf. |
+| Greedy | 128 | 21,161s (n=2/3) | 0,165 | — | — | — | — | 1,00 | réf. |
+| MTP bloc 2 | 32 | 4,313s (n=3/4) | 0,135 | 10/21 (47,6 %) | 21 | **0** | 11 | **0,81** | oui |
+| MTP bloc 3 | 32 | 5,175s (n=1) | 0,162 | 11/39 (28,2 %) | 20 | **0** | 18 | 0,97 | oui |
+| MTP bloc 4 | 32 | 5,847s (n=1) | 0,183 | 11/57 (19,3 %) | 20 | **0** | 20 | 1,10 | oui |
+| MTP bloc 2 | 128 | 18,129s (n=2/3) | 0,142 | 35/92 (38,0 %) | 92 | **0** | 57 | **0,86** | oui |
+| MTP bloc 3 | 128 | 21,187s (n=1) | 0,166 | 40/174 (23,0 %) | 87 | **0** | 81 | 1,00 | oui |
+| MTP bloc 4 | 128 | 24,906s (n=1) | 0,195 | 40/262 (15,3 %) | 88 | **0** | 86 | 1,18 | oui |
+
+`replayedTokens == 0` sur les 8 variantes MTP : la garantie « sans rejeu »
+de PM4.2 est confirmée en conditions réelles, pas seulement par les tests
+unitaires.
+
+**Décision — cible non atteinte** : le bloc 2 passe de ~1,19-1,6x plus
+lent que le greedy (PM3, avant PM4) à **0,81-0,86x** (plus rapide que le
+greedy, aux deux longueurs testées) grâce à PM4.1/PM4.2, mais reste
+au-dessus du seuil `≤ 0,8x` fixé par le plan pour brancher automatiquement
+le MTP en production — écart de 1 à 8 points selon le run/la longueur
+(mesure bruitée : sur les runs bruts sans exclure le premier essai de
+chaque famille, le ratio à 32 tokens descend même à 0,77, mais à 128
+tokens reste à 0,85 — le seuil n'est donc pas franchi de façon robuste
+dans un sens comme dans l'autre). Root cause inchangée depuis PM3 : le
+verify forward reste le plein coût, et à 38-48 % d'acceptation un rejet
+sur deux calcule presque un tour complet en pure perte ; PM4 a supprimé le
+*second* forward (le rejeu) mais pas ce premier coût structurel. Blocs 3 et
+4 confirment la tendance déjà connue (l'acceptation chute avec la taille
+du bloc — 47,6 % → 28,2 % → 19,3 % à 32 tokens — jusqu'à repasser
+au-dessus de 1,0x).
+
+**Décision de production (conforme à la consigne « si non atteint,
+documente et laisse hors catalogue »)** : le MTP local Flash-Next reste
+**hors catalogue** — `Qwen38FlashNextEngine.runGenerationStream` continue
+d'ignorer `options.mtp.enabled` (log + `Qwen38MTPRunStatus.fallback`,
+messages mis à jour pour référencer ce résultat au lieu de la conclusion
+PM3), le toggle GUI reste désactivé, le serveur continue d'ignorer `"mtp":
+true` sans erreur (H3.2 inchangé). Rouvrir ce chantier n'a de sens que si
+un futur levier réduit encore le coût du verify forward lui-même (P2-fusion
+n'a démontré aucun gain mesurable à ce jour, voir l'entrée du même jour)
+ou si un drafter plus profond améliore sensiblement le taux d'acceptation
+au-delà de ~50 %.
+
+### Écarts à la consigne PM4
+
+1. Mesures 128 tokens en blocs 3/4 et blocs 3/4 à 32 tokens : **un seul run
+   chacun** (pas de répétitions stables comme pour le bloc 2/greedy) — la
+   décision ne dépend que du bloc 2 (le meilleur des trois, cf. tableau),
+   les runs 3/4 servent uniquement à documenter la tendance déjà établie ;
+   des runs supplémentaires n'auraient pas changé la conclusion (ils sont
+   déjà loin du seuil, au-dessus de 0,97x).
+2. PM4.4 (acceptation 4-bit sur machine propre) explicitement hors
+   périmètre de cette session (mémoire insuffisante, run précédent tué) —
+   non exécutée, conformément à la consigne reçue.
+3. Pas de ligne `BENCHMARKS.md` : la consigne ne le demande que si le MTP
+   est branché en production, ce qui n'est pas le cas ici.
