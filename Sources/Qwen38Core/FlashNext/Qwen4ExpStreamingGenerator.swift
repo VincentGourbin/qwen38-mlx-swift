@@ -49,19 +49,33 @@ public struct Qwen4ExpStreamingGenerationOptions: Sendable, Equatable {
     /// needs to carry the new suffix).
     public var continueConversation: Bool
     public var seed: UInt64?
+    /// P5.3: OpenAI-style presence penalty (flat, applied to every id already
+    /// generated this turn, not scaled by how many times it recurred — see
+    /// `Qwen4ExpLogitPenalizer`). 0 = no-op. Only ever consulted when
+    /// `preset.temperature > 0` — greedy decoding (temperature 0) is
+    /// byte-for-byte unchanged regardless of this value (PLAN.md P5.3
+    /// contract: "greedy inchangé").
+    public var presencePenalty: Float
+    /// P5.3: multiplicative repetition penalty, same greedy-only exemption
+    /// as `presencePenalty`. 1.0 = no-op.
+    public var repetitionPenalty: Float
 
     public init(
         maxNewTokens: Int = 256,
         stopTokenIDs: Set<Int32> = [],
         preset: Qwen4ExpSamplingPreset = .instruct,
         continueConversation: Bool = false,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        presencePenalty: Float = 0,
+        repetitionPenalty: Float = 1.0
     ) {
         self.maxNewTokens = maxNewTokens
         self.stopTokenIDs = stopTokenIDs
         self.preset = preset
         self.continueConversation = continueConversation
         self.seed = seed
+        self.presencePenalty = presencePenalty
+        self.repetitionPenalty = repetitionPenalty
     }
 }
 
@@ -123,6 +137,45 @@ public struct Qwen4ExpGenerationSummary: Sendable, Equatable {
         self.lmHeadTime = lmHeadTime
         self.samplerSampleTime = samplerSampleTime
         self.itemTime = itemTime
+    }
+}
+
+/// P5.3: pure, GPU-side presence/repetition penalty over a `[1, vocab]`
+/// logits row. Kept separate from `Qwen4ExpStreamingGenerator.run` so a test
+/// can exercise it on synthetic logits without a model. No `.item()` call —
+/// every op below stays a lazy MLX array op, and the whole thing is skipped
+/// entirely by the caller whenever both penalties are no-ops (greedy
+/// decoding, or a sampling request that didn't ask for either).
+public enum Qwen4ExpLogitPenalizer {
+    /// `seenMask` is a `[vocab]` float array where a strictly positive entry
+    /// means that vocabulary id has already been generated this turn
+    /// (`>0`, not the raw count — presence, not frequency: PLAN.md P5.3
+    /// explicitly folds `frequency_penalty` into the same flat presence
+    /// treatment). `presence` is subtracted from every already-seen id's
+    /// logit; `repetition` divides positive logits and multiplies negative
+    /// ones at those same ids (the standard HF repetition-penalty formula).
+    public static func apply(
+        logits: MLXArray, seenMask: MLXArray, presence: Float, repetition: Float
+    ) -> MLXArray {
+        guard presence != 0 || repetition != 1.0 else { return logits }
+        let seen = seenMask .> 0
+        var result = logits
+        if repetition != 1.0 {
+            let rescaled = MLX.where(result .> 0, result / repetition, result * repetition)
+            result = MLX.where(seen, rescaled, result)
+        }
+        if presence != 0 {
+            result = MLX.where(seen, result - presence, result)
+        }
+        return result
+    }
+
+    /// Scatter-marks `token` as seen in `seenMask` (`[vocab]`, in place via
+    /// reassignment — MLX arrays are copy-on-write value handles, so this is
+    /// the idiomatic "update" for a lazily-evaluated array, matching
+    /// `Qwen4ExpPLE`'s `result.at[...].add(...)` scatter pattern).
+    public static func markSeen(_ seenMask: MLXArray, token: Int32) -> MLXArray {
+        seenMask.at[MLXArray([token])].add(MLXArray(Float(1)))
     }
 }
 
@@ -229,17 +282,36 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
         var lmHeadTimeTotal: TimeInterval = 0
         var samplerSampleTimeTotal: TimeInterval = 0
         var itemTimeTotal: TimeInterval = 0
+        // P5.3: presence/repetition penalties are strictly opt-in and
+        // sampling-only — greedy decoding (`preset.temperature == 0`) never
+        // even allocates the mask, let alone touches `logits`, so it stays
+        // byte-for-byte identical to pre-P5.3 behavior.
+        let penaltiesActive =
+            options.preset.temperature > 0
+            && (options.presencePenalty != 0 || options.repetitionPenalty != 1.0)
+        var seenMask = penaltiesActive ? MLXArray.zeros([logits.dim(-1)]) : nil
 
         while tokenIDs.count < options.maxNewTokens {
             if Task.isCancelled { break }
+            let sampledLogits: MLXArray
+            if let seenMask {
+                sampledLogits = Qwen4ExpLogitPenalizer.apply(
+                    logits: logits, seenMask: seenMask, presence: options.presencePenalty,
+                    repetition: options.repetitionPenalty)
+            } else {
+                sampledLogits = logits
+            }
             // Materialize the token eagerly (piège 11) — no deferred graph
             // survives across autoregressive steps.
             let sampleStart = ContinuousClock.now
-            let sampled = sampler.sample(logits: logits)
+            let sampled = sampler.sample(logits: sampledLogits)
             samplerSampleTimeTotal += (ContinuousClock.now - sampleStart).seconds
             let itemStart = ContinuousClock.now
             let token = Int32(sampled.item(Int32.self))
             itemTimeTotal += (ContinuousClock.now - itemStart).seconds
+            if let mask = seenMask {
+                seenMask = Qwen4ExpLogitPenalizer.markSeen(mask, token: token)
+            }
             if !generationStarted {
                 generationStarted = true
                 firstTokenTime = Date().timeIntervalSince(started)

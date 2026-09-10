@@ -115,8 +115,8 @@ public enum Qwen38ModelCatalog {
 }
 
 private struct ChatCompletionRequest: Codable, Sendable {
-    let model: String?; let messages: [ChatCompletionMessage]; let stream: Bool?; let maxTokens: Int?; let maxCompletionTokens: Int?; let temperature: Float?; let topP: Float?; let reasoningEffort: String?; let reasoning: ChatCompletionReasoning?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let extra: ChatCompletionExtra?
-    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", extra }
+    let model: String?; let messages: [ChatCompletionMessage]; let stream: Bool?; let maxTokens: Int?; let maxCompletionTokens: Int?; let temperature: Float?; let topP: Float?; let presencePenalty: Float?; let frequencyPenalty: Float?; let reasoningEffort: String?; let reasoning: ChatCompletionReasoning?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let extra: ChatCompletionExtra?
+    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", extra }
 
     var effectiveMaxTokens: Int? { maxCompletionTokens ?? maxTokens }
     var effectiveReasoningEffort: String? { reasoningEffort ?? reasoning?.effort ?? extra?.reasoningEffort }
@@ -125,9 +125,16 @@ private struct ChatCompletionRequest: Codable, Sendable {
     var effectiveMTPEngine: Qwen38MTPEngine { Qwen38MTPEngine(rawValue: (mtpEngine ?? extra?.mtpEngine ?? "local").lowercased()) ?? .local }
     var effectiveMTPDraftTokens: Int { min(max(mtpDraftTokens ?? extra?.mtpDraftTokens ?? 1, 1), 8) }
     var effectiveConversationID: String? { (conversationID ?? extra?.conversationID)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
+    /// P5.3: `presence_penalty` wins over `frequency_penalty` (both accepted,
+    /// both treated as presence — PLAN.md P5.3). An explicit `0` from either
+    /// field disables the penalty even under sampling; only the complete
+    /// absence of both falls through to the server's own default (applied
+    /// by the caller, since it depends on `temperature`).
+    var explicitPresencePenalty: Float? { presencePenalty ?? frequencyPenalty }
+    var effectiveRepetitionPenalty: Float { extra?.repetitionPenalty ?? 1.0 }
 }
 private struct ChatCompletionReasoning: Codable, Sendable { let effort: String? }
-private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id" } }
+private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty" } }
 private struct ChatCompletionMessage: Codable, Sendable { let role: String; let content: ChatCompletionContent? }
 private enum ChatCompletionContent: Codable, Sendable {
     case text(String); case parts([ChatCompletionPart])
@@ -306,7 +313,15 @@ public actor Qwen38InferenceServer {
             let selectedModel = try await ensureModelLoaded(requestedModel)
             updateSession(id) { $0.model = selectedModel }
             let prepared = try prepare(input.messages)
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: input.temperature ?? 0, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine))
+            let temperature = input.temperature ?? 0
+            // P5.3: server default when a sampling request (temperature > 0)
+            // omits both `presence_penalty` and `frequency_penalty` — the
+            // instruct preset's `presence 1.5` (PLAN.md §2.1). An explicit
+            // `presence_penalty: 0` (or `frequency_penalty: 0`) disables it;
+            // greedy requests (temperature 0) never get this default since
+            // the generator ignores penalties there regardless.
+            let presencePenalty = input.explicitPresencePenalty ?? (temperature > 0 ? 1.5 : 0)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty)
             let conversationID = input.effectiveConversationID
             let (usePersistentCache, cacheRestored) = try await prepareConversation(
                 id: conversationID,
@@ -473,6 +488,8 @@ public actor Qwen38InferenceServer {
             && a.reasoningEffort == b.reasoningEffort
             && a.kvBits == b.kvBits
             && a.mtp == b.mtp
+            && a.presencePenalty == b.presencePenalty
+            && a.repetitionPenalty == b.repetitionPenalty
     }
 
     private func clearActiveConversation() {

@@ -413,7 +413,9 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             visionEmbeddings: built.visionEmbeddings, imageTokenID: built.imageTokenID,
             options: .init(
                 maxNewTokens: maxNewTokens, stopTokenIDs: stopTokenIDs, preset: preset,
-                continueConversation: continueConversation),
+                continueConversation: continueConversation,
+                presencePenalty: options.presencePenalty,
+                repetitionPenalty: options.repetitionPenalty),
             profiler: profiler)
 
         return AsyncThrowingStream { continuation in

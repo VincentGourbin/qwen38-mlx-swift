@@ -192,6 +192,83 @@ func generationParametersUseNativeKVQuantization() {
     #expect(options.parameters.topK == 20)
 }
 
+@Test("P5.3 : le pénaliseur de logits agit uniquement sur les ids déjà vus, présence puis répétition")
+func logitPenalizerAppliesOnlyToSeenIDs() {
+    let logits = MLXArray([Float(1.0), -1.0, 2.0, -2.0, 0.5])
+    // ids 0 and 2 already generated this turn.
+    var seenMask = MLXArray.zeros([5])
+    seenMask = Qwen4ExpLogitPenalizer.markSeen(seenMask, token: 0)
+    seenMask = Qwen4ExpLogitPenalizer.markSeen(seenMask, token: 2)
+    let seenValues = seenMask.asArray(Float.self)
+    #expect(seenValues == [1, 0, 1, 0, 0])
+
+    // Presence only: flat subtraction on seen ids, unseen untouched.
+    let presenceOnly = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: seenMask, presence: 1.0, repetition: 1.0
+    ).asArray(Float.self)
+    #expect(presenceOnly == [0.0, -1.0, 1.0, -2.0, 0.5])
+
+    // Repetition only: positive seen logits divided, negative seen logits
+    // multiplied; unseen untouched.
+    let repetitionOnly = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: seenMask, presence: 0, repetition: 2.0
+    ).asArray(Float.self)
+    #expect(repetitionOnly == [0.5, -1.0, 1.0, -2.0, 0.5])
+
+    // Both combined: repetition first, then presence.
+    let combined = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: seenMask, presence: 1.0, repetition: 2.0
+    ).asArray(Float.self)
+    #expect(combined == [-0.5, -1.0, 0.0, -2.0, 0.5])
+
+    // No-op fast path: identical array reference-equivalent values when both
+    // penalties are neutral (the generator skips calling this at all in that
+    // case, but the pure function itself must also be inert).
+    let noop = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: seenMask, presence: 0, repetition: 1.0
+    ).asArray(Float.self)
+    #expect(noop == logits.asArray(Float.self))
+}
+
+@Test("P5.3 : la génération greedy (température 0) est inchangée par les pénalités")
+func flashGreedyGenerationIgnoresPenalties() async throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
+        return
+    }
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let configuration = try Qwen4ExpConfiguration.load(from: directory)
+    let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+    let stopTokens: Set<Int32> = [
+        configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
+    ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
+    let built = try Qwen4ExpPromptBuilder.buildFirstTurn(
+        tokenizer: tokenizer, configuration: configuration, directory: directory,
+        prompt: "Explique en français qui est le président de la Chine et quel est son rôle.",
+        imageURL: nil, thinking: false)
+
+    let model = try Qwen4ExpStreamingTextModel(directory: directory)
+    let generator = Qwen4ExpStreamingGenerator(model: model)
+
+    func run(presence: Float, repetition: Float) async throws -> [Int32] {
+        var ids: [Int32] = []
+        for try await event in generator.generate(
+            promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+            options: .init(
+                maxNewTokens: 8, stopTokenIDs: stopTokens,
+                preset: .custom(temperature: 0, topP: 1, topK: 0),
+                presencePenalty: presence, repetitionPenalty: repetition)
+        ) {
+            if case .token(let token) = event { ids.append(token) }
+        }
+        return ids
+    }
+
+    let baseline = try await run(presence: 0, repetition: 1.0)
+    let withPenalties = try await run(presence: 1.5, repetition: 1.3)
+    #expect(baseline == withPenalties)
+    print("P5.3-greedy tokenIDs=\(baseline)")
+}
+
 @Test("Les compteurs n-gram exposent un taux de hit stable")
 func ngramCacheStatsComputeHitRate() {
     let stats = Qwen4ExpNGramCacheStats(hits: 7, misses: 3, entries: 9)

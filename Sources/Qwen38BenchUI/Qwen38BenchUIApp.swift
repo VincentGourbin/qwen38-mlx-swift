@@ -89,6 +89,12 @@ final class BenchViewModel: ObservableObject {
     @Published var thinking = true
     @Published var reasoningEffort = "xhigh"
     @Published var maxTokens = 2048
+    /// P5.3 : pénalité de présence Flash-Next (0 à 2, défaut 1,5 — même
+    /// valeur par défaut que le serveur applique quand un client échantillonne
+    /// sans préciser le champ). N'a d'effet que si `temperature > 0` ; la GUI
+    /// n'expose pas encore de réglage de température, ce champ reste donc
+    /// inerte tant que le chat local reste greedy.
+    @Published var presencePenalty: Double = 1.5
     @Published var mtpEnabled = true
     @Published var mtpEngine: Qwen38MTPEngine = .local
     @Published var mtpDraftTokens = 1
@@ -317,6 +323,7 @@ final class BenchViewModel: ObservableObject {
         let mtpEnabled = self.mtpEnabled
         let mtpEngine = self.mtpEngine
         let mtpDraftTokens = self.mtpDraftTokens
+        let presencePenalty = self.presencePenalty
 
         Task { @MainActor in
             do {
@@ -328,7 +335,8 @@ final class BenchViewModel: ObservableObject {
                         enabled: mtpEnabled,
                         draftDepth: .fixed(mtpDraftTokens),
                         engine: mtpEngine
-                    )
+                    ),
+                    presencePenalty: Float(presencePenalty)
                 )
                 let stream = try await runtime.generate(
                     prompt: prompt,
@@ -1204,6 +1212,14 @@ private struct SettingsView: View {
                     .multilineTextAlignment(.trailing)
                 Stepper("", value: $model.maxTokens, in: 128...16_384, step: 128)
                     .labelsHidden()
+            }
+            HStack {
+                Text("Pénalité de présence")
+                    .foregroundStyle(.secondary)
+                Slider(value: $model.presencePenalty, in: 0...2, step: 0.1)
+                Text(String(format: "%.1f", model.presencePenalty))
+                    .monospacedDigit()
+                    .frame(width: 28, alignment: .trailing)
             }
 
             Divider()

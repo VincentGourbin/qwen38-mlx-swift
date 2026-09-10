@@ -13,6 +13,17 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     public var reasoningEffort: String
     public var kvBits: Int?
     public var mtp: Qwen38MTPOptions
+    /// P5.3: OpenAI `presence_penalty` (and `frequency_penalty`, accepted as
+    /// an alias — see the server's field mapping). Applied only by the
+    /// Flash-Next streaming generator, only when `temperature > 0`
+    /// (`Qwen4ExpStreamingGenerator`); the 27B path and greedy decoding
+    /// ignore it. Default 0 (no-op, matches pre-P5.3 behavior); the server
+    /// applies its own default (1.5) when a sampling request omits the
+    /// field entirely (PLAN.md §2.1 instruct preset).
+    public var presencePenalty: Float
+    /// P5.3: multiplicative repetition penalty (`extra.repetition_penalty`).
+    /// 1.0 is a no-op (default). Same scope restriction as `presencePenalty`.
+    public var repetitionPenalty: Float
 
     public init(
         maxTokens: Int = 256,
@@ -22,7 +33,9 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         enableThinking: Bool = true,
         reasoningEffort: String = "xhigh",
         kvBits: Int? = 4,
-        mtp: Qwen38MTPOptions = .init()
+        mtp: Qwen38MTPOptions = .init(),
+        presencePenalty: Float = 0,
+        repetitionPenalty: Float = 1.0
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -32,6 +45,8 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         self.reasoningEffort = reasoningEffort
         self.kvBits = kvBits
         self.mtp = mtp
+        self.presencePenalty = presencePenalty
+        self.repetitionPenalty = repetitionPenalty
     }
 
     public var parameters: GenerateParameters {
