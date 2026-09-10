@@ -274,12 +274,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             temperature: options.temperature, topP: options.topP, topK: options.topK)
 
         let profiler = MLXProfiler.shared
-        let profileSession = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
-        profileSession.title = "QWEN3.8 FLASH-NEXT INFERENCE"
-        profileSession.metadata["model"] = directory.lastPathComponent
-        profileSession.metadata["turn"] = String(currentTurnIndex)
-        profiler.activeSession = profileSession
-        profiler.enable()
+        let (profileSession, ownsSession, requestPhase) = Qwen38Profiling.beginRequestSession(
+            title: "QWEN3.8 FLASH-NEXT INFERENCE",
+            metadata: ["model": directory.lastPathComponent, "turn": String(currentTurnIndex)],
+            phase: "Requête \(currentTurnIndex)")
 
         // PM4.3 (branchement, 2026-09-09): opt-in local MTP — default off
         // (`options.mtp.enabled`). PLAN.md P-MTP suite PM4.3 measured block
@@ -301,7 +299,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             return runMTPGenerationStream(
                 built: built, options: options, continueConversation: continueConversation,
                 inputDescription: inputDescription, currentTurnIndex: currentTurnIndex,
-                maxNewTokens: maxNewTokens, profiler: profiler, profileSession: profileSession)
+                maxNewTokens: maxNewTokens, profiler: profiler, profileSession: profileSession,
+                ownsSession: ownsSession, requestPhase: requestPhase)
         }
         if requestedMTP && hasImage {
             FileHandle.standardError.write(
@@ -368,9 +367,9 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                     Qwen38RunMetrics(
                                         metrics: llmMetrics,
                                         stopReason: stopReason,
-                                        report: profileSession.generateReport(),
-                                        chromeTrace: ChromeTraceExporter.export(
-                                            session: profileSession),
+                                        report: ownsSession ? profileSession.generateReport() : "",
+                                        chromeTrace: ownsSession
+                                            ? ChromeTraceExporter.export(session: profileSession) : Data(),
                                         activeMemoryBytes: summary.activeMemoryBytes,
                                         peakMemoryBytes: summary.peakMemoryBytes,
                                         acceptRate: nil,
@@ -383,10 +382,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                         }
                     }
                     continuation.finish()
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 } catch {
                     continuation.finish(throwing: error)
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -406,7 +405,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         built: Qwen4ExpBuiltPrompt, options: Qwen38GenerationOptions,
         continueConversation: Bool, inputDescription: String,
         currentTurnIndex: Int, maxNewTokens: Int,
-        profiler: MLXProfiler, profileSession: ProfilingSession
+        profiler: MLXProfiler, profileSession: ProfilingSession,
+        ownsSession: Bool, requestPhase: String
     ) -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         let requestedDrafts = options.mtp.draftDepth.requestedDraftTokens
         let blockSize = min(max(requestedDrafts + 1, 2), 4)
@@ -478,8 +478,9 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                             Qwen38RunMetrics(
                                 metrics: llmMetrics,
                                 stopReason: stopReason,
-                                report: profileSession.generateReport(),
-                                chromeTrace: ChromeTraceExporter.export(session: profileSession),
+                                report: ownsSession ? profileSession.generateReport() : "",
+                                chromeTrace: ownsSession
+                                    ? ChromeTraceExporter.export(session: profileSession) : Data(),
                                 activeMemoryBytes: Memory.activeMemory,
                                 peakMemoryBytes: Memory.peakMemory,
                                 acceptRate: result.stats.acceptanceRate,
@@ -490,10 +491,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 inputDescription: inputDescription,
                                 mtpStatus: mtpStatus)))
                     continuation.finish()
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 } catch {
                     continuation.finish(throwing: error)
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 }
             }
             continuation.onTermination = { _ in task.cancel() }

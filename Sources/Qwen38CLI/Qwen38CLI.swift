@@ -1969,10 +1969,38 @@ struct Serve: AsyncParsableCommand {
     @Option(name: .long, help: "Clé Bearer optionnelle")
     var apiKey: String?
 
+    @Option(
+        name: .long,
+        help: "Profiler TOUTE la session de service (swift-mlx-profiler 1.5 : sampler 16 ms, mémoire système, une phase par requête) et écrire la trace Chrome à ce chemin à l'arrêt (Ctrl-C)")
+    var trace: String?
+
+    @Option(
+        name: .long,
+        help: "Avec --trace : enregistrer en plus un Metal System Trace (xctrace, attaché à ce process) pendant N secondes après le chargement, fusionné dans la trace Chrome")
+    var metalTraceSeconds: Int = 0
+
     func run() async throws {
         let runtime = Qwen38Runtime()
+        var session: ProfilingSession?
+        if let trace {
+            _ = Device.defaultDevice()
+            var config = ProfilingConfig.fineGrained
+            config.trackSystemMemory = true
+            config.outputDirectory = URL(fileURLWithPath: trace).deletingLastPathComponent()
+            let profileSession = ProfilingSession(config: config, subsystem: "com.qwen38mlx")
+            profileSession.title = "QWEN3.8 SERVE"
+            profileSession.metadata["model"] = URL(fileURLWithPath: modelPath).lastPathComponent
+            profileSession.metadata["port"] = String(port)
+            Qwen38Profiling.sharedSession = profileSession
+            MLXProfiler.shared.activeSession = profileSession
+            MLXProfiler.shared.enable()
+            session = profileSession
+            print("Profilage de session actif (\(RunEnvironment.buildConfiguration)) → \(trace)")
+        }
         print("Chargement du modèle…")
+        MLXProfiler.shared.start("Chargement")
         try await runtime.load(from: URL(fileURLWithPath: modelPath, isDirectory: true))
+        MLXProfiler.shared.end("Chargement")
         let server = Qwen38InferenceServer(runtime: runtime)
         try await server.start(
             port: port,
@@ -1981,11 +2009,62 @@ struct Serve: AsyncParsableCommand {
                 .deletingLastPathComponent())
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
-        defer { Task { await server.stop() } }
-        while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(3_600))
+
+        var recorder: MetalSystemTrace.Recorder?
+        if let session, metalTraceSeconds > 0 {
+            do {
+                let r = try session.startMetalSystemTrace(timeLimit: TimeInterval(metalTraceSeconds))
+                print("Metal System Trace : enregistrement \(r.waitUntilRecording() ? "démarré" : "en attente") pour \(metalTraceSeconds) s")
+                recorder = r
+            } catch {
+                print("Metal System Trace indisponible : \(error)")
+            }
+        }
+
+        // Ctrl-C : arrêt propre puis export de la trace (ArgumentParser ne
+        // convertit pas SIGINT en annulation de tâche).
+        let stopFlag = Qwen38StopFlag()
+        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+        signal(SIGINT, SIG_IGN)
+        source.setEventHandler { stopFlag.requestStop() }
+        source.resume()
+        var metalTraceURL: URL?
+        let recordingStarted = Date()
+        while !Task.isCancelled && !stopFlag.isStopRequested {
+            try await Task.sleep(for: .seconds(1))
+            if let r = recorder, Date().timeIntervalSince(recordingStarted) > TimeInterval(metalTraceSeconds + 5) {
+                metalTraceURL = try? r.stop()
+                recorder = nil
+                print("Metal System Trace terminé : \(metalTraceURL?.path ?? "?")")
+            }
+        }
+        print("Arrêt du serveur…")
+        await server.stop()
+        if let session, let trace {
+            MLXProfiler.shared.disable()
+            if let r = recorder { metalTraceURL = try? r.stop() }
+            if let url = metalTraceURL {
+                do {
+                    let summary = try session.mergeMetalSystemTrace(url)
+                    print("GPU (Metal System Trace) : \(summary.intervalCount) intervalles, \(summary.commandBufferCount) command buffers, occupé \(summary.busyUs / 1000) ms sur \((summary.windowEndUs - summary.windowStartUs) / 1000) ms")
+                } catch {
+                    print("Fusion Metal System Trace impossible : \(error)")
+                }
+            }
+            session.finish()
+            try ChromeTraceExporter.export(session: session).write(to: URL(fileURLWithPath: trace))
+            print(session.generateReport())
+            print("trace : \(trace)")
         }
     }
+}
+
+/// Minimal thread-safe flag for the SIGINT handler of `serve`.
+final class Qwen38StopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stop = false
+    func requestStop() { lock.lock(); stop = true; lock.unlock() }
+    var isStopRequested: Bool { lock.lock(); defer { lock.unlock() }; return stop }
 }
 
 struct MTPParity: AsyncParsableCommand {

@@ -18,7 +18,7 @@ let package = Package(
         .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
-        .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.4.0"),
+        .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.5.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
     ],
     targets: [

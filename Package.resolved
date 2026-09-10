@@ -1,5 +1,5 @@
 {
-  "originHash" : "eea3c366c6213f01485a427b180bc1c50cd9bd33811c79a2faeb95268691b3d8",
+  "originHash" : "234beaf6526514ef80df6d718548ed2b9a4e7425b890d539bef5f8ac0124b191",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -186,8 +186,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/VincentGourbin/swift-mlx-profiler",
       "state" : {
-        "revision" : "b2a83b36a24b2e252573369644259a648fbaf18a",
-        "version" : "1.4.0"
+        "revision" : "689df79754fe69e32360ecd54c55d9e0a15d4017",
+        "version" : "1.5.0"
       }
     },
     {

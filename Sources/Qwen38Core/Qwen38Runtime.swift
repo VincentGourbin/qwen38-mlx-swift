@@ -830,17 +830,16 @@ public actor Qwen38Runtime {
         // deceptively tiny TTFT because those phases happen before its stream
         // is returned.
         let profiler = MLXProfiler.shared
-        let profileSession = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
-        profileSession.title = "QWEN3.8 INFERENCE"
-        profileSession.metadata["model"] = loadedDirectory?.lastPathComponent ?? "Qwen3.8"
-        profileSession.metadata["kvBits"] = options.kvBits.map(String.init) ?? "none"
-        profileSession.metadata["mtpRequested"] = String(requestedMTP)
-        profileSession.metadata["mtpEngine"] = options.mtp.engine.rawValue
-        profileSession.metadata["mtpSelectedPath"] = canUseLocalMTP
-            ? "local"
-            : canUseUpstreamMTP ? "upstream" : "fallback"
-        profiler.activeSession = profileSession
-        profiler.enable()
+        let (profileSession, ownsSession, requestPhase) = Qwen38Profiling.beginRequestSession(
+            title: "QWEN3.8 INFERENCE",
+            metadata: [
+                "model": loadedDirectory?.lastPathComponent ?? "Qwen3.8",
+                "kvBits": options.kvBits.map(String.init) ?? "none",
+                "mtpRequested": String(requestedMTP),
+                "mtpEngine": options.mtp.engine.rawValue,
+                "mtpSelectedPath": canUseLocalMTP ? "local" : canUseUpstreamMTP ? "upstream" : "fallback",
+            ],
+            phase: "Requête \(turnIndex)")
         let requestStart = Date()
         profiler.start("Turn")
         profiler.start("Time to first token")
@@ -907,7 +906,7 @@ public actor Qwen38Runtime {
                 generationStream = chatSession.streamDetails(to: prompt, images: images)
             }
         } catch {
-            profiler.disable()
+            Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
             removeLastPendingUserMessage()
             throw error
         }
@@ -980,8 +979,8 @@ public actor Qwen38Runtime {
                     continuation.yield(.metrics(Qwen38RunMetrics(
                         metrics: metrics,
                         stopReason: info.stopReason,
-                        report: profileSession.generateReport(),
-                        chromeTrace: ChromeTraceExporter.export(session: profileSession),
+                        report: ownsSession ? profileSession.generateReport() : "",
+                        chromeTrace: ownsSession ? ChromeTraceExporter.export(session: profileSession) : Data(),
                         activeMemoryBytes: Memory.activeMemory,
                         peakMemoryBytes: Memory.peakMemory,
                         acceptRate: acceptRate,
@@ -998,10 +997,10 @@ public actor Qwen38Runtime {
                     )))
                     self.finishConversationTurn(with: outputText)
                     continuation.finish()
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 } catch {
                     self.removeLastPendingUserMessage()
-                    profiler.disable()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                     continuation.finish(throwing: error)
                 }
             }
