@@ -3183,3 +3183,43 @@ Fichiers : `results/p62/before-chat-100.stdout.txt`,
 `results/p62/before-chat-2500.stdout.txt`, `results/p62/after2-chat-100.stdout.txt`,
 `results/p62/after2-chat-2500.stdout.txt`, `results/p62/after-ngram-parity-v2.stdout.txt`
 (traces `.trace.json` non versionnées, gitignore).
+
+## 2026-09-10 — P6.5 : coût fixe du forward court — host-bound confirmé, QSA écarté, pas d'op isolée
+
+Mesure `--profile-layers` (Release, checkpoint 3-bit réel) : préfill S≈100
+(`results/p62/after2-chat-100.trace.json`, après P6.2 correctif) contre
+décodage S=1 (`results/p65/s1-decode.trace.json`, régime établi, passes
+≥ 2 d'un tour de 4 tokens).
+
+| | S=1 (décodage) | S≈100 (préfill) | ratio |
+|---|---:|---:|---:|
+| médiane couche (hors PLE) | 4 ms | 15,5 ms | 3,9× |
+| couche PLE | — (négligeable au décodage) | 172 ms | — |
+| CPU / GPU (P5.6, même ordre de grandeur) | — | 88 % / 55 % | host-bound |
+
+**Seuil dépassé** : 15,5 ms/couche hors PLE à S≈100, au-dessus des 10 ms de
+la consigne P6.5 — recherche de l'opération en cause. **QSA écarté** : le
+détail par couche (`results/p62/after2-chat-100.trace.json`) montre les 12
+couches QSA et les 35 couches GDN/hyper-connections/MoE au **même coût**
+(15,1-15,8 ms, aucune distinction visible) — cohérent avec §6.0 (« sous
+2 048 tokens `makeMask` retourne `nil`, chemin dense ») : la construction
+du masque QSA n'est structurellement pas en cause ici. Comparaison avec/
+sans `--profile-layers` sur le même préfill (`results/p65/noprofile-100.
+stdout.txt`, 929 ms / 48 couches ≈ 19,4 ms/couche) : cohérent avec la somme
+mesurée sous profiler (910 ms), donc le coût du profiler lui-même
+(documenté ailleurs à ~4,7 ms/frontière) n'explique pas l'écart ici.
+
+**Non résolu, comme P4.3** : sans accès à Instruments/Shader Timeline,
+impossible d'isoler l'opération précise (MRoPE ? `asType` ? dispatch par
+couche ?) parmi les suspects listés par la consigne — le ratio 3,9× pour
+100× plus de tokens confirme que le coût est dominé par un surcoût hôte
+fixe par couche (dispatch/orchestration), pas par le calcul GPU lui-même
+(qui grandirait bien plus vite avec S s'il dominait), cohérent avec le
+diagnostic déjà posé en P5.6 (« host-bound à courte longueur, CPU 88 %,
+GPU 55 % »). Aucun correctif appliqué : la piste la plus probable (QSA) est
+écartée par la mesure, et les autres candidats de la consigne ne sont pas
+localisables sans profileur GPU natif — documenté ici pour reprise
+éventuelle avec Instruments, comme P4.3.
+
+Fichiers : `results/p65/s1-decode.stdout.txt`, `results/p65/noprofile-100.
+stdout.txt` (traces `.trace.json` non versionnées, gitignore).

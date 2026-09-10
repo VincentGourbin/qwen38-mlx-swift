@@ -1,0 +1,20 @@
+=== tour 1 ===
+Bonjour
+prompt tokens: 13
+generated ids: [78768]
+TTFT: 67.710s
+prefill: 67.710s
+decode: 0.000s
+couches: 48 visites · load cumulé 66.916s
+P4.2 fin de token (cumulé) : lm_head 0.0000s · sampler.sample 0.0000s · .item() 0.0005s
+=== tour 2 ===
+Bonjour
+prompt tokens: 112
+generated ids: [78768]
+TTFT: 0.930s
+prefill: 0.929s
+decode: 0.000s
+couches: 48 visites · load cumulé 0.000s
+P4.2 fin de token (cumulé) : lm_head 0.0000s · sampler.sample 0.0000s · .item() 0.0003s
+MLX mémoire active: 56,35 GB
+MLX mémoire peak: 56,8 GB
