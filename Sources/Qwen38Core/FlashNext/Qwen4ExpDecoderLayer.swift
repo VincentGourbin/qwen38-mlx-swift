@@ -141,6 +141,14 @@ public final class Qwen4ExpDecoderLayer: Module {
         ple?.ngramCacheStats()
     }
 
+    public func ngramLookupStats() -> Qwen4ExpPLELookupStats? {
+        ple?.ngramLookupStats()
+    }
+
+    public func resetNgramLookupStats() {
+        ple?.resetNgramLookupStats()
+    }
+
     private static func inject(
         branch: MLXArray,
         hyperInput: MLXArray,

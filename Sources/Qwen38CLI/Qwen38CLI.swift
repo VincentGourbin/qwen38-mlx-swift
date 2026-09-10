@@ -763,6 +763,12 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         }
         print("MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))")
         let ngramCacheStats = model.ngramCacheStats()
+        let ngramLookupStats = model.ngramLookupStats()
+        print(
+            "P6.2 PLE lookup : \(ngramLookupStats.lookupCalls) appels · "
+                + "\(ngramLookupStats.arraysConstructed) MLXArray construits · "
+                + "\(ngramLookupStats.dequantizeCalls) dequantize · "
+                + "lecture hôte cumulée \(String(format: "%.4fs", ngramLookupStats.hostReadSeconds))")
         if let profileSession {
             profileSession.metadata["ngram_cache_hits"] = String(ngramCacheStats.hits)
             profileSession.metadata["ngram_cache_misses"] = String(ngramCacheStats.misses)
@@ -770,6 +776,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             profileSession.metadata["ngram_cache_hit_rate"] = ngramCacheStats.hitRate.map {
                 String(format: "%.4f", $0)
             } ?? "n/a"
+            profileSession.metadata["ple_lookup_calls"] = String(ngramLookupStats.lookupCalls)
+            profileSession.metadata["ple_arrays_constructed"] = String(
+                ngramLookupStats.arraysConstructed)
+            profileSession.metadata["ple_dequantize_calls"] = String(
+                ngramLookupStats.dequantizeCalls)
+            profileSession.metadata["ple_host_read_seconds"] = String(
+                format: "%.6f", ngramLookupStats.hostReadSeconds)
         }
         print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
         if let profileSession {
@@ -1217,12 +1230,18 @@ struct FlashChatProbe: AsyncParsableCommand {
         print("MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))")
         print("MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))")
         let ngramCacheStats = model.ngramCacheStats()
+        let ngramLookupStats = model.ngramLookupStats()
         if profileLayers {
             print(
                 "P4.5 n-gram : \(ngramCacheStats.hits) hits · \(ngramCacheStats.misses) misses · "
                     + "miss cumulé \(String(format: "%.4fs", ngramCacheStats.missDuration)) · "
                     + "moyenne/miss \(ngramCacheStats.meanMissDuration.map { String(format: "%.5fs", $0) } ?? "n/a")"
             )
+            print(
+                "P6.2 PLE lookup : \(ngramLookupStats.lookupCalls) appels · "
+                    + "\(ngramLookupStats.arraysConstructed) MLXArray construits · "
+                    + "\(ngramLookupStats.dequantizeCalls) dequantize · "
+                    + "lecture hôte cumulée \(String(format: "%.4fs", ngramLookupStats.hostReadSeconds))")
         }
         if let profileSession {
             profileSession.metadata["ngram_cache_hits"] = String(ngramCacheStats.hits)
@@ -1231,6 +1250,13 @@ struct FlashChatProbe: AsyncParsableCommand {
             profileSession.metadata["ngram_cache_hit_rate"] = ngramCacheStats.hitRate.map {
                 String(format: "%.4f", $0)
             } ?? "n/a"
+            profileSession.metadata["ple_lookup_calls"] = String(ngramLookupStats.lookupCalls)
+            profileSession.metadata["ple_arrays_constructed"] = String(
+                ngramLookupStats.arraysConstructed)
+            profileSession.metadata["ple_dequantize_calls"] = String(
+                ngramLookupStats.dequantizeCalls)
+            profileSession.metadata["ple_host_read_seconds"] = String(
+                format: "%.6f", ngramLookupStats.hostReadSeconds)
             print(profileSession.generateReport())
             if let trace { print("trace profiler: \(trace)") }
         }

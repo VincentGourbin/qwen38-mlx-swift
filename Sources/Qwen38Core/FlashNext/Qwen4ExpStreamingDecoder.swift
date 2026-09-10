@@ -113,6 +113,11 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     private var ngramCacheTotals = Qwen4ExpNGramCacheStats()
     private var ngramCacheEntriesByLayer: [Int: Int] = [:]
     private var residentNGramCacheSnapshots: [Int: Qwen4ExpNGramCacheStats] = [:]
+    /// P6.2: same delta-accounting pattern as the n-gram cache counters
+    /// above, for the lookup-path instrumentation (arrays constructed,
+    /// dequantize calls, host read time).
+    private var ngramLookupTotals = Qwen4ExpPLELookupStats()
+    private var residentNGramLookupSnapshots: [Int: Qwen4ExpPLELookupStats] = [:]
 
     public init(
         directory: URL,
@@ -264,6 +269,9 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             if let currentNGramStats = loaded.layer.ngramCacheStats() {
                 observeNGramCache(layerIndex: layerIndex, current: currentNGramStats)
             }
+            if let currentLookupStats = loaded.layer.ngramLookupStats() {
+                observeNGramLookup(layerIndex: layerIndex, current: currentLookupStats)
+            }
             // Streamed mode must detach the next layer from the previous
             // module before that module is released. Resident mode keeps all
             // modules alive and checkpoints the lazy graph periodically. The
@@ -329,6 +337,15 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         // They must be reset together with the public counters; otherwise the
         // first forward of the next generation can be silently under-counted.
         residentNGramCacheSnapshots.removeAll(keepingCapacity: true)
+    }
+
+    public func ngramLookupStats() -> Qwen4ExpPLELookupStats {
+        ngramLookupTotals
+    }
+
+    public func resetNGramLookupStats() {
+        ngramLookupTotals = Qwen4ExpPLELookupStats()
+        residentNGramLookupSnapshots.removeAll(keepingCapacity: true)
     }
 
     /// Capture all hybrid attention state before a speculative verification
@@ -415,6 +432,27 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         }
         ngramCacheEntriesByLayer[layerIndex] = max(
             ngramCacheEntriesByLayer[layerIndex] ?? 0, current.entries)
+    }
+
+    /// P6.2: same delta-vs-snapshot accounting as `observeNGramCache`, for
+    /// the lookup instrumentation counters.
+    private func observeNGramLookup(layerIndex: Int, current: Qwen4ExpPLELookupStats) {
+        if layerLoadingMode == .resident {
+            let previous = residentNGramLookupSnapshots[layerIndex] ?? Qwen4ExpPLELookupStats()
+            ngramLookupTotals.lookupCalls += max(0, current.lookupCalls - previous.lookupCalls)
+            ngramLookupTotals.arraysConstructed += max(
+                0, current.arraysConstructed - previous.arraysConstructed)
+            ngramLookupTotals.dequantizeCalls += max(
+                0, current.dequantizeCalls - previous.dequantizeCalls)
+            ngramLookupTotals.hostReadSeconds += max(
+                0, current.hostReadSeconds - previous.hostReadSeconds)
+            residentNGramLookupSnapshots[layerIndex] = current
+        } else {
+            ngramLookupTotals.lookupCalls += current.lookupCalls
+            ngramLookupTotals.arraysConstructed += current.arraysConstructed
+            ngramLookupTotals.dequantizeCalls += current.dequantizeCalls
+            ngramLookupTotals.hostReadSeconds += current.hostReadSeconds
+        }
     }
 
     private func makeCache(for layerIndex: Int) -> any KVCache {

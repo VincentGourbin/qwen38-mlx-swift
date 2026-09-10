@@ -128,6 +128,14 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         decoder.resetNGramCacheStats()
     }
 
+    public func ngramLookupStats() -> Qwen4ExpPLELookupStats {
+        decoder.ngramLookupStats()
+    }
+
+    public func resetNGramLookupStats() {
+        decoder.resetNGramLookupStats()
+    }
+
     /// Capture the complete target continuation point.  This is the public
     /// Flash-Next equivalent of the upstream MTP cache snapshot: it includes
     /// QSA keys/indexer positions, GDN recurrent state and the M-RoPE offset.

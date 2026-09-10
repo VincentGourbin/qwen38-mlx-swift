@@ -37,6 +37,29 @@ public struct Qwen4ExpNGramCacheStats: Sendable, Equatable {
     }
 }
 
+/// P6.2: instrumentation for the PLE lookup path — how many `MLXArray(...)`
+/// host→device tensor constructions and `MLX.dequantized` calls a lookup
+/// batch emits, and how much host wall time went into the row reads that
+/// feed them. Measured once per resident model (the storage object is
+/// created once in `.resident` mode, see `Qwen38FlashNextEngine`), reset
+/// with `resetLookupStats()` before a probe run.
+public struct Qwen4ExpPLELookupStats: Sendable, Equatable {
+    public var lookupCalls: Int
+    public var arraysConstructed: Int
+    public var dequantizeCalls: Int
+    public var hostReadSeconds: TimeInterval
+
+    public init(
+        lookupCalls: Int = 0, arraysConstructed: Int = 0, dequantizeCalls: Int = 0,
+        hostReadSeconds: TimeInterval = 0
+    ) {
+        self.lookupCalls = lookupCalls
+        self.arraysConstructed = arraysConstructed
+        self.dequantizeCalls = dequantizeCalls
+        self.hostReadSeconds = hostReadSeconds
+    }
+}
+
 /// A row-wise reader for Flash-Next's very large quantized n-gram table.
 ///
 /// A normal MLX gather over a lazy safetensors array can materialize the
@@ -223,6 +246,46 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
 
     private let rowCache = RowCache(capacity: 4096)
 
+    /// P6.2 instrumentation box: counts `MLXArray(...)` constructions and
+    /// `MLX.dequantized` calls emitted per lookup, plus the host wall time
+    /// spent in the row reads that feed them. NSLock-protected like
+    /// `RowCache` above (lookups can run concurrently with `asyncEval`).
+    private final class LookupStatsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lookupCalls = 0
+        private var arraysConstructed = 0
+        private var dequantizeCalls = 0
+        private var hostReadSeconds: TimeInterval = 0
+
+        func record(arrays: Int, dequantize: Int, readSeconds: TimeInterval) {
+            lock.lock()
+            defer { lock.unlock() }
+            lookupCalls += 1
+            arraysConstructed += arrays
+            dequantizeCalls += dequantize
+            hostReadSeconds += readSeconds
+        }
+
+        func snapshot() -> Qwen4ExpPLELookupStats {
+            lock.lock()
+            defer { lock.unlock() }
+            return Qwen4ExpPLELookupStats(
+                lookupCalls: lookupCalls, arraysConstructed: arraysConstructed,
+                dequantizeCalls: dequantizeCalls, hostReadSeconds: hostReadSeconds)
+        }
+
+        func reset() {
+            lock.lock()
+            defer { lock.unlock() }
+            lookupCalls = 0
+            arraysConstructed = 0
+            dequantizeCalls = 0
+            hostReadSeconds = 0
+        }
+    }
+
+    private let lookupStatsBox = LookupStatsBox()
+
     public init(
         directory: URL,
         rawKeysByShardFile: [String: [String]],
@@ -302,9 +365,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         }
         let rowIndices = rows.map(Int.init)
         precondition(rowIndices.allSatisfy { $0 >= 0 && $0 < location.weight.rowCount })
+        let readStart = ContinuousClock.now
         let packed = readPackedRows(location.weight, rows: rowIndices)
         let scales = readUInt16Rows(location.scales, rows: rowIndices)
         let biases = location.biases.map { readUInt16Rows($0, rows: rowIndices) }
+        let readSeconds = (ContinuousClock.now - readStart).seconds
         let packedArray = MLXArray(packed).reshaped([rows.count, packedWidth])
         let scalesArray = MLXArray(scales).reshaped([rows.count, scaleWidth])
             // Safetensors stores BF16 as its raw UInt16 bit pattern. `asType`
@@ -313,13 +378,85 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         let biasesArray = biases.map {
             MLXArray($0).reshaped([rows.count, scaleWidth]).view(dtype: .bfloat16)
         }
-        return MLX.dequantized(
+        let result = MLX.dequantized(
             packedArray, scales: scalesArray, biases: biasesArray,
             groupSize: groupSize, bits: bits, mode: mode)
+        lookupStatsBox.record(
+            arrays: biasesArray == nil ? 2 : 3, dequantize: 1, readSeconds: readSeconds)
+        return result
+    }
+
+    /// P6.2: the batched counterpart of `lookup(shard:rows:)` — one request
+    /// list spanning every shard touched by a token batch, one packed array,
+    /// one scales array, one biases array (if any) and a single
+    /// `MLX.dequantized` call, instead of one of each per distinct shard.
+    /// Row bytes are still read per-shard (`readPackedRows`/`readUInt16Rows`
+    /// batch contiguous runs within a shard already, P5.4), but the result
+    /// is assembled into flat host buffers **in request order** before a
+    /// single upload, so the caller gets rows back already ordered by
+    /// position — no on-device scatter/add needed afterwards.
+    public func lookupBatch(_ requests: [(shard: Int, row: Int32)]) -> MLXArray {
+        precondition(!requests.isEmpty)
+        var positionsByShard: [Int: [Int32]] = [:]
+        for (index, request) in requests.enumerated() {
+            positionsByShard[request.shard, default: []].append(Int32(index))
+        }
+        var packedFlat = [UInt32](repeating: 0, count: requests.count * packedWidth)
+        var scalesFlat = [UInt16](repeating: 0, count: requests.count * scaleWidth)
+        var biasesFlat: [UInt16]?
+        let readStart = ContinuousClock.now
+        for (shard, positions) in positionsByShard {
+            guard let location = shards[shard] else {
+                preconditionFailure("Shard n-gram inexistante: \(shard)")
+            }
+            let rowIndices = positions.map { Int(requests[Int($0)].row) }
+            precondition(rowIndices.allSatisfy { $0 >= 0 && $0 < location.weight.rowCount })
+            let packedRows = readPackedRows(location.weight, rows: rowIndices)
+            let scaleRows = readUInt16Rows(location.scales, rows: rowIndices)
+            let biasRows = location.biases.map { readUInt16Rows($0, rows: rowIndices) }
+            for (localIndex, globalPosition) in positions.enumerated() {
+                let globalIndex = Int(globalPosition)
+                packedFlat.replaceSubrange(
+                    (globalIndex * packedWidth) ..< ((globalIndex + 1) * packedWidth),
+                    with: packedRows[(localIndex * packedWidth) ..< ((localIndex + 1) * packedWidth)])
+                scalesFlat.replaceSubrange(
+                    (globalIndex * scaleWidth) ..< ((globalIndex + 1) * scaleWidth),
+                    with: scaleRows[(localIndex * scaleWidth) ..< ((localIndex + 1) * scaleWidth)])
+                if let biasRows {
+                    if biasesFlat == nil {
+                        biasesFlat = [UInt16](repeating: 0, count: requests.count * scaleWidth)
+                    }
+                    biasesFlat!.replaceSubrange(
+                        (globalIndex * scaleWidth) ..< ((globalIndex + 1) * scaleWidth),
+                        with: biasRows[(localIndex * scaleWidth) ..< ((localIndex + 1) * scaleWidth)])
+                }
+            }
+        }
+        let readSeconds = (ContinuousClock.now - readStart).seconds
+        let packedArray = MLXArray(packedFlat).reshaped([requests.count, packedWidth])
+        let scalesArray = MLXArray(scalesFlat).reshaped([requests.count, scaleWidth])
+            .view(dtype: .bfloat16)
+        let biasesArray = biasesFlat.map {
+            MLXArray($0).reshaped([requests.count, scaleWidth]).view(dtype: .bfloat16)
+        }
+        let result = MLX.dequantized(
+            packedArray, scales: scalesArray, biases: biasesArray,
+            groupSize: groupSize, bits: bits, mode: mode)
+        lookupStatsBox.record(
+            arrays: biasesArray == nil ? 2 : 3, dequantize: 1, readSeconds: readSeconds)
+        return result
     }
 
     public func cacheStats() -> CacheStats {
         rowCache.stats()
+    }
+
+    public func lookupStats() -> Qwen4ExpPLELookupStats {
+        lookupStatsBox.snapshot()
+    }
+
+    public func resetLookupStats() {
+        lookupStatsBox.reset()
     }
 
     private func readPackedRows(_ location: TensorLocation, rows: [Int]) -> [UInt32] {
@@ -599,8 +736,33 @@ public final class Qwen4ExpNGramShardTable: Module {
         return shards[shard](MLXArray(rows).asType(.int32))
     }
 
+    /// P6.2: batched lookup across every shard touched by a token batch, in
+    /// request order. The lazy (real-checkpoint) path forwards to
+    /// `Qwen4ExpLazyNGramStorage.lookupBatch` (one packed/scales/biases
+    /// array + one dequantize for the whole batch). The module-backed path
+    /// (small-vocab tests, no lazy storage) has no shard-dispatch cost worth
+    /// batching — it stays one `Embedding` call per request, concatenated in
+    /// order.
+    public func lookupBatch(_ requests: [(shard: Int, row: Int32)]) -> MLXArray {
+        if let lazyStorage {
+            return lazyStorage.lookupBatch(requests)
+        }
+        let pieces = requests.map { request in
+            shards[request.shard](MLXArray([request.row]).asType(.int32))
+        }
+        return concatenated(pieces, axis: 0)
+    }
+
     public func cacheStats() -> Qwen4ExpNGramCacheStats? {
         lazyStorage?.cacheStats().publicStats
+    }
+
+    public func lookupStats() -> Qwen4ExpPLELookupStats? {
+        lazyStorage?.lookupStats()
+    }
+
+    public func resetLookupStats() {
+        lazyStorage?.resetLookupStats()
     }
 }
 
@@ -743,6 +905,18 @@ public final class Qwen4ExpNGramEmbedding: Module {
         let flat = IDs.reshaped([-1])
         eval(flat)
         let hostIDs = flat.asArray(Int64.self)
+        guard !hostIDs.isEmpty else {
+            return MLXArray.zeros([IDs.dim(0), IDs.dim(1), embeddingDimension])
+        }
+
+        // P6.2 mesure (docs/knowledge/log.md "P6.2") : chaque shard distinct
+        // touché par le batch (jusqu'à 231 mesurés sur le checkpoint réel,
+        // constant quel que soit le nombre de tokens dans le préfill)
+        // construit ici ses propres `MLXArray(...)` × 2-3 + un
+        // `MLX.dequantized` (`lookup(shard:rows:)` ci-dessus), puis un
+        // scatter/add sur device par shard — O(shards) constructions de
+        // tenseurs et dispatches GPU par appel PLE. Correctif (une seule
+        // construction de tenseurs par appel) dans le commit suivant.
         var shardIndices: [Int] = []
         shardIndices.reserveCapacity(hostIDs.count)
         for ID in hostIDs {
@@ -750,27 +924,13 @@ public final class Qwen4ExpNGramEmbedding: Module {
             precondition(value >= 0 && value < shardOffsets.last!)
             shardIndices.append(shardIndex(for: value))
         }
-
-        // P5.4: bucket every ID's position by shard in one pass instead of
-        // scanning the whole `shardIndices` array once per distinct shard
-        // (`Set(shardIndices).sorted()` outer loop, `compactMap` inner scan
-        // — O(shards × total IDs), up to 128 × a few hundred thousand IDs on
-        // a long prefill). Measured contribution: this shard-routing loop,
-        // not the row-byte reads it was originally suspected to be, is what
-        // made the PLE layer (couche 1) cost ~30 % of a 2 543-token prefill
-        // (docs/knowledge/log.md "P5.4"). Order within each shard's position
-        // list is preserved (ascending original index), matching the old
-        // `compactMap` traversal exactly.
         var positionsByShard: [Int: [Int32]] = [:]
         positionsByShard.reserveCapacity(min(shardOffsets.count, shardIndices.count))
         for (index, shard) in shardIndices.enumerated() {
             positionsByShard[shard, default: []].append(Int32(index))
         }
-
         var groupedValues: [MLXArray] = []
         var groupedPositions: [[Int32]] = []
-        groupedValues.reserveCapacity(positionsByShard.count)
-        groupedPositions.reserveCapacity(positionsByShard.count)
         for shard in positionsByShard.keys.sorted() {
             let positions = positionsByShard[shard]!
             let local = positions.map { Int32(hostIDs[Int($0)]) - Int32(shardOffsets[shard]) }
@@ -778,11 +938,6 @@ public final class Qwen4ExpNGramEmbedding: Module {
             groupedValues.append(values)
             groupedPositions.append(positions)
         }
-        // The hash-to-shard routing necessarily evaluates the compact IDs on the
-        // host (the checkpoint is split into 128 independent tables). Keep the
-        // actual row gather/reorder on the device, using the same scatter
-        // primitive used by mlx-lm, so selected embeddings do not cross through
-        // Swift memory on every token.
         let dimension = embeddingDimension / ngramHeads
         guard let firstValues = groupedValues.first else {
             return MLXArray.zeros([IDs.dim(0), IDs.dim(1), embeddingDimension])
@@ -799,6 +954,14 @@ public final class Qwen4ExpNGramEmbedding: Module {
 
     public func cacheStats() -> Qwen4ExpNGramCacheStats? {
         ngramEmbedding.cacheStats()
+    }
+
+    public func ngramLookupStats() -> Qwen4ExpPLELookupStats? {
+        ngramEmbedding.lookupStats()
+    }
+
+    public func resetNgramLookupStats() {
+        ngramEmbedding.resetLookupStats()
     }
 
     private func shardIndex(for ID: Int) -> Int {
@@ -968,6 +1131,14 @@ public final class Qwen4ExpPLELayer: Module {
 
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats? {
         pleEmbedding.cacheStats()
+    }
+
+    public func ngramLookupStats() -> Qwen4ExpPLELookupStats? {
+        pleEmbedding.ngramLookupStats()
+    }
+
+    public func resetNgramLookupStats() {
+        pleEmbedding.resetNgramLookupStats()
     }
 }
 
