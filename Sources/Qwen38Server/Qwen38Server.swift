@@ -21,6 +21,18 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     public var tokensPerSecond: Double?
     public var lastToken: String
     public var cacheReused: Bool
+    /// P5.2: true when `cacheReused` came from an LRU restore (a different
+    /// conversation was live in the resident engine just before this
+    /// request) rather than the conversation already being live. GUI:
+    /// `sessionRow`'s "Cache" line — restauré / réutilisé / rejoué.
+    public var cacheRestored: Bool
+    /// P5.2: true when this request had a `conversation_id` with prior
+    /// history but still had to fall back to a full stateless replay
+    /// (`Qwen38Runtime.generateStateless`) instead of the persistent-cache
+    /// path — set directly by the server's `prepareConversation`, since the
+    /// engine-level `conversationReplayed` metric only ever reflects the 27B
+    /// M1 replay path today (Flash-Next always reports `false` there).
+    public var cacheReplayed: Bool
     public var conversationReplayed: Bool
     public var mtp: String
     public var mtpProposed: Int
@@ -29,8 +41,8 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     public var error: String?
     /// Set when the session completes or fails (GUI: durée totale).
     public var finishedAt: Date?
-    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil) {
-        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error
+    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, cacheRestored: Bool = false, cacheReplayed: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil) {
+        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.cacheRestored = cacheRestored; self.cacheReplayed = cacheReplayed; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error
     }
 }
 
@@ -44,7 +56,16 @@ public struct Qwen38ServerSnapshot: Sendable, Equatable, Codable {
     public let availableModels: [String]
     public let loadedModel: String?
     public let lastError: String?
-    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError }
+    /// P5.2: LRU counters for the Flash-Next per-conversation cache
+    /// (contrat §5.1.1 — the 27B path keeps its single `ChatSession` cache
+    /// and never touches these). `cacheBudgetBytes == 0` means the LRU is
+    /// disabled (`--conversation-cache-gb 0`, legacy single-active-cache
+    /// behavior).
+    public let cacheMisses: Int
+    public let cachedConversations: Int
+    public let cacheBytes: Int64
+    public let cacheBudgetBytes: Int64
+    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil, cacheMisses: Int = 0, cachedConversations: Int = 0, cacheBytes: Int64 = 0, cacheBudgetBytes: Int64 = 0) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError; self.cacheMisses = cacheMisses; self.cachedConversations = cachedConversations; self.cacheBytes = cacheBytes; self.cacheBudgetBytes = cacheBudgetBytes }
 }
 
 public enum Qwen38ServerError: LocalizedError, Equatable {
@@ -216,10 +237,28 @@ public actor Qwen38InferenceServer {
     private var activeConversationModel: String?
     private var activeConversationMessages: [Qwen38ChatMessage] = []
     private var activeConversationOptions: Qwen38GenerationOptions?
+    /// P5.2: LRU of exported Flash-Next conversation states that are *not*
+    /// currently live in the resident engine (the live one stays only in
+    /// `activeConversation*` above until a different id displaces it —
+    /// exporting on every turn would be wasted `KVCache.copy()` work).
+    /// qwen4Exp only; 27B never populates this (contrat §5.1.1).
+    private struct CachedConversation {
+        let model: String
+        let options: Qwen38GenerationOptions
+        let ledger: [Qwen38ChatMessage]
+        let state: any Qwen38FlashConversationStateProtocol
+    }
+    private var conversationCache: [String: CachedConversation] = [:]
+    /// Least-recently-used at the front, most-recently-used at the back.
+    private var conversationCacheOrder: [String] = []
+    private var conversationCacheBudgetBytes: Int64 = 12 * 1024 * 1024 * 1024
+    private var cacheMissCount = 0
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil) async throws {
+    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12) async throws {
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
+        conversationCacheBudgetBytes = conversationCacheGB > 0
+            ? Int64(conversationCacheGB * 1024 * 1024 * 1024) : 0
         let currentDirectory = await runtime.loadedDirectory
         let root = modelsDirectory ?? currentDirectory?.deletingLastPathComponent()
         guard let root else { throw Qwen38ServerError.modelNotLoaded }
@@ -246,7 +285,7 @@ public actor Qwen38InferenceServer {
     public func stop() async {
         guard serverStatus != .stopped else { return }; serverStatus = .stopping; serverTask?.cancel(); if let serverTask { await serverTask.value }; self.serverTask = nil; serverStatus = .stopped
     }
-    public func snapshot() async -> Qwen38ServerSnapshot { refreshModelCatalog(); let current = sessionOrder.compactMap { sessions[$0] }; return .init(status: serverStatus, port: serverPort, url: "http://127.0.0.1:\(serverPort)", activeSessions: current.filter { $0.status == .queued || $0.status == .running }.count, queuedSessions: await queue.queuedCount, sessions: current, availableModels: modelDirectories.keys.sorted(), loadedModel: loadedModel, lastError: lastError) }
+    public func snapshot() async -> Qwen38ServerSnapshot { refreshModelCatalog(); let current = sessionOrder.compactMap { sessions[$0] }; return .init(status: serverStatus, port: serverPort, url: "http://127.0.0.1:\(serverPort)", activeSessions: current.filter { $0.status == .queued || $0.status == .running }.count, queuedSessions: await queue.queuedCount, sessions: current, availableModels: modelDirectories.keys.sorted(), loadedModel: loadedModel, lastError: lastError, cacheMisses: cacheMissCount, cachedConversations: conversationCache.count, cacheBytes: totalCacheBytes(), cacheBudgetBytes: conversationCacheBudgetBytes) }
     private func serverDidStop() { if serverStatus != .stopping { serverStatus = .stopped } }
     private func serverDidFail(_ error: String) { lastError = error; serverStatus = .failed }
 
@@ -269,11 +308,17 @@ public actor Qwen38InferenceServer {
             let prepared = try prepare(input.messages)
             let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: input.temperature ?? 0, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine))
             let conversationID = input.effectiveConversationID
-            let usePersistentCache = try await prepareConversation(
+            let (usePersistentCache, cacheRestored) = try await prepareConversation(
                 id: conversationID,
                 model: selectedModel,
                 messages: prepared.messages,
                 options: options)
+            // Ground truth for the GUI's "Cache" tri-state (P5.2): a request
+            // that named a conversation with prior turns but still fell back
+            // to a full stateless replay. Computed here, not from engine
+            // metrics — see `cacheReplayed`'s doc comment.
+            let cacheReplayed = !usePersistentCache && conversationID != nil && prepared.messages.count > 1
+            updateSession(id) { $0.cacheRestored = cacheRestored; $0.cacheReplayed = cacheReplayed }
             let stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>
             if usePersistentCache, let last = prepared.messages.last {
                 let systemPrompt = prepared.messages.first(where: { $0.role == .system })?.content
@@ -311,23 +356,57 @@ public actor Qwen38InferenceServer {
         }
     }
 
-    private func prepareConversation(
+    /// P5.2: returns whether this request can use the resident engine's
+    /// persistent cache, and — when it can — whether that meant restoring a
+    /// different conversation's exported state into the (single, §5.1.1)
+    /// resident engine rather than continuing the conversation that was
+    /// already live.
+    func prepareConversation(
         id: String?,
         model: String,
         messages: [Qwen38ChatMessage],
         options: Qwen38GenerationOptions
-    ) async throws -> Bool {
+    ) async throws -> (usePersistentCache: Bool, cacheRestored: Bool) {
         guard let id else {
             clearActiveConversation()
-            return false
+            return (false, false)
         }
-        let isContinuation = activeConversationID == id
-            && activeConversationModel == model
-            && activeConversationOptions.map(cacheCompatible(_:)) == true
-            && messages.count == activeConversationMessages.count + 1
-            && Array(messages.dropLast()) == activeConversationMessages
-        if isContinuation {
-            return true
+        // The LRU only ever manages Flash-Next conversations (contrat
+        // §5.1.1 / PLAN.md P5 scope) — the 27B path, or an operator who set
+        // `--conversation-cache-gb 0`, keeps the original single-active-
+        // conversation behavior with no export/restore machinery at all.
+        guard familyOf(model) == .qwen4Exp, conversationCacheBudgetBytes > 0 else {
+            return (try await legacyPrepareConversation(id: id, model: model, messages: messages, options: options), false)
+        }
+
+        if activeConversationID == id, activeConversationModel == model,
+           activeConversationOptions.map({ cacheOptionsCompatible($0, options) }) == true,
+           messages.count == activeConversationMessages.count + 1,
+           Array(messages.dropLast()) == activeConversationMessages {
+            return (true, false)
+        }
+
+        // A different conversation is about to become live: export the
+        // current one into the LRU first (a no-op if none was active) so
+        // switching back to it later can restore instead of replaying.
+        if let previousID = activeConversationID, let previousModel = activeConversationModel,
+           let previousOptions = activeConversationOptions {
+            await storeActiveConversationIntoLRU(id: previousID, model: previousModel, options: previousOptions)
+        }
+        clearActiveConversation()
+
+        if let cached = conversationCache[id], cached.model == model,
+           cacheOptionsCompatible(cached.options, options),
+           messages.count == cached.ledger.count + 1,
+           Array(messages.dropLast()) == cached.ledger {
+            await runtime.restoreFlashConversationState(cached.state)
+            conversationCache.removeValue(forKey: id)
+            conversationCacheOrder.removeAll { $0 == id }
+            activeConversationID = id
+            activeConversationModel = model
+            activeConversationMessages = cached.ledger
+            activeConversationOptions = options
+            return (true, true)
         }
 
         // A new or non-contiguous session is deliberately cold. A short
@@ -335,11 +414,40 @@ public actor Qwen38InferenceServer {
         // histories use the stateless replay path and are not advertised as
         // cached because reconstructing assistant hidden states is impossible
         // without rerunning them.
+        cacheMissCount += 1
         await runtime.resetConversation()
-        activeConversationID = nil
-        activeConversationModel = nil
-        activeConversationMessages = []
-        activeConversationOptions = nil
+        let userCount = messages.filter { $0.role == .user }.count
+        guard messages.last?.role == .user,
+              userCount == 1,
+              messages.allSatisfy({ $0.role == .system || $0.role == .user }) else {
+            return (false, false)
+        }
+        activeConversationID = id
+        activeConversationModel = model
+        activeConversationOptions = options
+        return (true, false)
+    }
+
+    /// Legacy behavior (pre-P5.2 / LRU disabled / non-Flash-Next family):
+    /// exactly one conversation's cache can ever be live; switching ids
+    /// always resets and cold-starts, never restores.
+    private func legacyPrepareConversation(
+        id: String,
+        model: String,
+        messages: [Qwen38ChatMessage],
+        options: Qwen38GenerationOptions
+    ) async throws -> Bool {
+        let isContinuation = activeConversationID == id
+            && activeConversationModel == model
+            && activeConversationOptions.map({ cacheOptionsCompatible($0, options) }) == true
+            && messages.count == activeConversationMessages.count + 1
+            && Array(messages.dropLast()) == activeConversationMessages
+        if isContinuation {
+            return true
+        }
+
+        await runtime.resetConversation()
+        clearActiveConversation()
         let userCount = messages.filter { $0.role == .user }.count
         guard messages.last?.role == .user,
               userCount == 1,
@@ -352,15 +460,19 @@ public actor Qwen38InferenceServer {
         return true
     }
 
-    private func cacheCompatible(_ options: Qwen38GenerationOptions) -> Bool {
-        guard let active = activeConversationOptions else { return false }
-        return active.temperature == options.temperature
-            && active.topP == options.topP
-            && active.topK == options.topK
-            && active.enableThinking == options.enableThinking
-            && active.reasoningEffort == options.reasoningEffort
-            && active.kvBits == options.kvBits
-            && active.mtp == options.mtp
+    private func familyOf(_ model: String) -> Qwen38ModelFamily? {
+        guard let directory = modelDirectories[model] else { return nil }
+        return (try? Qwen38ModelValidator.readInfo(from: directory))?.family
+    }
+
+    private func cacheOptionsCompatible(_ a: Qwen38GenerationOptions, _ b: Qwen38GenerationOptions) -> Bool {
+        a.temperature == b.temperature
+            && a.topP == b.topP
+            && a.topK == b.topK
+            && a.enableThinking == b.enableThinking
+            && a.reasoningEffort == b.reasoningEffort
+            && a.kvBits == b.kvBits
+            && a.mtp == b.mtp
     }
 
     private func clearActiveConversation() {
@@ -370,7 +482,50 @@ public actor Qwen38InferenceServer {
         activeConversationOptions = nil
     }
 
-    private func rememberConversation(
+    /// P5.2: exports the currently-live conversation's engine state
+    /// (`Qwen38Runtime.exportFlashConversationState`, `KVCache.copy()`
+    /// under the hood — P5.1) into the LRU, then evicts the oldest entries
+    /// until the budget is met again.
+    private func storeActiveConversationIntoLRU(
+        id: String, model: String, options: Qwen38GenerationOptions
+    ) async {
+        guard !activeConversationMessages.isEmpty,
+              let exported = await runtime.exportFlashConversationState(ledger: activeConversationMessages)
+        else { return }
+        conversationCache[id] = CachedConversation(
+            model: model, options: options, ledger: activeConversationMessages, state: exported)
+        conversationCacheOrder.removeAll { $0 == id }
+        conversationCacheOrder.append(id)
+        await evictIfNeeded()
+    }
+
+    private func totalCacheBytes() -> Int64 {
+        conversationCache.values.reduce(Int64(0)) { $0 + Int64($1.state.byteCount) }
+    }
+
+    /// Drops the least-recently-used cached conversations until the total
+    /// exported byte count is back under budget. `MLXArray`s referenced only
+    /// by the evicted `CachedConversation` are released by ARC when the
+    /// dictionary entry is removed; `Memory.clearCache()` then returns that
+    /// freed device memory to the system (PLAN.md P5.2 criterion, verified
+    /// in a gated test against `Memory.activeMemory`).
+    private func evictIfNeeded() async {
+        guard conversationCacheBudgetBytes > 0 else { return }
+        var total = totalCacheBytes()
+        var evictedAny = false
+        while total > conversationCacheBudgetBytes, !conversationCacheOrder.isEmpty {
+            let oldest = conversationCacheOrder.removeFirst()
+            if let removed = conversationCache.removeValue(forKey: oldest) {
+                total -= Int64(removed.state.byteCount)
+                evictedAny = true
+            }
+        }
+        if evictedAny {
+            await runtime.clearMLXCache()
+        }
+    }
+
+    func rememberConversation(
         id: String,
         model: String,
         requestMessages: [Qwen38ChatMessage],
@@ -402,6 +557,11 @@ public actor Qwen38InferenceServer {
         }
         await runtime.unload()
         clearActiveConversation()
+        // A different resident model invalidates every exported state: they
+        // reference the previous decoder's own caches (§5.1.1, one model
+        // resident at a time).
+        conversationCache.removeAll()
+        conversationCacheOrder.removeAll()
         try await runtime.load(from: selection.1, preloadMTP: true)
         loadedModel = selection.0
         return selection.0

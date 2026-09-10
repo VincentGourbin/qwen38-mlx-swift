@@ -312,6 +312,31 @@ public actor Qwen38Runtime {
         flashEngine?.warmUp()
     }
 
+    /// P5.2: exposes the resident Flash-Next engine's export/restore surface
+    /// to the server's per-conversation LRU without leaking the concrete
+    /// engine type. `nil` when no Flash-Next model is resident (27B keeps
+    /// its own single `ChatSession` cache, untouched by the LRU — contrat
+    /// §5.1.1 / PLAN.md P5 scope).
+    public func exportFlashConversationState(
+        ledger: [Qwen38ChatMessage]
+    ) -> (any Qwen38FlashConversationStateProtocol)? {
+        flashEngine?.exportConversationState(ledger: ledger)
+    }
+
+    /// Restores a previously exported state into the resident Flash-Next
+    /// engine. A no-op when no Flash-Next model is resident.
+    public func restoreFlashConversationState(_ state: any Qwen38FlashConversationStateProtocol) {
+        flashEngine?.restoreConversationState(state)
+    }
+
+    /// P5.2: releases MLX's allocator cache after the server's LRU drops
+    /// evicted conversation snapshots, so the device memory those
+    /// `MLXArray`s held is actually returned to the system instead of
+    /// sitting in MLX's buffer pool.
+    public func clearMLXCache() {
+        Memory.clearCache()
+    }
+
     /// Executes the local M2 loop on one prepared request.
     ///
     /// This diagnostic entry point is intentionally separate from `generate`:

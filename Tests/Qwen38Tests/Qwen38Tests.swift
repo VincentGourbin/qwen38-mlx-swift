@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import MLXProfiler
 import Testing
 import Tokenizers
 @testable import Qwen38Core
@@ -119,6 +120,67 @@ func serverModelsEndpointPublishesBothFamilies() async throws {
     ])
     let (_, unknownModelResponse) = try await URLSession.shared.data(for: request)
     #expect((unknownModelResponse as? HTTPURLResponse).map { (200 ..< 300).contains($0.statusCode) } == false)
+}
+
+@Test("P5.2 : le LRU serveur restaure deux conversations alternées A/B/A/B sans rejeu")
+func serverConversationLRURestoresAlternatingConversations() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-lru-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let options = Qwen38GenerationOptions()
+    let userA1 = Qwen38ChatMessage(role: .user, content: "A1")
+    let userB1 = Qwen38ChatMessage(role: .user, content: "B1")
+
+    // Turn 1 of each conversation: cold start, persistent path, no restore.
+    let a1 = try await server.prepareConversation(
+        id: "A", model: modelID, messages: [userA1], options: options)
+    #expect(a1.usePersistentCache == true)
+    #expect(a1.cacheRestored == false)
+    await server.rememberConversation(
+        id: "A", model: modelID, requestMessages: [userA1], assistantContent: "replyA1")
+
+    let b1 = try await server.prepareConversation(
+        id: "B", model: modelID, messages: [userB1], options: options)
+    #expect(b1.usePersistentCache == true)
+    #expect(b1.cacheRestored == false)
+    await server.rememberConversation(
+        id: "B", model: modelID, requestMessages: [userB1], assistantContent: "replyB1")
+
+    // Turn 2 alternates back to A: B is now live, so A must come from the LRU.
+    let ledgerA = [userA1, Qwen38ChatMessage(role: .assistant, content: "replyA1")]
+    let userA2 = Qwen38ChatMessage(role: .user, content: "A2")
+    let a2 = try await server.prepareConversation(
+        id: "A", model: modelID, messages: ledgerA + [userA2], options: options)
+    #expect(a2.usePersistentCache == true)
+    #expect(a2.cacheRestored == true)
+    await server.rememberConversation(
+        id: "A", model: modelID, requestMessages: ledgerA + [userA2], assistantContent: "replyA2")
+
+    // Turn 2 of B: A is now live again, so B must also come from the LRU.
+    let ledgerB = [userB1, Qwen38ChatMessage(role: .assistant, content: "replyB1")]
+    let userB2 = Qwen38ChatMessage(role: .user, content: "B2")
+    let b2 = try await server.prepareConversation(
+        id: "B", model: modelID, messages: ledgerB + [userB2], options: options)
+    #expect(b2.usePersistentCache == true)
+    #expect(b2.cacheRestored == true)
+
+    #expect(mock.restoreCount == 2)
 }
 
 @Test("Les options appliquent le contrat KV cache Qwen")
@@ -522,14 +584,33 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
         prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateOptions = options
-        return AsyncThrowingStream { $0.finish() }
+        return Self.makeCompletedStream()
     }
 
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateFromMessagesOptions = options
-        return AsyncThrowingStream { $0.finish() }
+        return Self.makeCompletedStream()
+    }
+
+    /// P5.2: a server-level LRU test needs a request to actually complete
+    /// (one `.chunk` then `.metrics`) so `chatCompletionsResponse` reaches
+    /// `completeSession`/`rememberConversation` — the empty-and-finish
+    /// stream above was enough for the H3.1/PM4.3 dispatch tests, which
+    /// never drain it.
+    private static func makeCompletedStream() -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.chunk("mock"))
+            continuation.yield(
+                .metrics(
+                    Qwen38RunMetrics(
+                        metrics: LLMMetrics(
+                            prefillTime: 0.01, generationTime: 0.01, promptTokens: 1,
+                            generatedTokens: 1),
+                        stopReason: .stop, report: "", chromeTrace: Data())))
+            continuation.finish()
+        }
     }
 
     /// P5.2: records restores so a server LRU test can assert "2 restores, 0

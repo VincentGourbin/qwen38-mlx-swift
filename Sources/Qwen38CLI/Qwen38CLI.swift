@@ -1979,6 +1979,13 @@ struct Serve: AsyncParsableCommand {
         help: "Avec --trace : enregistrer en plus un Metal System Trace (xctrace, attaché à ce process) pendant N secondes après le chargement, fusionné dans la trace Chrome")
     var metalTraceSeconds: Int = 0
 
+    @Option(
+        name: .long,
+        help:
+            "P5.2 : budget en Go du LRU de conversations Flash-Next par client (0 = comportement précédent, un seul cache actif, défaut 12)"
+    )
+    var conversationCacheGb: Double = 12
+
     func run() async throws {
         let runtime = Qwen38Runtime()
         var session: ProfilingSession?
@@ -2006,7 +2013,8 @@ struct Serve: AsyncParsableCommand {
             port: port,
             apiKey: apiKey,
             modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
-                .deletingLastPathComponent())
+                .deletingLastPathComponent(),
+            conversationCacheGB: conversationCacheGb)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
 

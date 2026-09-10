@@ -894,6 +894,14 @@ private struct ServerView: View {
         // Demande Vincent (2026-09-09) : plus de flux de tokens dans la liste,
         // seulement les statistiques de génération, avec entrée / sortie.
         let duration = (session.finishedAt ?? Date()).timeIntervalSince(session.startedAt)
+        // P5.2 : trois états du cache de conversation Flash-Next — restauré
+        // (LRU, une autre conversation était résidente juste avant),
+        // réutilisé (déjà résidente), rejoué (repli sans cache persistant).
+        let cacheLabel: String? =
+            session.cacheRestored ? "restauré"
+            : session.cacheReused ? "réutilisé"
+            : session.cacheReplayed ? "rejoué"
+            : nil
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Circle()
@@ -928,8 +936,8 @@ private struct ServerView: View {
                 } else if session.mtp != "indisponible" {
                     sessionStat("MTP", session.mtp)
                 }
-                if session.cacheReused {
-                    sessionStat("Cache", session.conversationReplayed ? "rejoué" : "réutilisé")
+                if let cacheLabel {
+                    sessionStat("Cache", cacheLabel)
                 }
             }
             if let error = session.error {
