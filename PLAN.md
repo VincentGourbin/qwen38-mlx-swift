@@ -3867,3 +3867,23 @@ remet le moteur à zéro (l'erreur « image qu'au premier tour » vue par Vincen
 venait de là). Correctif complet : traiter la conversation GUI comme une
 entrée du LRU (`conversation_id` interne, export après chaque tour, restore
 avant le suivant), ce qui rend GUI et LAN réellement indépendants.
+
+### P6 — Après P5 : ce que la trace désigne encore — plan du 2026-09-10
+
+Faits (`log.md` « Dialogue 20 min via la GUI (P5) et lecture de la trace
+P5.6 ») : serveur transparent (2 ms par requête) ; TTFT plat de ~2 s = coût
+fixe du forward (PLE 28 %, 48 couches host-bound à courte longueur) ; les
+clients OpenAI ordinaires (Open WebUI, SDK) n'envoient **pas** de
+`conversation_id` et renvoient tout l'historique → ils ne profitent pas du
+LRU et paient toujours le rejeu (TTFT 8,5 ms par token d'historique) ; la
+pénalité de présence n'agit qu'à l'intérieur d'un tour (paraphrases entre
+tours) ; la GUI et le LAN partagent l'état du moteur (P5.7).
+
+| # | Tâche | Critère |
+|---|---|---|
+| P6.1 | **Cache de préfixe implicite** : sans `conversation_id`, le serveur reconnaît un historique dont un préfixe (messages rendus identiques, comparés sur les IDs de tokens rendus, pas sur le texte) correspond au ledger d'un état du LRU, restaure cet état et ne préfille que le suffixe ; la clé du LRU devient un hash du préfixe rendu (`conversation_id` explicite reste prioritaire). Cas à couvrir : même historique + nouveau message utilisateur (continuation), historique tronqué par le client (fenêtre glissante → miss propre), système modifié (miss). | test XCTest avec moteur mock ; dialogue A/B **sans** `conversation_id` (option `--no-conversation-id` à ajouter au script) : TTFT plat comme avec |
+| P6.2 | **PLE / n-gram en préfill** : après le routage O(n) de P5.4, la couche 1 reste ~20× une couche normale. Mesurer le nombre d'ops MLX émis par `Qwen4ExpLazyNGramStorage.lookup` pour un batch de 100 tokens (un par shard touché, jusqu'à 128) et le temps hôte de lecture des lignes ; regrouper en **une seule** construction de tenseurs par appel (lignes de tous les shards concaténées côté hôte dans l'ordre des positions, un `MLXArray` packé + un scales + un biases, une déquantification) ; garder le LRU de lignes. | couche PLE ≤ 3× une couche normale en préfill (mesure `--profile-layers`), IDs identiques, parité n-gram `delta=0` |
+| P6.3 | **Pénalité sur tout le contexte** : le masque de présence/répétition est initialisé avec les tokens des tours **assistant** précédents (limité aux 2 048 derniers tokens du prompt), pas seulement les tokens du tour courant ; option `penalty_context_tokens` (défaut 2 048, 0 = ancien comportement). Greedy inchangé. | dialogue A/B 20 min : aucune paire de répliques consécutives du même agent avec Jaccard > 0,6 (contre 3 épisodes) ; IDs greedy identiques |
+| P6.4 | **P5.7 — GUI indépendante du LAN** : la conversation GUI est une entrée du LRU (`conversation_id` interne `gui`), exportée après chaque tour et restaurée avant le suivant ; le runtime ne touche plus directement à l'état du moteur pour la GUI. Test : tour GUI → requête LAN → tour GUI ⇒ le second tour GUI continue bien la conversation GUI (IDs identiques à un dialogue GUI sans requête LAN intercalée). | test gated + scénario manuel documenté |
+| P6.5 | **Coût fixe du forward court** : profil `--profile-layers` d'un préfill de 100 tokens (Release) : ms par couche vs les 3,4 ms du décodage ; si les couches non-PLE coûtent > 10 ms à S=100, chercher l'op qui croît avec S côté hôte (masque QSA construit sur CPU ? MRoPE ? `asType`) ; sinon clore. | tableau ms/couche S=1 vs S=100 |
+| P6.6 | **Validation** : dialogue 20 min **sans** `conversation_id` (le cas Open WebUI) contre `serve --trace` ; tableau avec P5.6 ; `BENCHMARKS.md`. | TTFT médian < 3 s sans `conversation_id`, aucune boucle, pic process < 75 Go |

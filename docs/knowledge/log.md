@@ -3104,3 +3104,24 @@ prochain levier, non implémentée ici.
 
 Fichiers : `results/p56/dialogue.jsonl`, `results/p56/sessions.jsonl`,
 `results/p56/server.log` (rapport profiler complet), `results/p56/serve.trace.json`.
+
+## 2026-09-10 — Dialogue 20 min via la GUI (P5) et lecture de la trace P5.6 : points de friction restants
+
+Dialogue A/B contre le serveur de la GUI (P5 complet, `results/dialogue-gui-p5`) :
+102 tours en 20 min (38 hier, 76 en P5.6 CLI), TTFT médian 1,71 s, max 2,65 s,
+6,3 tok/s médian, contexte final ≈ 6 500 tokens par agent, débit 6,4 → 6,1
+tok/s entre le début et la fin. Trois paraphrases (tours 24, 52, 54, Jaccard
+0,67-0,81 avec la réplique précédente du même agent), pas de boucle durable.
+Bug trouvé par Vincent : le moteur résident est partagé GUI/LAN, un premier
+tour GUI après une requête LAN était pris pour une continuation (image
+refusée) → reset au premier tour GUI (`ae9f72f`), P5.7 pour l'indépendance.
+
+Trace P5.6 (`results/p56/serve.trace.json`, 76 requêtes) décomposée par
+requête : **le serveur ne coûte rien** (reste hors préfill/génération 2 ms,
+attente client 20 ms) ; tout est dans le modèle. Préfill médian **2,16 s pour
+~100 tokens de suffixe** (≈ 45 tok/s, GPU 55 %, CPU 88 % : host-bound à
+courte longueur ; la couche PLE/n-gram pèse 28 % du préfill, P5.4) contre 115-
+190 tok/s à 1 000-2 700 tokens ; génération 14 s pour ~80 tokens (89 % GPU,
+51 % CPU). Mémoire stable (compresseur ≤ 0,8 Go, process 56 Go, MLX 53 Go).
+Le TTFT plat de 2 s est donc un **coût fixe par forward** (48 couches
+dispatchées + PLE), pas une fonction du contexte.
