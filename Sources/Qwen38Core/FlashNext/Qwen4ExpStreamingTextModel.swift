@@ -7,6 +7,10 @@ import MLX
 public final class Qwen4ExpStreamingTextModelSnapshot: @unchecked Sendable {
     fileprivate let decoder: Qwen4ExpStreamingDecoderSnapshot
     fileprivate let logicalOffset: Int
+    /// P5.1: device bytes held by the copied per-layer caches (GDN/PLE/QSA).
+    /// Does not include the resident decoder *weights* (those are shared
+    /// across every conversation, not per-snapshot).
+    public var byteCount: Int { decoder.byteCount }
 
     fileprivate init(decoder: Qwen4ExpStreamingDecoderSnapshot, logicalOffset: Int) {
         self.decoder = decoder

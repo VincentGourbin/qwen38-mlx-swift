@@ -531,6 +531,28 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
         lastGenerateFromMessagesOptions = options
         return AsyncThrowingStream { $0.finish() }
     }
+
+    /// P5.2: records restores so a server LRU test can assert "2 restores, 0
+    /// replays" without a real checkpoint (H3.1's mock-engine pattern).
+    private(set) var restoreCount = 0
+    private(set) var lastRestoredLedger: [Qwen38ChatMessage]?
+    var fakeByteCount = 1
+
+    private struct MockState: Qwen38FlashConversationStateProtocol {
+        let ledger: [Qwen38ChatMessage]
+        let byteCount: Int
+    }
+
+    func exportConversationState(
+        ledger: [Qwen38ChatMessage]
+    ) -> any Qwen38FlashConversationStateProtocol {
+        MockState(ledger: ledger, byteCount: fakeByteCount)
+    }
+
+    func restoreConversationState(_ state: any Qwen38FlashConversationStateProtocol) {
+        restoreCount += 1
+        lastRestoredLedger = state.ledger
+    }
 }
 
 private final class MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory, @unchecked Sendable {
@@ -1740,6 +1762,58 @@ func qwen4ExpStreamingGeneratorMatchesGreedyAndStreams() async throws {
     }
     #expect(continuationTokenCount == continuation.tokenIDs.count)
     #expect(continuationTokenCount < built.tokenIDs.count)
+}
+
+@Test("P5.1 : export → génération d'un tour → restore → même sortie qu'avant l'export")
+func qwen4ExpEngineExportRestoreConversationStateReproducesGeneration() async throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
+        return
+    }
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let engine = try await Qwen38FlashNextEngine(directory: directory)
+
+    let options = Qwen38GenerationOptions(maxTokens: 6, temperature: 0)
+    // ~3 000 tokens of history (P5.1's measurement target): a long repeated
+    // prompt, same idea as the P4 préfill probes in docs/knowledge/log.md.
+    let longPrompt = String(
+        repeating: "Le chat noir traverse la rue tranquillement avant midi. ", count: 220)
+    for try await _ in try engine.generate(
+        prompt: longPrompt, systemPrompt: nil, imageURLs: [], options: options
+    ) {}
+
+    // Export right after the first turn, exactly the point P5.2's LRU
+    // captures a conversation between two client turns. Timed here (P5.1
+    // "mesurer le coût à 3 000 tokens, attendu < 100 ms") since
+    // `KVCache.copy()` is the only per-export cost — everything else is
+    // struct bookkeeping.
+    let exportStart = ContinuousClock.now
+    let exported = engine.exportConversationState(ledger: [])
+    let exportDuration = ContinuousClock.now - exportStart
+    let byteCount = exported.byteCount
+    print(
+        "P5.1-export byteCount=\(byteCount) (\(Double(byteCount) / 1e6) Mo) "
+            + "duration=\(exportDuration)")
+    #expect(byteCount > 0)
+
+    // A second, different turn perturbs the live state...
+    var sideTurn = ""
+    for try await event in try engine.generate(
+        prompt: "Et son prédécesseur ?", systemPrompt: nil, imageURLs: [], options: options
+    ) {
+        if case .chunk(let chunk) = event { sideTurn += chunk }
+    }
+    #expect(!sideTurn.isEmpty)
+
+    // ...restoring the export must reproduce the exact same next-turn
+    // output the untouched state would have produced.
+    engine.restoreConversationState(exported)
+    var restoredTurn = ""
+    for try await event in try engine.generate(
+        prompt: "Et son prédécesseur ?", systemPrompt: nil, imageURLs: [], options: options
+    ) {
+        if case .chunk(let chunk) = event { restoredTurn += chunk }
+    }
+    #expect(restoredTurn == sideTurn)
 }
 
 @Test("Qwen38Runtime bascule Flash-Next → 27B dans le même process et libère la résidence (H3.3)")

@@ -19,9 +19,18 @@ public enum Qwen4ExpLayerLoadingMode: String, Sendable, Equatable {
 /// decoder: MLX arrays are intentionally confined to the owning runtime.
 public final class Qwen4ExpStreamingDecoderSnapshot: @unchecked Sendable {
     fileprivate let caches: [Int: any KVCache]
+    /// P5.1: total device bytes held by this snapshot's copied caches
+    /// (`KVCache.state` is the generic array surface every cache family —
+    /// `ArraysCache`, `MambaCache`, `Qwen4ExpQSAKVCache` — already exposes).
+    /// Summed once at snapshot time so a caller (the server's LRU, P5.2)
+    /// never has to walk the cache dictionary itself.
+    public let byteCount: Int
 
     fileprivate init(caches: [Int: any KVCache]) {
         self.caches = caches
+        self.byteCount = caches.values.reduce(0) { total, cache in
+            total + cache.state.reduce(0) { $0 + $1.nbytes }
+        }
     }
 }
 

@@ -22,6 +22,23 @@ public enum Qwen38FlashNextEngineError: LocalizedError, Equatable {
     }
 }
 
+/// P5.1: opaque, exportable snapshot of one Flash-Next conversation's
+/// generation state. `Qwen38FlashNextEngine` produces the real thing
+/// (decoder caches via `Qwen4ExpStreamingTextModel.snapshot()`); a test
+/// mock can hand back its own lightweight conformer without loading the
+/// ~57-84 GB real checkpoint (H3.1's existing mock-engine pattern).
+public protocol Qwen38FlashConversationStateProtocol: Sendable {
+    /// The exact message history (system/user/assistant turns, assistant
+    /// replies included) this state was captured after — the server's LRU
+    /// contract (§5.1.1, P5.2) compares an incoming request's
+    /// `messages.dropLast()` against this to decide whether the state is
+    /// still a valid continuation point.
+    var ledger: [Qwen38ChatMessage] { get }
+    /// Device bytes held by the captured caches — what the server's
+    /// `--conversation-cache-gb` budget is measured against.
+    var byteCount: Int { get }
+}
+
 /// Runtime-facing surface for the Flash-Next engine. A protocol — rather
 /// than the concrete `Qwen38FlashNextEngine` — so `Qwen38Runtime`'s family
 /// dispatch (H3.1) can be exercised in tests through a lightweight mock,
@@ -50,6 +67,18 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     /// A best-effort warm-up: failures surface later, on the first real
     /// `generate` call, rather than here.
     func warmUp() -> AsyncStream<Int>
+    /// P5.1: capture the complete per-conversation generation state (decoder
+    /// caches, M-RoPE offset, turn index) bundled with `ledger` — the
+    /// message history already rendered — so the server's LRU (P5.2) can
+    /// key, budget and later restore it as one unit. MTP's own drafter
+    /// cache is deliberately not preserved (see `Qwen38FlashNextEngine`'s
+    /// doc comment on `exportConversationState`): a restored conversation
+    /// re-primes the drafter from scratch on its next MTP-enabled turn.
+    func exportConversationState(ledger: [Qwen38ChatMessage]) -> any Qwen38FlashConversationStateProtocol
+    /// Replace this engine's live conversation state with a previously
+    /// exported one. The engine is a single resident model (§5.1.1): this
+    /// overwrites whatever conversation was live before the call.
+    func restoreConversationState(_ state: any Qwen38FlashConversationStateProtocol)
 }
 
 public protocol Qwen38FlashNextEngineFactory: Sendable {
@@ -61,6 +90,31 @@ public struct Qwen38DefaultFlashNextEngineFactory: Qwen38FlashNextEngineFactory 
 
     public func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol {
         try await Qwen38FlashNextEngine(directory: directory)
+    }
+}
+
+/// P5.1: `Qwen38FlashNextEngine`'s concrete conversation state. Holds the
+/// decoder's copied caches (`Qwen4ExpStreamingTextModelSnapshot`, itself
+/// `@unchecked Sendable` for the same "MLX arrays are confined to the
+/// owning runtime" reason as every other Flash-Next snapshot type) plus the
+/// bookkeeping `restoreConversationState` needs to put the engine back in
+/// exactly the state `exportConversationState` found it in.
+public final class Qwen38FlashConversationState: Qwen38FlashConversationStateProtocol, @unchecked Sendable {
+    fileprivate let modelSnapshot: Qwen4ExpStreamingTextModelSnapshot
+    fileprivate let hasConversationHistory: Bool
+    fileprivate let turnIndex: Int
+    public let ledger: [Qwen38ChatMessage]
+    public let byteCount: Int
+
+    fileprivate init(
+        modelSnapshot: Qwen4ExpStreamingTextModelSnapshot, hasConversationHistory: Bool,
+        turnIndex: Int, ledger: [Qwen38ChatMessage]
+    ) {
+        self.modelSnapshot = modelSnapshot
+        self.hasConversationHistory = hasConversationHistory
+        self.turnIndex = turnIndex
+        self.ledger = ledger
+        self.byteCount = modelSnapshot.byteCount
     }
 }
 
@@ -169,6 +223,46 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
 
     public func unload() {
         model.decoder.unloadResidentLayers()
+    }
+
+    /// P5.1: capture caches + M-RoPE offset (`model.snapshot()`, `KVCache.copy()`
+    /// under the hood — measured cost and size documented in
+    /// docs/knowledge/log.md "P5.1") together with the turn bookkeeping a
+    /// later `restoreConversationState` needs to resume exactly where this
+    /// conversation left off.
+    ///
+    /// MTP's drafter cache (`mtpDraftState`) is intentionally *not* captured:
+    /// it has no `copy()`-based deep-snapshot support today, and MTP requires
+    /// greedy decoding while the LRU's main use case (P5.2) is sampled
+    /// multi-client dialogue. A conversation restored through this state
+    /// simply re-primes its drafter from scratch on its next MTP-enabled
+    /// turn (`runMTPGenerationStream` treats a missing `mtpDraftState` as
+    /// "prime fresh" already).
+    public func exportConversationState(
+        ledger: [Qwen38ChatMessage]
+    ) -> any Qwen38FlashConversationStateProtocol {
+        Qwen38FlashConversationState(
+            modelSnapshot: model.snapshot(), hasConversationHistory: hasConversationHistory,
+            turnIndex: turnIndex, ledger: ledger)
+    }
+
+    /// Replace the engine's live state with a previously exported one. Only
+    /// ever called by the server's LRU (P5.2) with a state this same engine
+    /// produced (states never cross model families or checkpoints), hence
+    /// the force-cast — a mismatch here would be a server-side bug, not a
+    /// recoverable runtime condition.
+    public func restoreConversationState(_ state: any Qwen38FlashConversationStateProtocol) {
+        guard let state = state as? Qwen38FlashConversationState else {
+            preconditionFailure(
+                "restoreConversationState: état d'un autre moteur (bug du LRU serveur)")
+        }
+        model.restore(state.modelSnapshot)
+        hasConversationHistory = state.hasConversationHistory
+        turnIndex = state.turnIndex
+        // See exportConversationState's doc comment: the drafter cache is
+        // never preserved, so any stale one from before this restore must
+        // not survive into the resumed conversation.
+        mtpDraftState = nil
     }
 
     public func decode(tokenIDs: [Int32]) -> String {
