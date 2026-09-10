@@ -398,12 +398,35 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     public func lookupBatch(_ requests: [(shard: Int, row: Int32)]) -> MLXArray {
         precondition(!requests.isEmpty)
         var positionsByShard: [Int: [Int32]] = [:]
+        positionsByShard.reserveCapacity(min(shards.count, requests.count))
         for (index, request) in requests.enumerated() {
             positionsByShard[request.shard, default: []].append(Int32(index))
         }
-        var packedFlat = [UInt32](repeating: 0, count: requests.count * packedWidth)
-        var scalesFlat = [UInt16](repeating: 0, count: requests.count * scaleWidth)
-        var biasesFlat: [UInt16]?
+        let hasBiases = shards[requests[0].shard]?.biases != nil
+
+        // P6.2: an earlier version of this scatter used `Array.
+        // replaceSubrange` per position — correct, but measured *slower*
+        // than the O(shards) path it replaced on a 2 543-token prefill
+        // (14.6s vs 9.25s of PLE-layer time): high-level Array API overhead
+        // (bounds checks, COW checks) dominating a loop that runs once per
+        // token × head (tens of thousands of iterations). Raw
+        // `UnsafeMutableBufferPointer.update(from:count:)` is the same
+        // primitive `readContiguousRuns` already relies on for the mmap
+        // reads (P5.4) — writing every shard's fetched rows straight into
+        // pre-allocated flat buffers at each row's *global* offset avoids
+        // both the per-position Array overhead and any Swift-level
+        // reallocation.
+        let packedBuffer = UnsafeMutableBufferPointer<UInt32>.allocate(
+            capacity: requests.count * packedWidth)
+        defer { packedBuffer.deallocate() }
+        let scalesBuffer = UnsafeMutableBufferPointer<UInt16>.allocate(
+            capacity: requests.count * scaleWidth)
+        defer { scalesBuffer.deallocate() }
+        let biasesBuffer: UnsafeMutableBufferPointer<UInt16>? = hasBiases
+            ? UnsafeMutableBufferPointer<UInt16>.allocate(capacity: requests.count * scaleWidth)
+            : nil
+        defer { biasesBuffer?.deallocate() }
+
         let readStart = ContinuousClock.now
         for (shard, positions) in positionsByShard {
             guard let location = shards[shard] else {
@@ -414,30 +437,33 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             let packedRows = readPackedRows(location.weight, rows: rowIndices)
             let scaleRows = readUInt16Rows(location.scales, rows: rowIndices)
             let biasRows = location.biases.map { readUInt16Rows($0, rows: rowIndices) }
-            for (localIndex, globalPosition) in positions.enumerated() {
-                let globalIndex = Int(globalPosition)
-                packedFlat.replaceSubrange(
-                    (globalIndex * packedWidth) ..< ((globalIndex + 1) * packedWidth),
-                    with: packedRows[(localIndex * packedWidth) ..< ((localIndex + 1) * packedWidth)])
-                scalesFlat.replaceSubrange(
-                    (globalIndex * scaleWidth) ..< ((globalIndex + 1) * scaleWidth),
-                    with: scaleRows[(localIndex * scaleWidth) ..< ((localIndex + 1) * scaleWidth)])
-                if let biasRows {
-                    if biasesFlat == nil {
-                        biasesFlat = [UInt16](repeating: 0, count: requests.count * scaleWidth)
+            packedRows.withUnsafeBufferPointer { source in
+                for (localIndex, globalPosition) in positions.enumerated() {
+                    (packedBuffer.baseAddress! + Int(globalPosition) * packedWidth)
+                        .update(from: source.baseAddress! + localIndex * packedWidth, count: packedWidth)
+                }
+            }
+            scaleRows.withUnsafeBufferPointer { source in
+                for (localIndex, globalPosition) in positions.enumerated() {
+                    (scalesBuffer.baseAddress! + Int(globalPosition) * scaleWidth)
+                        .update(from: source.baseAddress! + localIndex * scaleWidth, count: scaleWidth)
+                }
+            }
+            if let biasRows, let biasesBuffer {
+                biasRows.withUnsafeBufferPointer { source in
+                    for (localIndex, globalPosition) in positions.enumerated() {
+                        (biasesBuffer.baseAddress! + Int(globalPosition) * scaleWidth)
+                            .update(from: source.baseAddress! + localIndex * scaleWidth, count: scaleWidth)
                     }
-                    biasesFlat!.replaceSubrange(
-                        (globalIndex * scaleWidth) ..< ((globalIndex + 1) * scaleWidth),
-                        with: biasRows[(localIndex * scaleWidth) ..< ((localIndex + 1) * scaleWidth)])
                 }
             }
         }
         let readSeconds = (ContinuousClock.now - readStart).seconds
-        let packedArray = MLXArray(packedFlat).reshaped([requests.count, packedWidth])
-        let scalesArray = MLXArray(scalesFlat).reshaped([requests.count, scaleWidth])
+        let packedArray = MLXArray(Array(packedBuffer)).reshaped([requests.count, packedWidth])
+        let scalesArray = MLXArray(Array(scalesBuffer)).reshaped([requests.count, scaleWidth])
             .view(dtype: .bfloat16)
-        let biasesArray = biasesFlat.map {
-            MLXArray($0).reshaped([requests.count, scaleWidth]).view(dtype: .bfloat16)
+        let biasesArray = biasesBuffer.map { buffer -> MLXArray in
+            MLXArray(Array(buffer)).reshaped([requests.count, scaleWidth]).view(dtype: .bfloat16)
         }
         let result = MLX.dequantized(
             packedArray, scales: scalesArray, biases: biasesArray,
@@ -909,44 +935,34 @@ public final class Qwen4ExpNGramEmbedding: Module {
             return MLXArray.zeros([IDs.dim(0), IDs.dim(1), embeddingDimension])
         }
 
-        // P6.2 mesure (docs/knowledge/log.md "P6.2") : chaque shard distinct
-        // touché par le batch (jusqu'à 231 mesurés sur le checkpoint réel,
-        // constant quel que soit le nombre de tokens dans le préfill)
-        // construit ici ses propres `MLXArray(...)` × 2-3 + un
-        // `MLX.dequantized` (`lookup(shard:rows:)` ci-dessus), puis un
-        // scatter/add sur device par shard — O(shards) constructions de
-        // tenseurs et dispatches GPU par appel PLE. Correctif (une seule
-        // construction de tenseurs par appel) dans le commit suivant.
-        var shardIndices: [Int] = []
-        shardIndices.reserveCapacity(hostIDs.count)
+        // P6.2 correctif (mesure dans docs/knowledge/log.md "P6.2" : avant
+        // ce correctif, chacun des shards distincts touchés — jusqu'à 231
+        // mesurés sur le checkpoint réel, constant quel que soit le nombre
+        // de tokens dans le préfill — construisait ses propres
+        // `MLXArray(...)` × 2-3 + un `MLX.dequantized` (`lookup(shard:
+        // rows:)` ci-dessus) plus un scatter/add sur device — O(shards)
+        // constructions de tenseurs et dispatches GPU par appel PLE, couche
+        // 1 ~18-20× une couche normale). Route chaque ID vers son shard et
+        // sa ligne locale, dans l'ordre des positions, puis un seul appel
+        // `lookupBatch` : lecture des lignes toujours par shard sur l'hôte
+        // (P5.4, inchangé), mais une seule construction de tenseurs (packé
+        // + scales + biases) et une seule déquantification pour tout
+        // l'appel — le résultat revient déjà dans l'ordre des positions,
+        // aucun scatter/add nécessaire.
+        var requests: [(shard: Int, row: Int32)] = []
+        requests.reserveCapacity(hostIDs.count)
         for ID in hostIDs {
             let value = Int(ID)
             precondition(value >= 0 && value < shardOffsets.last!)
-            shardIndices.append(shardIndex(for: value))
+            let shard = shardIndex(for: value)
+            requests.append((shard: shard, row: Int32(value - shardOffsets[shard])))
         }
-        var positionsByShard: [Int: [Int32]] = [:]
-        positionsByShard.reserveCapacity(min(shardOffsets.count, shardIndices.count))
-        for (index, shard) in shardIndices.enumerated() {
-            positionsByShard[shard, default: []].append(Int32(index))
-        }
-        var groupedValues: [MLXArray] = []
-        var groupedPositions: [[Int32]] = []
-        for shard in positionsByShard.keys.sorted() {
-            let positions = positionsByShard[shard]!
-            let local = positions.map { Int32(hostIDs[Int($0)]) - Int32(shardOffsets[shard]) }
-            let values = ngramEmbedding.lookup(shard: shard, rows: local)
-            groupedValues.append(values)
-            groupedPositions.append(positions)
-        }
+
         let dimension = embeddingDimension / ngramHeads
-        guard let firstValues = groupedValues.first else {
-            return MLXArray.zeros([IDs.dim(0), IDs.dim(1), embeddingDimension])
-        }
-        var result = MLXArray.zeros([hostIDs.count, dimension], dtype: firstValues.dtype)
-        for (values, positions) in zip(groupedValues, groupedPositions) {
-            result = result.at[MLXArray(positions).asType(.int32)].add(values)
-        }
-        result = result.reshaped([IDs.dim(0), IDs.dim(1), embeddingDimension])
+        let flatResult = ngramEmbedding.lookupBatch(requests)
+        precondition(flatResult.shape == [hostIDs.count, dimension],
+                     "PLE lookup batch inattendu: \(flatResult.shape)")
+        let result = flatResult.reshaped([IDs.dim(0), IDs.dim(1), embeddingDimension])
         precondition(result.shape == [IDs.dim(0), IDs.dim(1), embeddingDimension],
                      "PLE lookup inattendu: \(result.shape)")
         return result

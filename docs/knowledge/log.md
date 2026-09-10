@@ -3125,3 +3125,61 @@ courte longueur ; la couche PLE/n-gram pèse 28 % du préfill, P5.4) contre 115-
 51 % CPU). Mémoire stable (compresseur ≤ 0,8 Go, process 56 Go, MLX 53 Go).
 Le TTFT plat de 2 s est donc un **coût fixe par forward** (48 couches
 dispatchées + PLE), pas une fonction du contexte.
+
+## 2026-09-10 — P6.2 : lookups PLE regroupés en un seul appel — gain réel à ~100 tokens, nul à 2 500 (l'E/S domine)
+
+Instrumentation (`Qwen4ExpPLELookupStats` : appels, `MLXArray` construits,
+`MLX.dequantized`, temps hôte des lectures) sur `Qwen4ExpLazyNGramStorage`,
+propagée jusqu'au CLI comme `ngramCacheStats`. Mesure « avant » (ancien
+chemin, un `lookup(shard:rows:)` par shard distinct touché) sur le
+checkpoint 3-bit réel via `flash-chat-probe --resident-layers
+--resident-async --profile-layers --trace` (deux tours, protocole P5.4) :
+231 shards distincts touchés — **constant, indépendant du nombre de
+tokens** — donc 693 `MLXArray` construits + 231 `MLX.dequantized` + un
+scatter/add sur device par shard, à 125 tokens comme à 2 556.
+
+**Correctif** : `Qwen4ExpNGramEmbedding.lookup` route chaque ID vers
+`(shard, ligne locale)` puis appelle `Qwen4ExpLazyNGramStorage.lookupBatch`
+une seule fois — une construction de tenseurs (packé + scales + biases) et
+une déquantification pour tout l'appel, quel que soit le nombre de shards
+touchés. IDs greedy identiques à la référence
+(`[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`), parité
+`flash-ngram-parity` `delta=0`.
+
+**Premier essai de l'assemblage host→device, réfuté par la mesure** : une
+version qui réordonne les lignes lues par shard vers leur position globale
+via `Array.replaceSubrange` par position (une fois par token × tête, soit
+~245 000 fois sur le préfill 2 543 tokens des deux tours) a **régressé** :
+couche PLE 2 568 ms → 3 616 ms à 2 500 tokens (+41 %), 280 ms → 341 ms à 100
+tokens. Le surcoût de l'API `Array` haut niveau (bornes, COW) sur une
+boucle aussi chaude dominait le gain visé. Corrigé en écrivant directement
+dans des `UnsafeMutableBufferPointer` pré-alloués (`update(from:count:)`,
+même primitive que `readContiguousRuns`, P5.4) au lieu de `replaceSubrange`.
+
+**Résultat final, mesuré deux fois (avant/après le correctif d'assemblage)** :
+
+| | couche PLE (avant) | couche PLE (après) | lookupCalls | MLXArray | dequantize |
+|---|---:|---:|---:|---:|---:|
+| ~100 tokens (125 cumulés 2 tours) | 280 ms (méd. 16 ms, 17,5×) | **172 ms (10,75×, −39 %)** | 231 → 2 | 693 → 6 | 231 → 2 |
+| ~2 500 tokens (2 556 cumulés) | 2 568 ms (méd. 138 ms, 18,6×) | 2 614 ms (19,1×, +1,8 %, bruit) | 231 → 2 | 693 → 6 | 231 → 2 |
+
+**Cause racine corrigée par rapport à l'hypothèse de départ** (celle du
+plan P6.2, qui reprenait celle de P5.4) : ce n'est pas le nombre de
+dispatches GPU/constructions de tenseurs qui domine à grande échelle, mais
+le temps hôte des lectures mmap elles-mêmes (`ple_host_read_seconds` :
+2,445 s sur 2,614 s de couche PLE à 2 500 tokens, **93 %**) — de la lecture
+aléatoire sur le Lexar USB pour des lignes non encore en cache. Regrouper
+les constructions de tenseurs supprime bien le surcoût de dispatch (mesurable
+et net à ~100 tokens, l'ordre de grandeur d'un tour de dialogue réel après
+P5.2/P6.1) mais ne peut rien contre un plafond d'E/S à grande échelle — le
+critère « couche PLE ≤ 3× une couche normale » n'est donc pas atteint
+(10,75× et 19,1× après correctif, contre 17,5× et 18,6× avant), et ne
+pouvait pas l'être par ce seul levier. Un chantier distinct (cache de lignes
+plus agressif, préchargement, ou déplacement de la table n-gram vers un
+support plus rapide) resterait nécessaire pour l'atteindre, hors périmètre
+de ce correctif ciblé.
+
+Fichiers : `results/p62/before-chat-100.stdout.txt`,
+`results/p62/before-chat-2500.stdout.txt`, `results/p62/after2-chat-100.stdout.txt`,
+`results/p62/after2-chat-2500.stdout.txt`, `results/p62/after-ngram-parity-v2.stdout.txt`
+(traces `.trace.json` non versionnées, gitignore).

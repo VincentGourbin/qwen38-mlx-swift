@@ -1,0 +1,6 @@
+shard: 0 · lignes: [0, 1, 12345]
+forme eager/lazy: [3, 160] / [3, 160]
+max |delta|: 0
+mean |delta|: 0
+parité n-gram lazy: IDENTIQUE
+cache lignes: hits=18 · misses=9 · entrées=9 · max |delta| répétition=0
