@@ -3858,3 +3858,12 @@ fenêtre, méthode `rows[i]` vs `rows[i-2]`) ne correspond pas au chiffre 0,87
 cité plus haut dans ce document — écart non expliqué, méthode d'origine non
 retrouvée. Détails complets, tableaux avant/après et fichiers :
 `docs/knowledge/log.md` (2026-09-10, « P5.6 »), `BENCHMARKS.md` (« P5.6 »).
+
+**P5.7 (à faire)** — la conversation de la GUI et celles du serveur partagent
+le même moteur résident : après une requête LAN (ou une restauration LRU), le
+tour suivant de la GUI continue sur l'état d'un autre client. Correctif
+minimal appliqué le 2026-09-10 : le premier tour d'une conversation GUI
+remet le moteur à zéro (l'erreur « image qu'au premier tour » vue par Vincent
+venait de là). Correctif complet : traiter la conversation GUI comme une
+entrée du LRU (`conversation_id` interne, export après chaque tour, restore
+avant le suivant), ce qui rend GUI et LAN réellement indépendants.

@@ -766,6 +766,15 @@ public actor Qwen38Runtime {
         forceConversationReplay: Bool = false
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         if let flashEngine {
+            // The resident engine is shared with the LAN server (single model,
+            // §5.1.1): after a server request — or a P5 LRU restore — it holds
+            // someone else's conversation. A new GUI conversation must start
+            // from a clean state, otherwise its first turn is treated as a
+            // continuation ("Flash-Next n'accepte une image qu'au premier
+            // tour", seen 2026-09-10 with an image on turn 1).
+            if conversationTurnCount == 0 {
+                flashEngine.resetConversation()
+            }
             conversationTurnCount += 1
             return try flashEngine.generate(
                 prompt: prompt, systemPrompt: systemPrompt, imageURLs: imageURLs,
