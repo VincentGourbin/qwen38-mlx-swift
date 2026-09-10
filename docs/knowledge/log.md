@@ -2928,3 +2928,45 @@ supposait le prompt terminé à l'intérieur de `<think>`. Correctif :
 `thinkingIsPrimed = options.enableThinking`. Au passage : l'IP LAN du Mac
 change avec le DHCP (192.168.1.183 → .87 cette nuit) ; l'onglet Serveur la lit
 en direct, les scripts de test doivent la relire aussi.
+
+## 2026-09-10 — Dialogue A/B de 20 minutes sous profiler 1.5.0 (serveur CLI, 3-bit)
+
+`qwen38 serve --trace … --metal-trace-seconds 300` (session partagée, sampler
+16 ms `ioReportResidency`, mémoire système) + `Scripts/agent-dialogue.py`
+20 min : 38 tours, trace Chrome de 34 Mo (`results/dialogue-profiled/`).
+
+**Débit en fonction de l'historique** (rejeu stateless à chaque tour, les
+deux agents alternant sur un seul cache) :
+
+| Tour | Historique | TTFT | Génération |
+|---|---|---|---|
+| 4 | 407 tok | 4,3 s | 5,7 tok/s |
+| 10 | 1 075 | 8,4 s | 5,9 |
+| 22 | 1 994 | 13,3 s | 5,9 |
+| 31 | 2 414 | 17,3 s | 5,6 |
+| 38 | 2 691 | 23,9 s | 4,9 |
+
+TTFT ≈ 8,5 ms par token d'historique (≈ 115 tok/s de préfill) ; génération
+stable 5,6-6,0 tok/s jusqu'à ~2 500 tokens puis 4,9. **GPU (residency IOReport,
+moyenne pondérée par phase)** : 78-95 % en génération, 29-65 % en préfill
+(croissant avec la longueur) — le préfill court est host-bound, la génération
+ne l'est plus depuis P4.1. CPU 45-90 %. Pic process 66,3 Go, MLX 60,7 Go
+(KV/QSA + n-gram sur 2 700 tokens : +4 Go par rapport à un prompt court).
+Passage des 2 048 tokens (chemin QSA épars) au tour 22 sans incident.
+
+**Incident au tour 13 (TTFT 228 s)** : c'est l'arrêt du Metal System Trace
+attaché (limite 300 s). xctrace a écrit un bundle de **15 Go** ; pendant
+l'écriture, le compresseur est monté à 56 Go et le swap à 27 Go, l'anonyme du
+process est tombé de 69 à 20 Go (modèle compressé), `memorystatus_level` à
+27 % ; retour à la normale après 4 minutes. `Recorder.stop()` a échoué (le
+process xctrace s'était déjà terminé) et la fusion n'a pas eu lieu ; l'export
+`--toc` du bundle n'a rien rendu en 2 min. Bundle supprimé. Correctifs :
+fenêtre plafonnée à 60 s dans `serve`, `stop()` tolérant après la limite de
+temps ; retour au profiler (#532) : plafond de durée par défaut, estimation
+de taille, et `Recorder.stop()` idempotent après auto-arrêt.
+
+Détails de session : Release, batterie, sampler 59 651 échantillons, pas de
+stall détecté par le profiler (le gel du tour 13 avait des échantillons : ce
+n'est pas une absence d'échantillons mais une famine mémoire). Les compteurs
+n-gram restent à 0 en session partagée (ils ne sont publiés qu'avec le
+profilage par couche) — à brancher sur la session partagée.

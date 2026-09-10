@@ -2011,10 +2011,17 @@ struct Serve: AsyncParsableCommand {
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
 
         var recorder: MetalSystemTrace.Recorder?
-        if let session, metalTraceSeconds > 0 {
+        if metalTraceSeconds > 60 {
+            // 2026-09-10 : 300 s attachés à un serveur résident de 57 Go ont
+            // produit un bundle de 15 Go, 56 Go de compresseur, 27 Go de swap
+            // et 4 minutes de gel du service au moment de l'arrêt de xctrace.
+            print("Metal System Trace : durée plafonnée à 60 s (demandé \(metalTraceSeconds) s) — au-delà, xctrace écrase la mémoire de la machine")
+        }
+        let metalTraceWindow = min(metalTraceSeconds, 60)
+        if let session, metalTraceWindow > 0 {
             do {
-                let r = try session.startMetalSystemTrace(timeLimit: TimeInterval(metalTraceSeconds))
-                print("Metal System Trace : enregistrement \(r.waitUntilRecording() ? "démarré" : "en attente") pour \(metalTraceSeconds) s")
+                let r = try session.startMetalSystemTrace(timeLimit: TimeInterval(metalTraceWindow))
+                print("Metal System Trace : enregistrement \(r.waitUntilRecording() ? "démarré" : "en attente") pour \(metalTraceWindow) s")
                 recorder = r
             } catch {
                 print("Metal System Trace indisponible : \(error)")
@@ -2032,8 +2039,10 @@ struct Serve: AsyncParsableCommand {
         let recordingStarted = Date()
         while !Task.isCancelled && !stopFlag.isStopRequested {
             try await Task.sleep(for: .seconds(1))
-            if let r = recorder, Date().timeIntervalSince(recordingStarted) > TimeInterval(metalTraceSeconds + 5) {
-                metalTraceURL = try? r.stop()
+            if let r = recorder, Date().timeIntervalSince(recordingStarted) > TimeInterval(metalTraceWindow + 5) {
+                // Après la limite de temps xctrace s'est déjà arrêté seul :
+                // `stop()` peut échouer, mais le bundle est sur disque.
+                metalTraceURL = (try? r.stop()) ?? r.output
                 recorder = nil
                 print("Metal System Trace terminé : \(metalTraceURL?.path ?? "?")")
             }

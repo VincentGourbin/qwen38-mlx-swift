@@ -12,6 +12,8 @@ import MLXProfiler
 /// disable the profiler, and skip the per-request report/Chrome export.
 public enum Qwen38Profiling {
     nonisolated(unsafe) public static var sharedSession: ProfilingSession?
+    private static let counterLock = NSLock()
+    nonisolated(unsafe) private static var requestCounter = 0
 
     /// Returns the session to record into and whether the caller owns it.
     /// A caller that owns its session disables the profiler at the end; a
@@ -21,10 +23,14 @@ public enum Qwen38Profiling {
     ) -> (session: ProfilingSession, ownsSession: Bool, phase: String) {
         let profiler = MLXProfiler.shared
         if let shared = sharedSession {
+            // The per-turn index restarts at 1 for every stateless request;
+            // number requests globally so the trace reads "Requête 1…N".
+            counterLock.lock(); requestCounter += 1; let n = requestCounter; counterLock.unlock()
+            let globalPhase = "Requête \(n)"
             profiler.activeSession = shared
             profiler.enable()
-            profiler.start(phase)
-            return (shared, false, phase)
+            profiler.start(globalPhase)
+            return (shared, false, globalPhase)
         }
         let session = ProfilingSession(config: .singleRun, subsystem: "com.qwen38mlx")
         session.title = title

@@ -1,0 +1,160 @@
+2026-09-10T08:11:00+0200 info Qwen38Inference: [HummingbirdCore] Server started and listening on 0.0.0.0:8848
+2026-09-10T08:31:39+0200 error Qwen38Inference: [HummingbirdCore] Waiting on child channel: CancellationError()
+Profilage de session actif (Release) → results/dialogue-profiled/serve.trace.json
+Chargement du modèle…
+Qwen3.8 écoute sur http://0.0.0.0:8848
+POST /v1/chat/completions · GET /v1/models · GET /metrics
+Metal System Trace : enregistrement démarré pour 300 s
+Metal System Trace terminé : ?
+Arrêt du serveur…
+
+╭──────────────────────────────────────────────────────────────────╮
+│  QWEN3.8 SERVE                                                   │
+├──────────────────────────────────────────────────────────────────┤
+  model: Qwen3.8-Flash-Next-MLX-e3bit-MTP  port: 8848
+  Device: applegpu_g15s  RAM: 96GB  Build: Release  Power: Battery Power
+  Sampler: 16 ms, ioReportResidency, 59651 samples
+  pmset: disksleep=10 displaysleep=2 powernap=1 sleep=1 standby=1  (idle sleep held off)
+
+  PHASE TIMINGS                                GPU%   p50   CPU%
+  ──────────────────────────────────────────────────────────────────
+  Prefill                1m 11.6s    2.9%           7%    0%  20.1%
+  Prefill                   4.08s     0.2%          29%    0%  59.4%
+  Prefill                   3.20s     0.1%          40%    0%  93.1%
+  Prefill                   4.30s     0.2%          38%    0%  84.8%
+  Prefill                   4.88s     0.2%          41%   14%  80.6%
+  Prefill                   5.74s     0.2%          39%    0%  75.3%
+  Prefill                   6.36s     0.3%          40%    0%  74.9%
+  Prefill                   7.11s     0.3%          41%    0%  74.1%
+  Prefill                   7.93s     0.3%          42%    0%  71.8%
+  Prefill                   8.41s     0.3%          43%    0%  71.8%
+  Prefill                  11.36s     0.5%          50%   51%  59.5%
+  Prefill                  10.68s     0.4%          47%    0%  60.7%
+  Prefill                3m 48.6s    9.4%          12%    0%  13.1%
+  Prefill                  12.63s     0.5%          41%    0%  55.2%
+  Prefill                  10.79s     0.4%          48%    0%  62.3%
+  Prefill                  11.20s     0.5%          49%   30%  68.1%
+  Prefill                  11.39s     0.5%          48%    0%  64.3%
+  Prefill                  11.79s     0.5%          49%   25%  65.2%
+  Prefill                  11.97s     0.5%          47%    0%  63.8%
+  Prefill                  12.34s     0.5%          47%    0%  68.4%
+  Prefill                  12.87s     0.5%          47%    0%  67.1%
+  Prefill                  13.32s     0.5%          46%    0%  63.4%
+  Prefill                  13.59s     0.6%          46%    0%  64.3%
+  Prefill                  14.02s     0.6%          47%    0%  63.7%
+  Prefill                  14.29s     0.6%          48%   16%  68.1%
+  Prefill                  14.65s     0.6%          46%    0%  63.2%
+  Prefill                  15.11s     0.6%          47%    0%  61.9%
+  Prefill                  15.37s     0.6%          48%   15%  63.1%
+  Prefill                  15.87s     0.7%          49%   13%  60.6%
+  Prefill                  16.67s     0.7%          50%   58%  58.8%
+  Prefill                  17.33s     0.7%          51%  100%  57.6%
+  Prefill                  18.00s     0.7%          55%  100%  55.5%
+  Prefill                  18.64s     0.8%          55%  100%  53.5%
+  Prefill                  19.59s     0.8%          58%  100%  51.1%
+  Prefill                  20.58s     0.8%          60%  100%  48.6%
+  Prefill                  21.54s     0.9%          62%  100%  46.2%
+  Prefill                  22.91s     0.9%          63%  100%  43.5%
+  Prefill                  23.89s     1.0%          65%  100%  43.1%
+  Generation               15.41s     0.6%          78%  100%  53.3%
+  Generation               16.78s     0.7%          79%  100%  52.6%
+  Generation               21.03s     0.9%          77%  100%  51.3%
+  Generation               18.69s     0.8%          79%  100%  52.7%
+  Generation               21.17s     0.9%          78%  100%  53.2%
+  Generation               19.31s     0.8%          79%  100%  54.1%
+  Generation               14.42s     0.6%          79%  100%  53.9%
+  Generation               21.42s     0.9%          79%  100%  54.6%
+  Generation               16.32s     0.7%          81%  100%  55.4%
+  Generation               20.45s     0.8%          81%  100%  44.8%
+  Generation               11.31s     0.5%          79%  100%  44.4%
+  Generation               18.72s     0.8%          80%  100%  57.2%
+  Generation               33.83s     1.4%          45%   29%  36.8%
+  Generation               12.45s     0.5%          83%  100%  47.1%
+  Generation               13.51s     0.6%          82%  100%  46.5%
+  Generation                9.99s     0.4%          84%  100%  47.6%
+  Generation               10.20s     0.4%          84%  100%  47.8%
+  Generation                9.37s     0.4%          84%  100%  48.3%
+  Generation                7.37s     0.3%          85%  100%  49.0%
+  Generation               10.66s     0.4%          85%  100%  48.1%
+  Generation                6.06s     0.2%          89%  100%  51.0%
+  Generation                5.77s     0.2%          87%  100%  50.8%
+  Generation                7.85s     0.3%          87%  100%  54.9%
+  Generation                6.57s     0.3%          89%  100%  57.3%
+  Generation                6.69s     0.3%          87%  100%  58.2%
+  Generation                4.89s     0.2%          95%  100%  62.0%
+  Generation                5.53s     0.2%          85%  100%  59.4%
+  Generation                8.20s     0.3%          88%  100%  58.0%
+  Generation               10.29s     0.4%          86%  100%  56.8%
+  Generation                6.77s     0.3%          85%  100%  58.8%
+  Generation                6.48s     0.3%          85%  100%  59.2%
+  Generation                5.41s     0.2%          86%  100%  61.7%
+  Generation                7.31s     0.3%          86%  100%  58.7%
+  Generation                3.54s     0.1%          95%  100%  64.8%
+  Generation                3.82s     0.2%          91%  100%  77.4%
+  Generation                3.02s     0.1%          94%  100%  64.7%
+  Generation               14.77s     0.6%          86%  100%  52.5%
+  Generation               18.34s     0.8%          84%  100%  51.5%
+  Chargement                1.63s     0.1%           9%    0%  48.2%
+  Requête 1              1m 27.0s    3.6%          19%    0%  26.0%
+  Requête 1                20.86s     0.9%          69%  100%  53.9%
+  Requête 1                24.24s     1.0%          72%  100%  56.8%
+  Requête 1                22.99s     0.9%          71%  100%  58.7%
+  Requête 1                26.06s     1.1%          71%  100%  58.3%
+  Requête 1                25.08s     1.0%          70%  100%  59.0%
+  Requête 1                20.79s     0.9%          67%  100%  60.4%
+  Requête 1                28.53s     1.2%          69%  100%  59.5%
+  Requête 1                24.25s     1.0%          68%  100%  60.7%
+  Requête 1                28.87s     1.2%          70%  100%  52.7%
+  Requête 1                22.67s     0.9%          65%  100%  52.0%
+  Requête 1                29.40s     1.2%          68%  100%  58.5%
+  Requête 1              4m 22.4s   10.8%          16%    0%  16.1%
+  Requête 1                25.08s     1.0%          62%  100%  51.2%
+  Requête 1                24.31s     1.0%          67%  100%  53.5%
+  Requête 1                21.19s     0.9%          66%  100%  58.4%
+  Requête 1                21.59s     0.9%          65%  100%  56.5%
+  Requête 1                21.16s     0.9%          64%  100%  57.7%
+  Requête 1                19.35s     0.8%          62%  100%  58.2%
+  Requête 1                23.01s     0.9%          65%  100%  59.0%
+  Requête 1                18.93s     0.8%          60%  100%  61.9%
+  Requête 1                19.10s     0.8%          59%  100%  59.6%
+  Requête 1                21.44s     0.9%          61%  100%  60.9%
+  Requête 1                20.58s     0.8%          60%  100%  61.6%
+  Requête 1                20.98s     0.9%          61%  100%  64.9%
+  Requête 1                19.55s     0.8%          58%  100%  62.9%
+  Requête 1                20.67s     0.8%          57%  100%  61.2%
+  Requête 1                23.58s     1.0%          62%  100%  61.3%
+  Requête 1                26.19s     1.1%          63%  100%  59.1%
+  Requête 1                23.47s     1.0%          60%  100%  58.8%
+  Requête 1                23.82s     1.0%          60%  100%  58.0%
+  Requête 1                23.44s     1.0%          62%  100%  57.0%
+  Requête 1                25.98s     1.1%          64%  100%  55.0%
+  Requête 1                23.16s     0.9%          64%  100%  53.3%
+  Requête 1                24.44s     1.0%          64%  100%  53.1%
+  Requête 1                24.59s     1.0%          66%  100%  48.5%
+  Requête 1                37.72s     1.5%          72%  100%  47.0%
+  Requête 1                42.26s     1.7%          73%  100%  46.8%
+  ──────────────────────────────────────────────────────────────────
+  TOTAL                  40m 38.8s  100.0%
+
+  MEMORY
+  ──────────────────────────────────────────────────────────────────
+  Peak MLX Active: 60661.0 MB  at 20:18.429
+  Peak Process: 66316.0 MB  at 20:19.911
+
+  System-wide (peaks):
+    Anonymous:    70974.6 MB    Wired:  65195.2 MB
+    File-backed:  39247.0 MB    Speculative: 29093.4 MB
+    Compressor:   57744.6 MB occupied, holding 156597.2 MB (2.71x)
+    Swap used:    27392.0 MB
+    Lowest kern.memorystatus_level: 27
+
+  ⚠ Compressor grew 28.0 GB during "Prefill" - that phase includes compression stalls,
+    not just model work.
+  ⚠ Compressor grew 10.4 GB during "Generation" - that phase includes compression stalls,
+    not just model work.
+  ⚠ Compressor grew 11.3 GB during "Requête 1" - that phase includes compression stalls,
+    not just model work.
+
+╰──────────────────────────────────────────────────────────────────╯
+
+trace : results/dialogue-profiled/serve.trace.json
