@@ -2008,6 +2008,21 @@ struct Serve: AsyncParsableCommand {
         MLXProfiler.shared.start("Chargement")
         try await runtime.load(from: URL(fileURLWithPath: modelPath, isDirectory: true))
         MLXProfiler.shared.end("Chargement")
+        // P5.5 : `serve` payait jusqu'ici le chargement de chaque couche
+        // Flash-Next dans le TTFT de la toute première requête (71 s mesurés
+        // en CLI, docs/knowledge/log.md P5 « Faits mesurés ») parce que,
+        // contrairement à la GUI (`BenchViewModel.loadModel`), il ne forçait
+        // jamais `runtime.flashNextWarmUp()`. Fait ici avant d'écouter, sous
+        // sa propre phase profiler pour rester visible dans la trace de
+        // session partagée.
+        if await runtime.isFlashNextLoaded {
+            print("Warm-up Flash-Next (couches résidentes)…")
+            MLXProfiler.shared.start("Warm-up")
+            if let progress = await runtime.flashNextWarmUp() {
+                for await _ in progress {}
+            }
+            MLXProfiler.shared.end("Warm-up")
+        }
         let server = Qwen38InferenceServer(runtime: runtime)
         try await server.start(
             port: port,

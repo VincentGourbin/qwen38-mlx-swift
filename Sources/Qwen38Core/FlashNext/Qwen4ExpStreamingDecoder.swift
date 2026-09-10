@@ -253,7 +253,15 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             cache: cache,
             positionIDs: positionIDs,
             verificationSink: verificationSink)
-            if profileLayers, let currentNGramStats = loaded.layer.ngramCacheStats() {
+            // P5.5: bookkeeping only (a dictionary/struct read on the PLE's
+            // already-resident LRU state, no GPU op) — always on, unlike the
+            // `profiler.start`/`.end` pair above which stays gated by
+            // `profileLayers` (P0-c's ~4.7 ms/boundary cost). Before this fix
+            // `model.ngramCacheStats()` — and therefore the generators'
+            // `recordNGramCacheStats` counter published into the shared
+            // profiling session — stayed at zero unless `--profile-layers`
+            // was also on (docs/knowledge/log.md 2026-09-10, "Dialogue A/B").
+            if let currentNGramStats = loaded.layer.ngramCacheStats() {
                 observeNGramCache(layerIndex: layerIndex, current: currentNGramStats)
             }
             // Streamed mode must detach the next layer from the previous
