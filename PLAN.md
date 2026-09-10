@@ -3804,3 +3804,26 @@ P4.3 (aucune fusion implémentée, faisceau de preuves documenté dans
 −15,4 %, MTP 0,135→0,1328 s/token −1,6 %). Détail complet, tableaux et
 écarts assumés : `docs/knowledge/log.md`, entrée « 2026-09-09 — P4 : débit
 de décodage ».
+
+### P5 — Serveur multi-clients : cache par conversation, pénalité de présence, préfill — plan du 2026-09-10
+
+**Faits mesurés** (dialogue A/B de 20 min sous profiler 1.5.0, `log.md`
+« Dialogue A/B de 20 minutes ») : deux clients qui alternent sur le serveur
+paient chacun le rejeu complet de leur historique — TTFT 4 s à 400 tokens,
+24 s à 2 700 (8,5 ms par token, préfill à 115 tok/s, GPU 29-65 % en préfill
+contre 78-95 % en génération) ; à température 0,7 sans pénalité, le dialogue
+boucle à partir du tour 30 (similarité 0,87 entre répliques consécutives) ;
+en CLI, la première requête paie 71 s de résidence parce que `serve` ne fait
+pas le warm-up que la GUI fait. Périmètre : **Flash-Next d'abord** (le 27B
+garde son cache unique `ChatSession`, à traiter ensuite avec le même contrat).
+Règle inchangée : IDs identiques à la référence quand `temperature 0`, garde
+Q-B, 78+ tests.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P5.1 | **État de conversation exportable** : `Qwen38FlashNextEngine.exportConversationState() -> Qwen38FlashConversationState` (snapshot du décodeur = caches par couche via `Qwen4ExpStreamingTextModel.snapshot()` + `logicalOffset`, `hasConversationHistory`, `turnIndex`, état MTP éventuel, **ledger des messages** rendus) et `restoreConversationState(_:)`. Mesurer la taille (`nbytes` des caches) et l'exposer (`state.byteCount`). Le snapshot copie les caches (`KVCache.copy()`) : mesurer le coût à 3 000 tokens (attendu < 100 ms). | test : export → génération d'un tour → restore → même sortie qu'avant l'export (IDs identiques) |
+| P5.2 | **LRU de conversations côté serveur** (`Qwen38InferenceServer`) : dictionnaire `conversation_id → état` borné par un budget en octets (`--conversation-cache-gb`, défaut 12 Go, 0 = comportement actuel), éviction LRU ; `prepareConversation` : si l'id est connu et que `messages == ledger + 1`, restaurer l'état et continuer (chemin `generate` avec `continueConversation`) au lieu du rejeu stateless ; sinon rejeu et nouvel état après la réponse. Le modèle résident reste unique (§5.1.1). Métriques : `cacheReused`, `cacheRestored` (état rechargé depuis le LRU), `cacheMisses`, `cachedConversations`, `cacheBytes` dans `/metrics` et dans la liste de sessions GUI (colonne « Cache »). | test XCTest : deux conversations alternées A/B/A/B avec un moteur mock ⇒ 2 restaurations, 0 rejeu ; sur le vrai serveur : TTFT du tour 30 d'un dialogue A/B < 3 s (contre 17 s) |
+| P5.3 | **Pénalité de présence et de répétition** : `Qwen38GenerationOptions.presencePenalty` (défaut 0) et `repetitionPenalty` (défaut 1,0) ; champs OpenAI `presence_penalty` (et `frequency_penalty` accepté, appliqué comme présence) + `repetition_penalty` dans `extra` ; appliqués dans `Qwen4ExpStreamingGenerator` avant le sampler sur le GPU (masque des IDs déjà générés maintenu incrémentalement, `logits[ids] -= presence`, `logits[ids] /= repetition` pour les positifs et `*=` pour les négatifs, une seule op par token, pas de `.item()`), uniquement quand `temperature > 0` (greedy inchangé). Preset `.instruct` du modèle : `presence 1.5` **appliqué par défaut par le serveur quand le client échantillonne sans préciser** (documenté dans le README ; `presence_penalty: 0` explicite le désactive). | test unitaire sur logits synthétiques ; dialogue A/B 20 min : similarité Jaccard médiane entre répliques consécutives du même agent < 0,3 (contre 0,87) |
+| P5.4 | **Préfill** : profiler par sous-blocs un préfill de 2 700 tokens (Release, `--profile-layers` opt-in) : part de la couche PLE (n-gram : ~20 000 lignes lues une par une, `Qwen4ExpPLE.lookup` → `asArray` + lectures ligne par ligne), du masque QSA/indexer au-delà de 2 048 tokens, du `gatherQMM` trié. Correctif ciblé sur le premier poste : pour le n-gram, lecture **par plages triées** (un `pread` par plage contiguë) et une seule construction d'`MLXArray` par shard et par appel. | TTFT à 2 700 tokens avant/après (référence 23,9 s) ; IDs identiques |
+| P5.5 | `serve` : warm-up au démarrage (`engine.warmUp()` comme la GUI, phase « Warm-up » dans la trace) ; compteurs n-gram publiés aussi en session partagée ; `/metrics` expose le budget et l'occupation du LRU. | première requête : TTFT < 3 s pour 60 tokens (contre 71 s) |
+| P5.6 | **Validation** : rejouer `Scripts/agent-dialogue.py --max-minutes 20` contre `qwen38 serve --trace` (sans Metal trace, ou ≤ 60 s) ; tableau avant/après : TTFT par tour, tok/s, similarité, pic mémoire, `cacheRestored` ; `BENCHMARKS.md` ligne « serveur multi-conversations ». | TTFT plat (< 3 s) sur 38 tours, aucune boucle, pic process < 75 Go |
