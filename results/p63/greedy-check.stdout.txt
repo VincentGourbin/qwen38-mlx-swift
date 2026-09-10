@@ -1,0 +1,11 @@
+=== tour 1 ===
+Le président de la Chine est Xi Jinping
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]
+TTFT: 70.240s
+prefill: 70.240s
+decode: 1.605s
+couches: 384 visites · load cumulé 68.756s
+P4.2 fin de token (cumulé) : lm_head 0.0211s · sampler.sample 0.0000s · .item() 0.0038s
+MLX mémoire active: 56,18 GB
+MLX mémoire peak: 56,59 GB

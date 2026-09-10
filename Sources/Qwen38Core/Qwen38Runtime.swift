@@ -24,6 +24,14 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     /// P5.3: multiplicative repetition penalty (`extra.repetition_penalty`).
     /// 1.0 is a no-op (default). Same scope restriction as `presencePenalty`.
     public var repetitionPenalty: Float
+    /// P6.3: how many of the most recent **assistant-turn** tokens the
+    /// presence/repetition mask is seeded with before the first token of a
+    /// new turn, instead of starting empty every turn (`extra.
+    /// penalty_context_tokens`). 0 restores the pre-P6.3 per-turn-only
+    /// behavior. Only ever consulted alongside `presencePenalty`/
+    /// `repetitionPenalty` (temperature > 0) — greedy decoding is
+    /// unaffected regardless of this value.
+    public var penaltyContextTokens: Int
 
     public init(
         maxTokens: Int = 256,
@@ -35,7 +43,8 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         kvBits: Int? = 4,
         mtp: Qwen38MTPOptions = .init(),
         presencePenalty: Float = 0,
-        repetitionPenalty: Float = 1.0
+        repetitionPenalty: Float = 1.0,
+        penaltyContextTokens: Int = 2048
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -47,6 +56,7 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         self.mtp = mtp
         self.presencePenalty = presencePenalty
         self.repetitionPenalty = repetitionPenalty
+        self.penaltyContextTokens = penaltyContextTokens
     }
 
     public var parameters: GenerateParameters {

@@ -59,6 +59,13 @@ public struct Qwen4ExpStreamingGenerationOptions: Sendable, Equatable {
     /// P5.3: multiplicative repetition penalty, same greedy-only exemption
     /// as `presencePenalty`. 1.0 = no-op.
     public var repetitionPenalty: Float
+    /// P6.3: token ids the presence/repetition mask starts from — the
+    /// caller's job (`Qwen38FlashNextEngine`) to have already limited these
+    /// to the last `penaltyContextTokens` assistant-turn tokens. Empty
+    /// (default) reproduces the pre-P6.3 "per-turn only" mask. Ignored
+    /// whenever penalties are inactive (greedy, or both penalties at their
+    /// no-op values).
+    public var initialPenaltyTokenIDs: [Int32]
 
     public init(
         maxNewTokens: Int = 256,
@@ -67,7 +74,8 @@ public struct Qwen4ExpStreamingGenerationOptions: Sendable, Equatable {
         continueConversation: Bool = false,
         seed: UInt64? = nil,
         presencePenalty: Float = 0,
-        repetitionPenalty: Float = 1.0
+        repetitionPenalty: Float = 1.0,
+        initialPenaltyTokenIDs: [Int32] = []
     ) {
         self.maxNewTokens = maxNewTokens
         self.stopTokenIDs = stopTokenIDs
@@ -76,6 +84,7 @@ public struct Qwen4ExpStreamingGenerationOptions: Sendable, Equatable {
         self.seed = seed
         self.presencePenalty = presencePenalty
         self.repetitionPenalty = repetitionPenalty
+        self.initialPenaltyTokenIDs = initialPenaltyTokenIDs
     }
 }
 
@@ -176,6 +185,19 @@ public enum Qwen4ExpLogitPenalizer {
     /// `Qwen4ExpPLE`'s `result.at[...].add(...)` scatter pattern).
     public static func markSeen(_ seenMask: MLXArray, token: Int32) -> MLXArray {
         seenMask.at[MLXArray([token])].add(MLXArray(Float(1)))
+    }
+
+    /// P6.3: builds the `[vocab]` mask a turn's sampling loop starts from —
+    /// zeros marked at `tokenIDs` (deduplicated; scatter-add would double-
+    /// count a repeated id, which `apply`'s `.> 0` threshold does not need
+    /// but would otherwise waste a redundant write for) in one scatter,
+    /// instead of the all-zero mask every turn used before P6.3. Empty
+    /// `tokenIDs` is exactly the pre-P6.3 mask.
+    public static func seedMask(vocabSize: Int, tokenIDs: [Int32]) -> MLXArray {
+        let mask = MLXArray.zeros([vocabSize])
+        guard !tokenIDs.isEmpty else { return mask }
+        let unique = Array(Set(tokenIDs))
+        return mask.at[MLXArray(unique)].add(MLXArray.ones([unique.count]))
     }
 }
 
@@ -289,7 +311,15 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
         let penaltiesActive =
             options.preset.temperature > 0
             && (options.presencePenalty != 0 || options.repetitionPenalty != 1.0)
-        var seenMask = penaltiesActive ? MLXArray.zeros([logits.dim(-1)]) : nil
+        // P6.3: seed with the caller-provided prior-assistant-turn tokens
+        // (capped to `penaltyContextTokens`) instead of always starting
+        // empty — a presence/repetition mask that resets every turn cannot
+        // structurally stop a verbatim loop spanning several turns
+        // (docs/knowledge/log.md "P5.6", turns 68-73).
+        var seenMask = penaltiesActive
+            ? Qwen4ExpLogitPenalizer.seedMask(
+                vocabSize: logits.dim(-1), tokenIDs: options.initialPenaltyTokenIDs)
+            : nil
 
         while tokenIDs.count < options.maxNewTokens {
             if Task.isCancelled { break }

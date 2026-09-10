@@ -139,9 +139,14 @@ private struct ChatCompletionRequest: Codable, Sendable {
     /// by the caller, since it depends on `temperature`).
     var explicitPresencePenalty: Float? { presencePenalty ?? frequencyPenalty }
     var effectiveRepetitionPenalty: Float { extra?.repetitionPenalty ?? 1.0 }
+    /// P6.3: `extra.penalty_context_tokens` — how many trailing assistant-
+    /// turn tokens the presence/repetition mask is seeded with. Absent
+    /// falls through to `Qwen38GenerationOptions`'s own default (2048); an
+    /// explicit `0` restores the pre-P6.3 per-turn-only mask.
+    var effectivePenaltyContextTokens: Int? { extra?.penaltyContextTokens }
 }
 private struct ChatCompletionReasoning: Codable, Sendable { let effort: String? }
-private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty" } }
+private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; let penaltyContextTokens: Int?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty", penaltyContextTokens = "penalty_context_tokens" } }
 private struct ChatCompletionMessage: Codable, Sendable { let role: String; let content: ChatCompletionContent? }
 private enum ChatCompletionContent: Codable, Sendable {
     case text(String); case parts([ChatCompletionPart])
@@ -332,7 +337,7 @@ public actor Qwen38InferenceServer {
             // greedy requests (temperature 0) never get this default since
             // the generator ignores penalties there regardless.
             let presencePenalty = input.explicitPresencePenalty ?? (temperature > 0 ? 1.5 : 0)
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048))
             let conversationID = input.effectiveConversationID
             let (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
                 id: conversationID,

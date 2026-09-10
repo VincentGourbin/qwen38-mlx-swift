@@ -116,15 +116,22 @@ public final class Qwen38FlashConversationState: Qwen38FlashConversationStatePro
     fileprivate let turnIndex: Int
     public let ledger: [Qwen38ChatMessage]
     public let byteCount: Int
+    /// P6.3: the rolling buffer of prior-assistant-turn tokens the
+    /// presence/repetition mask seeds from — captured too, or an LRU
+    /// restore (P5.2/P6.1) would silently forget every turn generated
+    /// before the export and reopen the same verbatim-loop risk P6.3
+    /// fixes for a plain continuation.
+    fileprivate let recentAssistantTokenIDs: [Int32]
 
     fileprivate init(
         modelSnapshot: Qwen4ExpStreamingTextModelSnapshot, hasConversationHistory: Bool,
-        turnIndex: Int, ledger: [Qwen38ChatMessage]
+        turnIndex: Int, ledger: [Qwen38ChatMessage], recentAssistantTokenIDs: [Int32]
     ) {
         self.modelSnapshot = modelSnapshot
         self.hasConversationHistory = hasConversationHistory
         self.turnIndex = turnIndex
         self.ledger = ledger
+        self.recentAssistantTokenIDs = recentAssistantTokenIDs
         self.byteCount = modelSnapshot.byteCount
     }
 }
@@ -143,6 +150,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     private let visibleTokenFilter: Qwen38VisibleTokenFilter
     private var hasConversationHistory = false
     private var turnIndex = 0
+    /// P6.3: rolling buffer of the most recent assistant-turn tokens this
+    /// conversation generated, trimmed to `options.penaltyContextTokens`
+    /// after every turn — what a new turn's presence/repetition mask seeds
+    /// from instead of starting empty (see `Qwen4ExpLogitPenalizer.seedMask`).
+    private var recentAssistantTokenIDs: [Int32] = []
 
     /// PM4.3 (branchement, 2026-09-09): loaded lazily on the first turn
     /// that requests `options.mtp.enabled` (`Qwen4ExpMTPLoader`,
@@ -226,10 +238,25 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         model.resetConversation()
         hasConversationHistory = false
         turnIndex = 0
+        recentAssistantTokenIDs = []
         // The drafter's cache is tied to the target's own conversation
         // history; the predictor's *weights* stay loaded (no need to pay
         // Lexar IO again), only its per-conversation state is discarded.
         mtpDraftState = nil
+    }
+
+    /// P6.3: appends a turn's generated tokens to the rolling
+    /// presence/repetition context and trims it to `limit` tokens (`<= 0`
+    /// clears it — the option's "0 = old behavior" contract).
+    private func recordAssistantTokens(_ tokenIDs: [Int32], limit: Int) {
+        guard limit > 0 else {
+            recentAssistantTokenIDs = []
+            return
+        }
+        recentAssistantTokenIDs.append(contentsOf: tokenIDs)
+        if recentAssistantTokenIDs.count > limit {
+            recentAssistantTokenIDs.removeFirst(recentAssistantTokenIDs.count - limit)
+        }
     }
 
     public func unload() {
@@ -254,7 +281,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     ) -> any Qwen38FlashConversationStateProtocol {
         Qwen38FlashConversationState(
             modelSnapshot: model.snapshot(), hasConversationHistory: hasConversationHistory,
-            turnIndex: turnIndex, ledger: ledger)
+            turnIndex: turnIndex, ledger: ledger,
+            recentAssistantTokenIDs: recentAssistantTokenIDs)
     }
 
     /// Replace the engine's live state with a previously exported one. Only
@@ -270,6 +298,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         model.restore(state.modelSnapshot)
         hasConversationHistory = state.hasConversationHistory
         turnIndex = state.turnIndex
+        recentAssistantTokenIDs = state.recentAssistantTokenIDs
         // See exportConversationState's doc comment: the drafter cache is
         // never preserved, so any stale one from before this restore must
         // not survive into the resumed conversation.
@@ -438,6 +467,9 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                         .utf8))
         }
 
+        // P6.3: seed this turn's mask with the rolling buffer of prior
+        // assistant-turn tokens (already trimmed to `penaltyContextTokens`
+        // by `recordAssistantTokens`) instead of starting empty every turn.
         let inner = generator.generate(
             promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
             visionEmbeddings: built.visionEmbeddings, imageTokenID: built.imageTokenID,
@@ -445,7 +477,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                 maxNewTokens: maxNewTokens, stopTokenIDs: stopTokenIDs, preset: preset,
                 continueConversation: continueConversation,
                 presencePenalty: options.presencePenalty,
-                repetitionPenalty: options.repetitionPenalty),
+                repetitionPenalty: options.repetitionPenalty,
+                initialPenaltyTokenIDs: recentAssistantTokenIDs),
             profiler: profiler)
 
         return AsyncThrowingStream { continuation in
@@ -463,6 +496,14 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 continuation.yield(.chunk(piece))
                             }
                         case .finished(let summary):
+                            // P6.3: extend the rolling penalty-context buffer
+                            // with this turn's own reply, ready for the
+                            // *next* turn's mask — done regardless of
+                            // whether penalties were active this turn, so
+                            // enabling them mid-conversation still sees
+                            // whatever history already accumulated.
+                            self.recordAssistantTokens(
+                                summary.tokenIDs, limit: options.penaltyContextTokens)
                             let stopReason: GenerateStopReason
                             if let last = summary.tokenIDs.last, self.stopTokenIDs.contains(last) {
                                 stopReason = .stop
@@ -579,6 +620,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                             }
                         })
 
+                    // P6.3: MTP is greedy-only (no mask ever applied here),
+                    // but a later sampled turn in the same conversation
+                    // still needs this turn's reply in its penalty context.
+                    self.recordAssistantTokens(
+                        result.tokenIDs, limit: options.penaltyContextTokens)
                     let stopReason: GenerateStopReason
                     if let last = result.tokenIDs.last, self.stopTokenIDs.contains(last) {
                         stopReason = .stop

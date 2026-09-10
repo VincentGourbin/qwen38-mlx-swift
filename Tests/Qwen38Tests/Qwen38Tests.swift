@@ -429,6 +429,36 @@ func logitPenalizerAppliesOnlyToSeenIDs() {
     #expect(noop == logits.asArray(Float.self))
 }
 
+@Test("P6.3 : le masque de pénalité se pré-remplit avec les tokens des tours assistant précédents")
+func logitPenalizerSeedsMaskFromPriorTurns() {
+    // Empty seed reproduces the pre-P6.3 all-zero mask exactly.
+    let empty = Qwen4ExpLogitPenalizer.seedMask(vocabSize: 5, tokenIDs: [])
+    #expect(empty.asArray(Float.self) == [0, 0, 0, 0, 0])
+
+    // Prior-turn ids 0 and 2 (a repeat of 0 must not double-count — the
+    // penalty formula only ever checks `> 0`, but a scatter-add of a
+    // duplicate id would silently accumulate past 1).
+    let seeded = Qwen4ExpLogitPenalizer.seedMask(vocabSize: 5, tokenIDs: [0, 2, 0])
+    let values = seeded.asArray(Float.self)
+    #expect(values[0] == 1 && values[2] == 1)
+    #expect(values[1] == 0 && values[3] == 0 && values[4] == 0)
+
+    // The seeded mask behaves exactly like a mask built turn-by-turn via
+    // markSeen for the same ids — seeding is not a different code path as
+    // far as `apply` is concerned.
+    var built = MLXArray.zeros([5])
+    built = Qwen4ExpLogitPenalizer.markSeen(built, token: 0)
+    built = Qwen4ExpLogitPenalizer.markSeen(built, token: 2)
+    let logits = MLXArray([Float(1.0), -1.0, 2.0, -2.0, 0.5])
+    let fromSeed = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: seeded, presence: 1.0, repetition: 2.0
+    ).asArray(Float.self)
+    let fromBuilt = Qwen4ExpLogitPenalizer.apply(
+        logits: logits, seenMask: built, presence: 1.0, repetition: 2.0
+    ).asArray(Float.self)
+    #expect(fromSeed == fromBuilt)
+}
+
 @Test("P5.3 : la génération greedy (température 0) est inchangée par les pénalités")
 func flashGreedyGenerationIgnoresPenalties() async throws {
     guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
