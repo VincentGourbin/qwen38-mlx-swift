@@ -286,7 +286,9 @@ public actor Qwen38InferenceServer {
                 stream = try await runtime.generateStateless(messages: prepared.messages, options: options)
             }
             for url in prepared.temporaryFiles { try? FileManager.default.removeItem(at: url) }
-            let thinkingIsPrimed = input.effectiveThinking ?? true
+            // Must mirror `options.enableThinking` exactly: the parser assumes the
+            // prompt ends inside `<think>` only when thinking was rendered.
+            let thinkingIsPrimed = options.enableThinking
             if input.stream == true {
                 return try await makeStreamingResponse(
                     stream: stream, sessionID: id, model: selectedModel,

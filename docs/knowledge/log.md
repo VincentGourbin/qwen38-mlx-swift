@@ -2916,3 +2916,15 @@ défaut, effort `low`, mais 96 tokens ne suffisent pas à fermer `</think>` →
 le défaut serveur devient **thinking désactivé**, activé seulement si le
 client envoie `enable_thinking: true` ou un `reasoning_effort` (top-level,
 `reasoning.effort` ou `extra`). La GUI garde son propre toggle.
+
+## 2026-09-10 — Requête minimale : la réponse partait dans `reasoning_content`
+
+Après le passage du thinking à « désactivé par défaut », la requête minimale
+(sans `enable_thinking`) générait bien la réponse (« Le président de la Chine
+est Xi Jinping… ») mais le serveur la rangeait dans `reasoning_content` :
+`thinkingIsPrimed` était encore calculé avec `input.effectiveThinking ?? true`,
+indépendamment de l'option réellement rendue. Le parser de flux thinking
+supposait le prompt terminé à l'intérieur de `<think>`. Correctif :
+`thinkingIsPrimed = options.enableThinking`. Au passage : l'IP LAN du Mac
+change avec le DHCP (192.168.1.183 → .87 cette nuit) ; l'onglet Serveur la lit
+en direct, les scripts de test doivent la relire aussi.
