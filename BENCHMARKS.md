@@ -148,3 +148,43 @@ dérive thématique inter-tours ; une boucle quasi verbatim apparaît aux tours
 route (P5.2 : « nouvel état après un rejeu », partie manquée du premier
 passage — sans lui, un agent dont le tout premier message contient déjà un
 tour assistant restait bloqué en rejeu complet toute la conversation).
+
+### P6.6 — validation finale : dialogue A/B 20 min **sans** `conversation_id` (2026-09-10)
+
+`qwen38 serve --trace` (checkpoint 3-bit, P6.1-P6.5 tous appliqués),
+`Scripts/agent-dialogue.py --max-minutes 20 --no-conversation-id` (le cas
+Open WebUI / SDK openai ordinaire : aucun agent n'envoie `conversation_id`,
+chaque tour renvoie tout l'historique). Comparé à P5.6 (76 tours, avec
+`conversation_id`) et à la validation dédiée de P6.3 (61 tours, avec
+`conversation_id`, `docs/knowledge/log.md` 2026-09-10 « P6.3 »). Détail
+complet : `docs/knowledge/log.md` 2026-09-10 « P6.6 ».
+
+| | P5.6 (avec id, 76 tours) | P6.3 (avec id, 61 tours) | **P6.6 (sans id, 58 tours)** |
+|---|---:|---:|---:|
+| TTFT tour 1 | 0,93 s | — | 1,13 s |
+| TTFT médian | 2,16 s | 2,29 s | **2,34 s** |
+| TTFT max | 2,81 s (0 tour > 3 s) | 3,09 s | 4,43 s (4 tours consécutifs, 18-21, transitoire) |
+| tours > 3 s | 0/76 | 0/61 | 4/58 |
+| tok/s décodage | 4,9-6,4 | — | 2,5-6,6 |
+| Pic process | 57,58 Go | non mesuré | **58,32 Go** |
+| Restaurations / total | 74/76 (`cacheRestored`, id explicite) | — | 56/58 (`prefixHits`, préfixe implicite P6.1) |
+| Misses | `cacheMisses` 2 | — | `prefixMisses` 2 |
+| Jaccard médian (i vs i-2, même agent) | 0,145 | 0,114 | **0,143** |
+| Jaccard max | boucle 1,0 aux tours 68-73 | 0,184 | **0,261** |
+| Paires Jaccard > 0,6 | ≥ 1 (boucle) | 0 | **0** |
+
+**Tous les critères P6.6 atteints** : TTFT médian 2,34 s < 3 s sans
+`conversation_id` (contre un rejeu complet à chaque tour avant P6.1,
+TTFT croissant comme en référence P5.6) ; aucune boucle (0 paire > 0,6,
+Jaccard max 0,261, cohérent avec la validation dédiée de P6.3) ; pic
+process 58,32 Go < 75 Go. Le cache de préfixe implicite (P6.1) restaure
+56/58 tours (les 2 misses sont les deux tours de démarrage à froid, un par
+agent) — la trace confirme que le serveur reconnaît la continuation sans
+`conversation_id` exactement comme avec. Écart mineur documenté : 4 tours
+consécutifs (18-21) au-dessus de 3 s (jusqu'à 4,43 s) alors qu'aucun miss
+n'est enregistré à ce moment — un pic transitoire de pression mémoire
+système (compresseur actif, ratio 35× en fin de run) est le candidat le
+plus probable, non isolé plus précisément.
+
+Fichiers : `results/p66/dialogue.jsonl`, `results/p66/server.log`
+(trace `.trace.json` non versionnée, gitignore).

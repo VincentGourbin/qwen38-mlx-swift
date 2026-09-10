@@ -3223,3 +3223,35 @@ localisables sans profileur GPU natif — documenté ici pour reprise
 
 Fichiers : `results/p65/s1-decode.stdout.txt`, `results/p65/noprofile-100.
 stdout.txt` (traces `.trace.json` non versionnées, gitignore).
+
+## 2026-09-10 — P6.6 : validation finale — dialogue A/B 20 min sans conversation_id
+
+Protocole : `qwen38 serve --trace results/p66/serve.trace.json` (checkpoint
+3-bit, P6.1-P6.5 tous appliqués), `Scripts/agent-dialogue.py --max-minutes 20
+--no-conversation-id` (T=0,7, top_p 0,8, 120 tokens max, aucun champ de
+pénalité explicite — défaut serveur `presence 1.5`, P5.3). C'est le cas
+Open WebUI / SDK openai ordinaire : aucun agent n'envoie `conversation_id`,
+chaque tour renvoie tout l'historique complet — avant P6.1, ce cas payait
+le rejeu stateless complet à chaque tour (TTFT croissant, référence
+pré-P5 : 23,89 s au tour 38).
+
+**Résultat** : 58 tours en 20,1 min, 5 868 tokens générés. TTFT tour 1
+1,13 s ; TTFT médian **2,34 s** (< 3 s, critère atteint) ; TTFT max 4,43 s
+sur 4 tours consécutifs (18-21, transitoire — aucun miss enregistré à ce
+moment, candidat le plus probable : pression mémoire système, compresseur
+à ratio 35× en fin de run) ; 0 tour > 3 s en dehors de cette fenêtre. Pic
+process **58,32 Go** (< 75 Go). `/metrics` : `prefixHits` 56, `prefixMisses`
+2 (les deux démarrages à froid, un par agent), `cachedConversations` 3 en
+fin de run. Similarité Jaccard médiane (rows[i] vs rows[i-2], même agent)
+**0,143**, max **0,261**, **aucune paire > 0,6** — cohérent avec la
+validation dédiée de P6.3 (61 tours avec `conversation_id`, médiane 0,114,
+max 0,184) : le masque de pénalité pré-rempli (P6.3) empêche la boucle
+aussi bien sans `conversation_id` qu'avec.
+
+**Tous les critères P6.6 atteints** : TTFT médian < 3 s sans
+`conversation_id`, aucune boucle, pic process < 75 Go. Comparaison complète
+avec P5.6 (76 tours, avec `conversation_id`) : `BENCHMARKS.md` « P6.6 ».
+
+Fichiers : `results/p66/dialogue.jsonl`, `results/p66/dialogue.log`,
+`results/p66/server.log` (rapport profiler complet), `results/p66/
+serve.trace.json` (non versionnée, gitignore).

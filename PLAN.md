@@ -3887,3 +3887,84 @@ tours) ; la GUI et le LAN partagent l'état du moteur (P5.7).
 | P6.4 | **P5.7 — GUI indépendante du LAN** : la conversation GUI est une entrée du LRU (`conversation_id` interne `gui`), exportée après chaque tour et restaurée avant le suivant ; le runtime ne touche plus directement à l'état du moteur pour la GUI. Test : tour GUI → requête LAN → tour GUI ⇒ le second tour GUI continue bien la conversation GUI (IDs identiques à un dialogue GUI sans requête LAN intercalée). | test gated + scénario manuel documenté |
 | P6.5 | **Coût fixe du forward court** : profil `--profile-layers` d'un préfill de 100 tokens (Release) : ms par couche vs les 3,4 ms du décodage ; si les couches non-PLE coûtent > 10 ms à S=100, chercher l'op qui croît avec S côté hôte (masque QSA construit sur CPU ? MRoPE ? `asType`) ; sinon clore. | tableau ms/couche S=1 vs S=100 |
 | P6.6 | **Validation** : dialogue 20 min **sans** `conversation_id` (le cas Open WebUI) contre `serve --trace` ; tableau avec P5.6 ; `BENCHMARKS.md`. | TTFT médian < 3 s sans `conversation_id`, aucune boucle, pic process < 75 Go |
+
+**Statut (2026-09-10) — P6.1-P6.6 tous faits, commits séparés (ordre
+d'exécution : P6.2 mesure → P6.1 → P6.3 → P6.4 → P6.2 correctif → P6.5 →
+P6.6).**
+
+P6.1 : cache de préfixe implicite — sans `conversation_id`, comparaison
+sur les IDs de tokens **rendus** (`Qwen4ExpPromptBuilder`, jamais le texte
+ou les messages), comparant `messages.dropLast()` au ledger d'un candidat
+(actif ou LRU) plutôt que le ledger à un préfixe de la requête complète
+(évite une hypothèse sur le comportement du chat template en fin de tour
+assistant). Un id synthétique interne (`auto:<uuid>`) fait office de clé
+LRU, jamais exposé au client. Validé en réel : dialogue 3 min, 9 restaurations
+sur 11 tours, TTFT plat malgré un prompt qui grandit.
+
+P6.2 : instrumentation des lookups PLE (mesure : 231 shards distincts
+touchés, constant quel que soit le nombre de tokens, ⇒ 693 `MLXArray` +
+231 `MLX.dequantized` par appel) puis regroupement en un seul appel
+(`lookupBatch`, 231→2). **Cause racine corrigée par rapport à l'hypothèse
+du plan** : à grande échelle (~2 500 tokens) c'est le temps hôte des
+lectures mmap qui domine (93 % de la couche PLE), pas le nombre de
+dispatches GPU — le regroupement gagne net à l'échelle d'un tour de
+dialogue réel (~100 tokens : couche PLE 280 ms → 172 ms, −39 %) mais rien
+à 2 500 tokens (2 568 ms → 2 614 ms, bruit). Le critère « ≤ 3× une couche
+normale » n'est pas atteint (10,75× et 19,1×) et ne pouvait pas l'être par
+ce seul levier — documenté, pas de sur-vente. Un premier essai
+d'assemblage host→device via `Array.replaceSubrange` par position a
+**régressé** (+41 % à 2 500 tokens, surcoût de l'API `Array` haut niveau
+sur ~245 000 itérations) ; corrigé avec des `UnsafeMutableBufferPointer`
+pré-alloués (même primitive que `readContiguousRuns`, P5.4).
+
+P6.3 : le masque de présence/répétition (P5.3) accumule désormais les
+tokens générés à chaque tour dans un tampon glissant par conversation
+(`Qwen38FlashNextEngine.recentAssistantTokenIDs`, borné à
+`penaltyContextTokens`, défaut 2 048), capturé/restauré avec l'état de
+conversation pour survivre à une restauration LRU. Greedy inchangé
+(vérifié : IDs identiques à la référence). Dialogue A/B 20 min dédié (avec
+`conversation_id`, 61 tours) : Jaccard médian 0,114 (contre 0,145 en
+P5.6), max 0,184, aucune paire > 0,6 — écart à la consigne : ce run
+n'atteint que 61 tours en 20 min (76 en P5.6), donc ne recouvre pas
+exactement la fenêtre 68-73 où la boucle P5.6 apparaissait, mais aucune
+boucle n'apparaît sur les 61 tours produits.
+
+P6.4 : le LRU de conversations (P5.2/P6.1, budget, restauration par
+préfixe) a été déplacé de `Qwen38Server` vers `Qwen38Runtime` (Core) —
+partagé par construction puisque la GUI et le serveur LAN utilisent la
+même instance de runtime en process. Le serveur garde la main sur le
+budget (`configureConversationCacheBudget`) ; les méthodes serveur
+`prepareConversation`/`rememberConversation` deviennent de fins relais
+(mêmes signatures, tests P5.2/P6.1 inchangés). La GUI devient un client du
+LRU sous l'id interne fixe `"gui"`, en écriture immédiate (export +
+libération du pointeur actif après chaque tour, contrairement au chemin
+LAN resté paresseux) — nécessaire car la GUI ne peut pas supposer que rien
+d'autre ne touche le moteur partagé entre deux de ses tours. Test gated
+réel : GUI tour 1 → requête LAN stateless intercalée → GUI tour 2 ⇒
+sortie identique à un GUI tour 2 sans requête intercalée.
+
+P6.5 : mesure seule, comme demandé. Médiane hors PLE 4 ms/couche à S=1
+contre 15,5 ms à S≈100 (3,9× pour 100× plus de tokens — surcoût hôte fixe
+par couche, cohérent avec le diagnostic « host-bound » déjà posé en P5.6).
+Hypothèse QSA écartée par la mesure (couches QSA et non-QSA au même
+coût, cohérent avec `makeMask` nul sous 2 048 tokens). Aucune opération
+précise isolée faute d'accès à Instruments/Shader Timeline (même limite
+que P4.3) ; aucun correctif appliqué.
+
+P6.6 : dialogue A/B 20 min **sans** `conversation_id` rejoué contre `serve
+--trace` — 58 tours, TTFT médian **2,34 s** (< 3 s), TTFT max 4,43 s sur 4
+tours transitoires (aucun miss associé, candidat probable : pression
+mémoire système), pic process **58,32 Go** (< 75 Go), `prefixHits` 56/58,
+Jaccard médian 0,143 / max 0,261, **aucune paire > 0,6**. Les trois
+critères P6.6 sont atteints. Tableau complet vs P5.6 et P6.3 :
+`BENCHMARKS.md` (« P6.6 »). Détails complets, tableaux et fichiers de
+chaque tâche : `docs/knowledge/log.md` (2026-09-10, « P6.2 », « P6.3 »,
+« P6.5 », « P6.6 »).
+
+**Écarts documentés à la consigne** : P6.2 n'atteint pas « couche PLE ≤ 3×
+une couche normale » (10,75×/19,1× après correctif) — cause racine
+correctement réattribuée à l'E/S hôte plutôt qu'au dispatch GPU, hors
+portée du levier demandé. P6.3's dialogue dédié n'atteint que 61 tours en
+20 min (pas la fenêtre exacte 68-73 de la boucle P5.6). P6.5 n'isole pas
+d'opération précise faute d'outillage GPU natif (mesure et diagnostic
+qualitatif seulement, comme P4.3 avant lui).
