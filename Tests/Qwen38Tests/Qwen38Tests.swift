@@ -242,6 +242,146 @@ func serverConversationLRUEstablishesStateAfterReplay() async throws {
     #expect(mock.restoreCount == 1)
 }
 
+@Test("P6.1 : sans conversation_id, deux dialogues A/B alternés restaurent dès le 2e tour de chaque agent (préfixe rendu)")
+func serverImplicitPrefixCacheRestoresAlternatingConversations() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-prefix-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let options = Qwen38GenerationOptions()
+    let userA1 = Qwen38ChatMessage(role: .user, content: "A1")
+    let userB1 = Qwen38ChatMessage(role: .user, content: "B1")
+
+    // Turn 1 of each agent: no conversation_id at all — cold start, no
+    // candidate to match against yet.
+    let a1 = try await server.prepareConversation(
+        id: nil, model: modelID, messages: [userA1], options: options)
+    #expect(a1.usePersistentCache == true)
+    #expect(a1.cacheRestored == false)
+    let trackingA1 = try #require(a1.trackingID)
+    await server.rememberConversation(
+        id: trackingA1, model: modelID, requestMessages: [userA1], assistantContent: "replyA1",
+        options: options)
+
+    let b1 = try await server.prepareConversation(
+        id: nil, model: modelID, messages: [userB1], options: options)
+    #expect(b1.usePersistentCache == true)
+    #expect(b1.cacheRestored == false)
+    let trackingB1 = try #require(b1.trackingID)
+    await server.rememberConversation(
+        id: trackingB1, model: modelID, requestMessages: [userB1], assistantContent: "replyB1",
+        options: options)
+
+    // Turn 2 of A: the client resends its whole history (no id, exactly
+    // like Open WebUI) — B is live, so A's rendered ledger must be found in
+    // the LRU and restored.
+    let ledgerA = [userA1, Qwen38ChatMessage(role: .assistant, content: "replyA1")]
+    let userA2 = Qwen38ChatMessage(role: .user, content: "A2")
+    let a2 = try await server.prepareConversation(
+        id: nil, model: modelID, messages: ledgerA + [userA2], options: options)
+    #expect(a2.usePersistentCache == true)
+    #expect(a2.cacheRestored == true)
+    let trackingA2 = try #require(a2.trackingID)
+    await server.rememberConversation(
+        id: trackingA2, model: modelID, requestMessages: ledgerA + [userA2],
+        assistantContent: "replyA2", options: options)
+
+    // Turn 2 of B: same story, the other way around.
+    let ledgerB = [userB1, Qwen38ChatMessage(role: .assistant, content: "replyB1")]
+    let userB2 = Qwen38ChatMessage(role: .user, content: "B2")
+    let b2 = try await server.prepareConversation(
+        id: nil, model: modelID, messages: ledgerB + [userB2], options: options)
+    #expect(b2.usePersistentCache == true)
+    #expect(b2.cacheRestored == true)
+
+    #expect(mock.restoreCount == 2)
+    let snapshot = await server.snapshot()
+    #expect(snapshot.prefixHits == 2)
+    #expect(snapshot.prefixMisses == 2)
+}
+
+@Test("P6.1 : sans conversation_id, un historique tronqué par le client (fenêtre glissante) est un miss propre")
+func serverImplicitPrefixCacheMissesOnTruncatedHistory() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-prefix-truncated-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let options = Qwen38GenerationOptions()
+    let system = Qwen38ChatMessage(role: .system, content: "system prompt")
+    let user1 = Qwen38ChatMessage(role: .user, content: "user1")
+    let user2 = Qwen38ChatMessage(role: .user, content: "user2")
+
+    // Turn 1: cold start (system + one user message).
+    let first = try await server.prepareConversation(
+        id: nil, model: modelID, messages: [system, user1], options: options)
+    #expect(first.usePersistentCache == true)
+    let trackingFirst = try #require(first.trackingID)
+    await server.rememberConversation(
+        id: trackingFirst, model: modelID, requestMessages: [system, user1],
+        assistantContent: "reply1", options: options)
+
+    // Turn 2: full, untruncated history — continues the same conversation.
+    let ledger = [system, user1, Qwen38ChatMessage(role: .assistant, content: "reply1")]
+    let second = try await server.prepareConversation(
+        id: nil, model: modelID, messages: ledger + [user2], options: options)
+    #expect(second.usePersistentCache == true)
+    let trackingSecond = try #require(second.trackingID)
+    await server.rememberConversation(
+        id: trackingSecond, model: modelID, requestMessages: ledger + [user2],
+        assistantContent: "reply2", options: options)
+
+    // A different conversation takes the resident engine over, forcing the
+    // conversation above into the LRU (so the next lookup goes through the
+    // LRU scan, not the "already active" shortcut).
+    let other = Qwen38ChatMessage(role: .user, content: "other conversation")
+    _ = try await server.prepareConversation(
+        id: nil, model: modelID, messages: [other], options: options)
+
+    // Turn 3, but the client applied a sliding window: it drops the first
+    // exchange (`user1`/`reply1`) and resends only the most recent one plus
+    // a new user message — never the exact prefix of anything stored.
+    let user3 = Qwen38ChatMessage(role: .user, content: "user3")
+    let truncated = [
+        system, user2, Qwen38ChatMessage(role: .assistant, content: "reply2"), user3,
+    ]
+    let restoreCountBefore = mock.restoreCount
+    let third = try await server.prepareConversation(
+        id: nil, model: modelID, messages: truncated, options: options)
+    #expect(third.usePersistentCache == false)
+    #expect(third.cacheRestored == false)
+    #expect(mock.restoreCount == restoreCountBefore)
+}
+
 @Test("Les options appliquent le contrat KV cache Qwen")
 func generationParametersUseNativeKVQuantization() {
     let options = Qwen38GenerationOptions()
@@ -728,6 +868,25 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateFromMessagesOptions = options
         return Self.makeCompletedStream()
+    }
+
+    /// P6.1: a deterministic stand-in for the real tokenizer — one Int32
+    /// "token" per whitespace-separated word (plus a role marker), stable
+    /// across calls (`String.hashValue` is process-stable, not persisted).
+    /// Good enough to exercise strict-prefix comparison in tests without a
+    /// real checkpoint: identical message lists render identical IDs,
+    /// differing content (system edit, truncated history) renders
+    /// different IDs.
+    func renderedTokenIDs(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> [Int32] {
+        messages.flatMap { message -> [Int32] in
+            let roleToken = Int32(message.role.rawValue.hashValue % 1000)
+            let wordTokens = message.content.split(separator: " ").map {
+                Int32($0.hashValue % 1_000_000)
+            }
+            return [roleToken] + wordTokens
+        }
     }
 
     /// P5.2: a server-level LRU test needs a request to actually complete

@@ -8,10 +8,13 @@ dialogue.jsonl. S'arrête sur erreur HTTP (limite de contexte, mémoire), sur
 
     python3 Scripts/agent-dialogue.py --base http://127.0.0.1:8848 --max-minutes 180
 
-Note : le serveur ne conserve qu'un seul cache persistant (contrat §5.1.1) ;
-comme A et B alternent, chaque tour rejoue l'historique complet (chemin
-stateless) — le temps de préfill croît donc avec la longueur du dialogue, et
-c'est précisément ce que ce script mesure.
+Note : par défaut, chaque agent a son propre `conversation_id` et profite du
+LRU de conversations du serveur (P5.2) — TTFT plat. Avec --no-conversation-id
+(P6.1), aucun agent n'envoie de conversation_id : chaque tour renvoie tout
+l'historique, comme le ferait Open WebUI ou le SDK openai ordinaire ; le
+serveur doit alors reconnaître la continuation via son cache de préfixe
+implicite (comparaison sur les IDs de tokens rendus) pour rester au même TTFT
+plat au lieu de rejouer l'historique complet à chaque tour.
 """
 import argparse, json, os, sys, time, urllib.request, urllib.error
 from datetime import datetime
@@ -34,6 +37,10 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=120)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--out", default="results/dialogue")
+    ap.add_argument("--no-conversation-id", action="store_true",
+                     help="P6.1 : n'envoie jamais conversation_id — chaque agent renvoie tout son "
+                          "historique à chaque tour, comme Open WebUI ou le SDK openai ordinaire. "
+                          "Sert à valider le cache de préfixe implicite du serveur.")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     log = open(os.path.join(args.out, "dialogue.log"), "a", encoding="utf-8")
@@ -63,8 +70,9 @@ def main():
     while turn < args.max_turns and (time.time() - started) < args.max_minutes * 60:
         turn += 1
         body = {"model": model, "temperature": args.temperature, "top_p": 0.8, "max_tokens": args.max_tokens,
-                "enable_thinking": False, "mtp": False, "conversation_id": f"dialogue-{speaker}",
-                "messages": hist[speaker]}
+                "enable_thinking": False, "mtp": False, "messages": hist[speaker]}
+        if not args.no_conversation_id:
+            body["conversation_id"] = f"dialogue-{speaker}"
         req = urllib.request.Request(args.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         t0 = time.time()

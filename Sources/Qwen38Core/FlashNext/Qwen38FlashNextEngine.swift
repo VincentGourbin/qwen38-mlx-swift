@@ -60,6 +60,17 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error>
+    /// P6.1: pure rendering, no generation side effect — the exact token
+    /// IDs `generateFromMessages` would feed the model for this message
+    /// list, via the same `Qwen4ExpPromptBuilder.buildFromMessages` path.
+    /// The server's implicit-prefix cache (no `conversation_id`) uses this
+    /// to compare a candidate LRU entry's `ledger` against an incoming
+    /// request on rendered token IDs rather than message structs, so a
+    /// system-prompt edit or a client-truncated history is a clean miss
+    /// instead of a wrong restore.
+    func renderedTokenIDs(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> [Int32]
     /// H4.2: forces every decoder layer to be loaded from disk once, up
     /// front, instead of paying that cost inside the first real turn's
     /// TTFT. Yields the index of each layer as it finishes loading (0-based,
@@ -322,6 +333,25 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     /// v1"). Images are rejected explicitly rather than silently dropped;
     /// the manual ChatML assembly Flash-Next uses for images only knows how
     /// to attach one image to the first rendered turn (see `generate`).
+    /// P6.1: same rendering `generateFromMessages` performs before it calls
+    /// `resetConversation()` and starts generating — extracted so it can be
+    /// called read-only, on the server's actor, without touching
+    /// `hasConversationHistory` or any decoder state.
+    public func renderedTokenIDs(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> [Int32] {
+        guard messages.allSatisfy({ $0.imageURLs.isEmpty }) else {
+            throw Qwen38FlashNextEngineError.statelessImagesUnsupported
+        }
+        let hfMessages: [Tokenizers.Message] = messages.map {
+            ["role": $0.role.rawValue, "content": $0.content]
+        }
+        let built = try Qwen4ExpPromptBuilder.buildFromMessages(
+            tokenizer: tokenizer, messages: hfMessages, thinking: options.enableThinking,
+            reasoningEffort: options.reasoningEffort)
+        return built.tokenIDs
+    }
+
     public func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {

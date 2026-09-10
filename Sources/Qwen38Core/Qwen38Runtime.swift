@@ -344,6 +344,15 @@ public actor Qwen38Runtime {
         flashEngine?.restoreConversationState(state)
     }
 
+    /// P6.1: exposes `Qwen38FlashNextEngineProtocol.renderedTokenIDs` to the
+    /// server's implicit-prefix cache. `nil` when no Flash-Next model is
+    /// resident (same scope restriction as the rest of the LRU, §5.1.1).
+    public func renderedFlashTokenIDs(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> [Int32]? {
+        try flashEngine?.renderedTokenIDs(messages: messages, options: options)
+    }
+
     /// P5.2: releases MLX's allocator cache after the server's LRU drops
     /// evicted conversation snapshots, so the device memory those
     /// `MLXArray`s held is actually returned to the system instead of
