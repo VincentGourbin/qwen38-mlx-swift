@@ -349,18 +349,24 @@ public actor Qwen38InferenceServer {
             // Must mirror `options.enableThinking` exactly: the parser assumes the
             // prompt ends inside `<think>` only when thinking was rendered.
             let thinkingIsPrimed = options.enableThinking
+            // Always pass the real `conversationID` (not gated on
+            // `usePersistentCache`): `rememberConversation` itself decides
+            // whether to append to the already-active conversation or
+            // establish a brand new one from a replay's resulting state (the
+            // "nouvel état après la réponse" half of P5.2 — see its doc
+            // comment).
             if input.stream == true {
                 return try await makeStreamingResponse(
                     stream: stream, sessionID: id, model: selectedModel,
                     primedInside: thinkingIsPrimed,
-                    conversationID: usePersistentCache ? conversationID : nil,
-                    requestMessages: prepared.messages)
+                    conversationID: conversationID,
+                    requestMessages: prepared.messages, options: options)
             }
             return try await makeJSONResponse(
                 stream: stream, sessionID: id, model: selectedModel,
                 primedInside: thinkingIsPrimed,
-                conversationID: usePersistentCache ? conversationID : nil,
-                requestMessages: prepared.messages)
+                conversationID: conversationID,
+                requestMessages: prepared.messages, options: options)
         } catch {
             if input.effectiveConversationID != nil {
                 clearActiveConversation()
@@ -546,9 +552,35 @@ public actor Qwen38InferenceServer {
         id: String,
         model: String,
         requestMessages: [Qwen38ChatMessage],
-        assistantContent: String
+        assistantContent: String,
+        options: Qwen38GenerationOptions
     ) {
-        guard activeConversationID == id, activeConversationModel == model else { return }
+        if activeConversationID == id, activeConversationModel == model {
+            activeConversationMessages = requestMessages + [
+                Qwen38ChatMessage(role: .assistant, content: assistantContent)
+            ]
+            return
+        }
+        // P5.2, missed in the first pass: "sinon rejeu et **nouvel état après
+        // la réponse**" (PLAN.md). A stateless replay (`Qwen38Runtime.
+        // generateStateless` → `generateFromMessages`) still leaves the
+        // resident Flash-Next engine's live state matching this exact
+        // history when it finishes — nothing resets it afterward. Registering
+        // it here as the new active conversation means the *next* turn for
+        // this id can restore/continue instead of replaying again. Real-world
+        // impact found in P5.6's dialogue run: an agent whose very first
+        // message already carries a synthetic assistant turn (so the
+        // cold-start gate in `prepareConversation` never accepts it) was
+        // permanently stuck on stateless replay for the whole conversation
+        // without this. Only for the LRU-managed family with a non-zero
+        // budget; 27B and `--conversation-cache-gb 0` keep the untouched
+        // legacy behavior (no bookkeeping at all).
+        guard activeConversationID == nil,
+              familyOf(model) == .qwen4Exp,
+              conversationCacheBudgetBytes > 0 else { return }
+        activeConversationID = id
+        activeConversationModel = model
+        activeConversationOptions = options
         activeConversationMessages = requestMessages + [
             Qwen38ChatMessage(role: .assistant, content: assistantContent)
         ]
@@ -612,7 +644,7 @@ public actor Qwen38InferenceServer {
         let ext = metadata.split(separator: "/").last.map(String.init)?.split(separator: ";").first.map(String.init) ?? "bin"; let url = FileManager.default.temporaryDirectory.appendingPathComponent("qwen38-server-\(UUID().uuidString).\(ext)" ); try data.write(to: url, options: .atomic); return (url, true)
     }
 
-    private func makeJSONResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, conversationID: String?, requestMessages: [Qwen38ChatMessage]) async throws -> Response {
+    private func makeJSONResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, conversationID: String?, requestMessages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) async throws -> Response {
         var text = "", metrics: Qwen38RunMetrics?
         var parser = Qwen38ThinkingStreamParser(primedInside: primedInside)
         var reasoning = ""
@@ -632,11 +664,11 @@ public actor Qwen38InferenceServer {
             }
         }
         if let conversationID {
-            rememberConversation(id: conversationID, model: model, requestMessages: requestMessages, assistantContent: text)
+            rememberConversation(id: conversationID, model: model, requestMessages: requestMessages, assistantContent: text, options: options)
         }
         return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty), delta: nil, finishReason: Self.finishReason(metrics?.stopReason))]))
     }
-    private func makeStreamingResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, conversationID: String?, requestMessages: [Qwen38ChatMessage]) async throws -> Response {
+    private func makeStreamingResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, conversationID: String?, requestMessages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) async throws -> Response {
         let body = ResponseBody { writer in
             func writeDelta(content: String? = nil, reasoning: String? = nil, finishReason: String? = nil) async throws {
                 let value = ChatCompletionResponse(
@@ -674,7 +706,7 @@ public actor Qwen38InferenceServer {
                             await self.rememberConversation(
                                 id: conversationID, model: model,
                                 requestMessages: requestMessages,
-                                assistantContent: responseContent)
+                                assistantContent: responseContent, options: options)
                         }
                     }
                 }

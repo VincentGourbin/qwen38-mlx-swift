@@ -153,14 +153,16 @@ func serverConversationLRURestoresAlternatingConversations() async throws {
     #expect(a1.usePersistentCache == true)
     #expect(a1.cacheRestored == false)
     await server.rememberConversation(
-        id: "A", model: modelID, requestMessages: [userA1], assistantContent: "replyA1")
+        id: "A", model: modelID, requestMessages: [userA1], assistantContent: "replyA1",
+        options: options)
 
     let b1 = try await server.prepareConversation(
         id: "B", model: modelID, messages: [userB1], options: options)
     #expect(b1.usePersistentCache == true)
     #expect(b1.cacheRestored == false)
     await server.rememberConversation(
-        id: "B", model: modelID, requestMessages: [userB1], assistantContent: "replyB1")
+        id: "B", model: modelID, requestMessages: [userB1], assistantContent: "replyB1",
+        options: options)
 
     // Turn 2 alternates back to A: B is now live, so A must come from the LRU.
     let ledgerA = [userA1, Qwen38ChatMessage(role: .assistant, content: "replyA1")]
@@ -170,7 +172,8 @@ func serverConversationLRURestoresAlternatingConversations() async throws {
     #expect(a2.usePersistentCache == true)
     #expect(a2.cacheRestored == true)
     await server.rememberConversation(
-        id: "A", model: modelID, requestMessages: ledgerA + [userA2], assistantContent: "replyA2")
+        id: "A", model: modelID, requestMessages: ledgerA + [userA2], assistantContent: "replyA2",
+        options: options)
 
     // Turn 2 of B: A is now live again, so B must also come from the LRU.
     let ledgerB = [userB1, Qwen38ChatMessage(role: .assistant, content: "replyB1")]
@@ -181,6 +184,62 @@ func serverConversationLRURestoresAlternatingConversations() async throws {
     #expect(b2.cacheRestored == true)
 
     #expect(mock.restoreCount == 2)
+}
+
+@Test("P5.2 : un rejeu stateless établit un nouvel état actif que le tour suivant peut restaurer")
+func serverConversationLRUEstablishesStateAfterReplay() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-lru-replay-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let options = Qwen38GenerationOptions()
+    // A synthetic first turn that already carries an assistant message (the
+    // dialogue A/B pattern: one agent's history is seeded with a canned
+    // opening line, docs/knowledge/log.md "P5.6") — the cold-start gate
+    // (system/user only) always rejects it, so this must be a stateless
+    // replay every time... unless the replay itself establishes state.
+    let seeded = [
+        Qwen38ChatMessage(role: .system, content: "system prompt"),
+        Qwen38ChatMessage(role: .assistant, content: "Hello"),
+        Qwen38ChatMessage(role: .user, content: "reply to hello"),
+    ]
+    let first = try await server.prepareConversation(
+        id: "seeded", model: modelID, messages: seeded, options: options)
+    #expect(first.usePersistentCache == false)
+    #expect(first.cacheRestored == false)
+    await server.rememberConversation(
+        id: "seeded", model: modelID, requestMessages: seeded, assistantContent: "firstReply",
+        options: options)
+
+    // A different conversation takes over the resident engine...
+    let other = Qwen38ChatMessage(role: .user, content: "other conversation")
+    _ = try await server.prepareConversation(
+        id: "other", model: modelID, messages: [other], options: options)
+
+    // ...and the seeded conversation's *next* turn must now restore instead
+    // of replaying again, because rememberConversation registered it above.
+    let ledger = seeded + [Qwen38ChatMessage(role: .assistant, content: "firstReply")]
+    let secondUser = Qwen38ChatMessage(role: .user, content: "second user turn")
+    let second = try await server.prepareConversation(
+        id: "seeded", model: modelID, messages: ledger + [secondUser], options: options)
+    #expect(second.usePersistentCache == true)
+    #expect(second.cacheRestored == true)
+    #expect(mock.restoreCount == 1)
 }
 
 @Test("Les options appliquent le contrat KV cache Qwen")
