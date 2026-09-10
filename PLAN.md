@@ -3828,10 +3828,14 @@ Q-B, 78+ tests.
 | P5.5 | `serve` : warm-up au démarrage (`engine.warmUp()` comme la GUI, phase « Warm-up » dans la trace) ; compteurs n-gram publiés aussi en session partagée ; `/metrics` expose le budget et l'occupation du LRU. | première requête : TTFT < 3 s pour 60 tokens (contre 71 s) |
 | P5.6 | **Validation** : rejouer `Scripts/agent-dialogue.py --max-minutes 20` contre `qwen38 serve --trace` (sans Metal trace, ou ≤ 60 s) ; tableau avant/après : TTFT par tour, tok/s, similarité, pic mémoire, `cacheRestored` ; `BENCHMARKS.md` ligne « serveur multi-conversations ». | TTFT plat (< 3 s) sur 38 tours, aucune boucle, pic process < 75 Go |
 
-**Statut (2026-09-10)** : P5.1-P5.5 faits, commits séparés. P5.1 : snapshot/restore
-Flash-Next, 252 Mo / 1,2 ms à ~3 080 tokens (< 100 ms). P5.2 : LRU serveur
-(mock, 2 restaurations/0 rejeu). P5.3 : pénalités présence/répétition GPU,
-greedy inchangé, IDs identiques à la référence
+**Statut (2026-09-10) — P5.1-P5.6 tous faits, commits séparés.** P5.1 :
+snapshot/restore Flash-Next, 252 Mo / 1,2 ms à ~3 080 tokens (< 100 ms).
+P5.2 : LRU serveur (mock, 2 restaurations/0 rejeu) — **corrigé en cours de
+route** (commit « P5.2 fix ») : la consigne « sinon rejeu et nouvel état
+après la réponse » avait été manquée au premier passage, ce qui laissait un
+agent dont le tout premier message contient déjà un tour assistant bloqué en
+rejeu permanent (trouvé par le dialogue réel de P5.6). P5.3 : pénalités
+présence/répétition GPU, greedy inchangé, IDs identiques à la référence
 `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`. P5.5 : warm-up avant
 écoute (TTFT 0,97 s pour 60 tokens contre 71 s) + compteurs n-gram non nuls
 en session partagée. P5.4 : la couche PLE domine bien le préfill (29 % d'un
@@ -3841,4 +3845,16 @@ O(shards × IDs) du routage vers les shards n-gram ; corrigé en O(IDs), gain
 modeste (−1,6 % sur le préfill total, PLE reste ~28 %) ; documenté dans
 `docs/knowledge/log.md` (2026-09-10, « P5.4 »), rien de plus implémenté (le
 coût résiduel probable — dispatch GPU par shard — est un chantier distinct).
-Reste : P5.6 (rejeu du dialogue 20 min).
+P5.6 : dialogue A/B 20 min rejoué contre `serve --trace`, 76 tours (contre 38
+en référence) — **TTFT et mémoire largement dans les clous** (plat 0,76-2,81 s
+sur les 76 tours, 0 tour > 3 s, contre 23,9 s au dernier tour de la
+référence ; pic process 57,58 Go contre 75 Go ; `cacheRestored` 74/76 tours) ;
+**critère « aucune boucle » non atteint** — `presencePenalty` est remis à
+zéro à chaque tour (contrat GPU-par-token de P5.3), donc structurellement
+incapable d'empêcher une dérive thématique inter-tours : une boucle quasi
+verbatim apparaît aux tours 68-73 malgré la pénalité par défaut ; la
+similarité Jaccard médiane mesurée sur la référence (0,116-0,141 selon la
+fenêtre, méthode `rows[i]` vs `rows[i-2]`) ne correspond pas au chiffre 0,87
+cité plus haut dans ce document — écart non expliqué, méthode d'origine non
+retrouvée. Détails complets, tableaux avant/après et fichiers :
+`docs/knowledge/log.md` (2026-09-10, « P5.6 »), `BENCHMARKS.md` (« P5.6 »).

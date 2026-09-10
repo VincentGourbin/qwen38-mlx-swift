@@ -120,3 +120,31 @@ La couche PLE reste au-dessus du seuil de 15 % de la consigne après les deux
 correctifs ; le coût résiduel probable (dispatch GPU par shard n-gram touché,
 jusqu'à 128) n'a pas été attaqué — chantier distinct, hors du correctif ciblé
 demandé.
+
+### P5.6 — serveur multi-conversations : validation dialogue A/B 20 min (2026-09-10)
+
+`qwen38 serve --trace` (sans Metal System Trace), checkpoint 3-bit,
+`Scripts/agent-dialogue.py --max-minutes 20` (T=0,7, top_p 0,8, 120 tokens
+max, aucun champ de pénalité — défaut serveur `presence 1.5`). Détail complet,
+y compris le correctif P5.2 nécessaire en cours de route et l'écart non
+atteint sur la similarité : `docs/knowledge/log.md` 2026-09-10 « P5.6 ».
+
+| | Avant (référence, 38 tours) | Après (P5.1-P5.5, 76 tours) |
+|---|---:|---:|
+| TTFT tour 1 | 71,6 s | 0,93 s |
+| TTFT au dernier tour | 23,89 s (tour 38, 2 691 tok d'historique) | 2,65 s (tour 76) |
+| TTFT max sur le dialogue | 23,89 s | **2,81 s** (0 tour > 3 s) |
+| tok/s décodage | 4,9-6,0 | 4,9-6,4 |
+| Pic process | non mesuré | **57,58 Go** |
+| `cacheRestored` | métrique inexistante | 74/76 tours |
+| Similarité Jaccard médiane (i vs i-2) | 0,116 | 0,145 (non amélioré — voir log) |
+
+TTFT et mémoire : critère largement dépassé (76 tours plats sous 3 s contre
+l'objectif de 38 sous 3 s ; 57,6 Go contre le plafond de 75 Go). Similarité :
+critère « aucune boucle » non atteint — `presencePenalty` est remis à zéro à
+chaque tour (contrat P5.3), donc structurellement incapable d'empêcher une
+dérive thématique inter-tours ; une boucle quasi verbatim apparaît aux tours
+68-73 malgré la pénalité par défaut. Un correctif nécessaire en cours de
+route (P5.2 : « nouvel état après un rejeu », partie manquée du premier
+passage — sans lui, un agent dont le tout premier message contient déjà un
+tour assistant restait bloqué en rejeu complet toute la conversation).

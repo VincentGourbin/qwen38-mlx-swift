@@ -3037,3 +3037,70 @@ limite qu'en P4.3).
 Fichiers : `results/p54/chat.trace.json` (avant), `results/p54/chat-after.trace.json`
 (après lecture par plages), `results/p54/chat-after2.trace.json` (après le
 regroupement par shard, retenu) ; stdout correspondants.
+
+## 2026-09-10 — P5.6 : validation — dialogue A/B 20 min rejoué contre `serve` (P5.1-P5.5)
+
+Protocole : `qwen38 serve --trace results/p56/serve.trace.json` (sans Metal
+System Trace), checkpoint 3-bit, `Scripts/agent-dialogue.py --max-minutes 20`
+(température 0,7, top_p 0,8, 120 tokens max, `enable_thinking:false`,
+`mtp:false`, aucun champ de pénalité — le serveur applique donc son défaut
+`presence 1.5`, P5.3). Poller additionnel (`p56-metrics-poller.py`,
+hors dépôt) interrogeant `/metrics` toutes les 2 s pour capturer
+`cacheReused`/`cacheRestored`/`cacheReplayed` par session, absents du journal
+de `agent-dialogue.py`. Comparé à la référence pré-P5
+`results/dialogue-profiled/dialogue.jsonl` (38 tours, même script/réglages).
+
+**Premier essai (avant le correctif P5.2 ci-dessous)** : l'agent A démarre
+avec un tour assistant factice déjà dans son historique (le script fait dire
+« Hello » à A sans passer par une génération) ; le garde-fou de démarrage à
+froid de `prepareConversation` (« système/utilisateur seulement ») rejette
+donc systématiquement A, qui reste bloqué en rejeu stateless complet pour
+toute la conversation (TTFT recroissant avec l'historique, jusqu'à 19,6 s à
+2 578 tokens), alors que B (premier message pur système/utilisateur)
+bénéficie pleinement du LRU (TTFT plat ~2 s). Cause : PLAN.md spécifiait
+« sinon rejeu et **nouvel état après la réponse** » pour P5.2, partie
+manquée dans le premier passage — corrigée (commit « P5.2 fix »),
+`rememberConversation` enregistre désormais une conversation comme active
+après un rejeu réussi, pas seulement après une continuation. Essai jeté,
+rejoué proprement après le correctif.
+
+**Essai retenu** (après le correctif) : 76 tours en 20,0 min (contre 38 dans
+la référence — le débit de tours double puisque le TTFT ne croît plus).
+
+| | Avant (référence, 38 tours) | Après (P5.1-P5.5, 76 tours) |
+|---|---:|---:|
+| TTFT tour 1 | 71,6 s | 0,93 s |
+| TTFT médian | 8,4 s (tour 10) → 23,9 s (tour 38) | **2,16 s** (constant) |
+| TTFT max sur tout le dialogue | 23,89 s (tour 38) | **2,81 s** (aucun tour > 3 s) |
+| tok/s décodage | 4,9-6,0 | 4,9-6,4 (inchangé, attendu) |
+| Pic process (profiler) | — (non mesuré alors) | **57,58 Go** (< 75 Go) |
+| `cacheRestored` | n/a (métrique inexistante) | 74/76 tours (1 rejeu initial, 1 démarrage à froid) |
+| `cacheMisses` (serveur) | n/a | 2 |
+| Similarité Jaccard médiane (rows[i] vs rows[i-2]) | 0,116 (0,141 à partir du tour 30) | 0,145 (0,148 à partir du tour 30) |
+
+**TTFT et mémoire** : critère largement atteint — plat sous 3 s sur les 76
+tours (contre un objectif de 38), pic process 57,6 Go contre le plafond de
+75 Go. La restauration LRU fonctionne comme prévu une fois le correctif
+P5.2 appliqué : sur 76 tours, seuls les deux tout premiers (un par agent)
+ne restaurent pas.
+
+**Similarité / boucle — critère non atteint, écart documenté** : la
+similarité Jaccard médiane mesurée sur la référence n'est **pas** 0,87
+(chiffre cité dans PLAN.md P5) mais 0,116-0,141 selon la fenêtre — écart non
+expliqué (méthode de calcul du chiffre d'origine non retrouvée dans ce
+journal) ; en prenant ma propre mesure comme base de comparaison cohérente
+avant/après, la médiane ne s'améliore pas avec la pénalité de présence
+(0,141 → 0,148 à partir du tour 30) et une boucle quasi verbatim apparaît
+bel et bien aux tours 68-73 (« Tu as raison, je tourne en rond… », Jaccard
+1,0 entre tours 68 et 70). Explication : `presencePenalty` est appliqué par
+tour (masque remis à zéro à chaque nouvelle génération, PLAN.md P5.3
+l'implémente ainsi et le test greedy-inchangé le confirme) — il ne peut
+structurellement pas empêcher une dérive **thématique inter-tours** sur une
+conversation qui s'allonge, seulement la répétition d'un id **dans une
+même réponse**. Le critère « aucune boucle » de P5.6 n'est donc pas
+satisfait par ce mécanisme ; une pénalité inter-tours (fenêtre glissante sur
+l'historique récent, hors périmètre GPU-par-token de P5.3) serait le
+prochain levier, non implémentée ici.
+
+Fichiers : `results/p56/dialogue.jsonl`, `results/p56/sessions.jsonl`,
+`results/p56/server.log` (rapport profiler complet), `results/p56/serve.trace.json`.
