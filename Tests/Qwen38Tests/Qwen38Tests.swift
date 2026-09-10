@@ -2222,6 +2222,46 @@ func qwen4ExpEngineExportRestoreConversationStateReproducesGeneration() async th
     #expect(restoredTurn == sideTurn)
 }
 
+@Test("P6.4 : un appel LAN intercalé entre deux tours GUI ne corrompt plus le second (LRU partagé)")
+func runtimeGUIFlashConversationSurvivesInterleavedLANRequest() async throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {
+        return
+    }
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let runtime = Qwen38Runtime()
+    try await runtime.load(from: directory)
+    // Greedy: deterministic, and P6.3's mask never engages — the only
+    // thing that could make the two runs differ is which KV state "Et son
+    // prédécesseur ?" actually sees.
+    let options = Qwen38GenerationOptions(maxTokens: 6, temperature: 0)
+    let firstPrompt = "Bonjour"
+    let secondPrompt = "Et son prédécesseur ?"
+
+    // Control: two GUI turns back to back, nothing else touches the
+    // resident engine in between.
+    for try await _ in try await runtime.generate(prompt: firstPrompt, options: options) {}
+    var controlTurn = ""
+    for try await event in try await runtime.generate(prompt: secondPrompt, options: options) {
+        if case .chunk(let chunk) = event { controlTurn += chunk }
+    }
+    #expect(!controlTurn.isEmpty)
+
+    // Same scenario, but a LAN-style stateless request (`generateStateless`
+    // → `generateFromMessages`, which resets the engine unconditionally)
+    // runs between the two GUI turns — exactly P5.7's bug scenario.
+    await runtime.resetConversation()
+    for try await _ in try await runtime.generate(prompt: firstPrompt, options: options) {}
+    for try await _ in try await runtime.generateStateless(
+        messages: [Qwen38ChatMessage(role: .user, content: "Requête LAN intercalée.")],
+        options: options
+    ) {}
+    var interleavedTurn = ""
+    for try await event in try await runtime.generate(prompt: secondPrompt, options: options) {
+        if case .chunk(let chunk) = event { interleavedTurn += chunk }
+    }
+    #expect(interleavedTurn == controlTurn)
+}
+
 @Test("Qwen38Runtime bascule Flash-Next → 27B dans le même process et libère la résidence (H3.3)")
 func runtimeSwitchesFromFlashNextToQwen35ReleasesResidentMemory() async throws {
     guard let flashPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"],
