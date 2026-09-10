@@ -324,7 +324,6 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
 
     private func readPackedRows(_ location: TensorLocation, rows: [Int]) -> [UInt32] {
         guard !rows.isEmpty else { return [] }
-        let width = location.rowBytes / MemoryLayout<UInt32>.size
         var cached = [[UInt32]?](repeating: nil, count: rows.count)
         var missing = [Int]()
         var missingSet = Set<Int>()
@@ -339,10 +338,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             let missStart = ContinuousClock.now
             let fetched = readPackedRowsUncached(location, rows: missing)
             rowCache.recordMissDuration((ContinuousClock.now - missStart).seconds)
-            for (index, row) in missing.enumerated() {
-                rowCache.storePacked(
-                    Array(fetched[index * width ..< (index + 1) * width]),
-                    location: location, row: row)
+            for row in missing {
+                guard let value = fetched[row] else {
+                    preconditionFailure("Lecture n-gram incomplète: \(location.url.path):\(row)")
+                }
+                rowCache.storePacked(value, location: location, row: row)
             }
         }
         return rows.enumerated().flatMap { index, row in
@@ -354,7 +354,7 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         }
     }
 
-    private func readPackedRowsUncached(_ location: TensorLocation, rows: [Int]) -> [UInt32] {
+    private func readPackedRowsUncached(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt32]] {
         if let mapping = mappedFiles[location.url] {
             let raw = UnsafeRawBufferPointer(
                 start: UnsafeRawPointer(mapping.baseAddress), count: mapping.byteCount)
@@ -364,58 +364,118 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             guard start >= 0, end <= raw.count else {
                 preconditionFailure("Mapping safetensors invalide: \(location.url.path)")
             }
-            var result = [UInt32]()
-            result.reserveCapacity(rows.count * (byteWidth / MemoryLayout<UInt32>.size))
-            for row in rows {
-                let rowStart = start + row * byteWidth
-                for offset in stride(from: 0, to: byteWidth, by: 4) {
-                    let index = rowStart + offset
-                    // Safetensors offsets are byte offsets and need not be
-                    // aligned for UInt32 loads. Assemble explicitly to keep
-                    // the mapped and FileHandle paths bit-exact on ARM64.
-                    result.append(UInt32(raw[index])
-                        | UInt32(raw[index + 1]) << 8
-                        | UInt32(raw[index + 2]) << 16
-                        | UInt32(raw[index + 3]) << 24)
-                }
-            }
-            return result
+            return Self.readContiguousRuns(UInt32.self, mapping: raw, start: start, byteWidth: byteWidth, rows: rows)
         }
         return Self.readPackedRowsFromFile(location, rows: rows)
     }
 
-    private static func readPackedRowsFromFile(_ location: TensorLocation, rows: [Int]) -> [UInt32] {
-        let byteWidth = location.rowBytes
-        var result = [UInt32]()
-        result.reserveCapacity(rows.count * (byteWidth / MemoryLayout<UInt32>.size))
+    private static func readPackedRowsFromFile(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt32]] {
         guard let handle = try? FileHandle(forReadingFrom: location.url) else {
             preconditionFailure("Impossible d'ouvrir \(location.url.path)")
         }
         defer { try? handle.close() }
-        for row in rows {
+        return Self.readContiguousRunsFromFile(
+            UInt32.self, handle: handle, dataStart: location.dataStart, byteWidth: location.rowBytes,
+            rows: rows, url: location.url)
+    }
+
+    /// P5.4: bulk row reads for the n-gram table's mmap-backed shards.
+    ///
+    /// The original implementation read every requested row's bytes one
+    /// `UInt32`/`UInt16` at a time via manual little-endian shift-assembly
+    /// (avoiding unaligned typed loads). Measured contribution on the real
+    /// 3-bit checkpoint: the PLE layer (couche 1) alone took 2.75 s of a
+    /// 9.4 s pure-forward 2 543-token prefill — 29 % of total forward time
+    /// across 48 layers, against ~135 ms for a typical non-PLE/QSA layer
+    /// (docs/knowledge/log.md "P5.4", `results/p54/chat.trace.json`).
+    /// Sorting the requested rows and copying each *contiguous* run in one
+    /// `copyMemory` call reproduces the exact same bytes — ARM64 Apple
+    /// Silicon is little-endian, matching the manual reconstruction bit for
+    /// bit — with a single bulk copy per run instead of one loop iteration
+    /// per element.
+    private static func readContiguousRuns<Element: FixedWidthInteger & UnsignedInteger>(
+        _ type: Element.Type, mapping raw: UnsafeRawBufferPointer, start: Int, byteWidth: Int,
+        rows: [Int]
+    ) -> [Int: [Element]] {
+        var result: [Int: [Element]] = [:]
+        guard !rows.isEmpty else { return result }
+        result.reserveCapacity(rows.count)
+        let elementsPerRow = byteWidth / MemoryLayout<Element>.size
+        let sortedRows = rows.sorted()
+        var i = 0
+        while i < sortedRows.count {
+            var j = i
+            while j + 1 < sortedRows.count, sortedRows[j + 1] == sortedRows[j] + 1 {
+                j += 1
+            }
+            let firstRow = sortedRows[i]
+            let rangeRowCount = j - i + 1
+            let rangeByteCount = rangeRowCount * byteWidth
+            let sourceStart = start + firstRow * byteWidth
+            var rangeValues = [Element](repeating: 0, count: rangeRowCount * elementsPerRow)
+            rangeValues.withUnsafeMutableBytes { destination in
+                destination.copyMemory(
+                    from: UnsafeRawBufferPointer(rebasing: raw[sourceStart ..< sourceStart + rangeByteCount]))
+            }
+            for offset in 0 ..< rangeRowCount {
+                let sliceStart = offset * elementsPerRow
+                result[firstRow + offset] = Array(rangeValues[sliceStart ..< sliceStart + elementsPerRow])
+            }
+            i = j + 1
+        }
+        return result
+    }
+
+    /// `FileHandle` counterpart of `readContiguousRuns` for the (untested in
+    /// production — every shard is mmap-backed today) non-mapped fallback:
+    /// one `read(upToCount:)` per contiguous run instead of one per row.
+    private static func readContiguousRunsFromFile<Element: FixedWidthInteger & UnsignedInteger>(
+        _ type: Element.Type, handle: FileHandle, dataStart: UInt64, byteWidth: Int, rows: [Int],
+        url: URL
+    ) -> [Int: [Element]] {
+        var result: [Int: [Element]] = [:]
+        guard !rows.isEmpty else { return result }
+        result.reserveCapacity(rows.count)
+        let elementsPerRow = byteWidth / MemoryLayout<Element>.size
+        let sortedRows = rows.sorted()
+        var i = 0
+        while i < sortedRows.count {
+            var j = i
+            while j + 1 < sortedRows.count, sortedRows[j + 1] == sortedRows[j] + 1 {
+                j += 1
+            }
+            let firstRow = sortedRows[i]
+            let rangeRowCount = j - i + 1
+            let rangeByteCount = rangeRowCount * byteWidth
             do {
-                try handle.seek(toOffset: location.dataStart + UInt64(row * byteWidth))
-                guard let data = try handle.read(upToCount: byteWidth), data.count == byteWidth else {
-                    preconditionFailure("Lecture safetensors tronquée: \(location.url.path)")
+                try handle.seek(toOffset: dataStart + UInt64(firstRow * byteWidth))
+                guard let data = try handle.read(upToCount: rangeByteCount),
+                      data.count == rangeByteCount else {
+                    preconditionFailure("Lecture safetensors tronquée: \(url.path)")
                 }
                 data.withUnsafeBytes { raw in
-                    for offset in stride(from: 0, to: byteWidth, by: 4) {
-                        result.append(UInt32(raw[offset])
-                            | UInt32(raw[offset + 1]) << 8
-                            | UInt32(raw[offset + 2]) << 16
-                            | UInt32(raw[offset + 3]) << 24)
+                    for offset in 0 ..< rangeRowCount {
+                        let elementStart = offset * elementsPerRow
+                        let byteStart = elementStart * MemoryLayout<Element>.size
+                        let byteEnd = byteStart + elementsPerRow * MemoryLayout<Element>.size
+                        var rowValues = [Element](repeating: 0, count: elementsPerRow)
+                        rowValues.withUnsafeMutableBytes { destination in
+                            destination.copyMemory(
+                                from: UnsafeRawBufferPointer(rebasing: raw[byteStart ..< byteEnd]))
+                        }
+                        result[firstRow + offset] = rowValues
                     }
                 }
             } catch {
                 preconditionFailure("Lecture safetensors impossible: \(error)")
             }
+            i = j + 1
         }
         return result
     }
 
     private func readUInt16Rows(_ location: TensorLocation, rows: [Int]) -> [UInt16] {
         guard !rows.isEmpty else { return [] }
-        let width = location.rowBytes / MemoryLayout<UInt16>.size
         var cached = [[UInt16]?](repeating: nil, count: rows.count)
         var missing = [Int]()
         var missingSet = Set<Int>()
@@ -430,10 +490,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             let missStart = ContinuousClock.now
             let fetched = readUInt16RowsUncached(location, rows: missing)
             rowCache.recordMissDuration((ContinuousClock.now - missStart).seconds)
-            for (index, row) in missing.enumerated() {
-                rowCache.storeHalf(
-                    Array(fetched[index * width ..< (index + 1) * width]),
-                    location: location, row: row)
+            for row in missing {
+                guard let value = fetched[row] else {
+                    preconditionFailure("Lecture n-gram incomplète: \(location.url.path):\(row)")
+                }
+                rowCache.storeHalf(value, location: location, row: row)
             }
         }
         return rows.enumerated().flatMap { index, row in
@@ -445,7 +506,7 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         }
     }
 
-    private func readUInt16RowsUncached(_ location: TensorLocation, rows: [Int]) -> [UInt16] {
+    private func readUInt16RowsUncached(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt16]] {
         if let mapping = mappedFiles[location.url] {
             let raw = UnsafeRawBufferPointer(
                 start: UnsafeRawPointer(mapping.baseAddress), count: mapping.byteCount)
@@ -455,46 +516,19 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             guard start >= 0, end <= raw.count else {
                 preconditionFailure("Mapping safetensors invalide: \(location.url.path)")
             }
-            var result = [UInt16]()
-            result.reserveCapacity(rows.count * (byteWidth / MemoryLayout<UInt16>.size))
-            for row in rows {
-                let rowStart = start + row * byteWidth
-                for offset in stride(from: 0, to: byteWidth, by: 2) {
-                    let index = rowStart + offset
-                    // See the UInt32 reader above: preserve little-endian
-                    // safetensors semantics without alignment assumptions.
-                    result.append(UInt16(raw[index]) | UInt16(raw[index + 1]) << 8)
-                }
-            }
-            return result
+            return Self.readContiguousRuns(UInt16.self, mapping: raw, start: start, byteWidth: byteWidth, rows: rows)
         }
         return Self.readUInt16RowsFromFile(location, rows: rows)
     }
 
-    private static func readUInt16RowsFromFile(_ location: TensorLocation, rows: [Int]) -> [UInt16] {
-        let byteWidth = location.rowBytes
-        var result = [UInt16]()
-        result.reserveCapacity(rows.count * (byteWidth / MemoryLayout<UInt16>.size))
+    private static func readUInt16RowsFromFile(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt16]] {
         guard let handle = try? FileHandle(forReadingFrom: location.url) else {
             preconditionFailure("Impossible d'ouvrir \(location.url.path)")
         }
         defer { try? handle.close() }
-        for row in rows {
-            do {
-                try handle.seek(toOffset: location.dataStart + UInt64(row * byteWidth))
-                guard let data = try handle.read(upToCount: byteWidth), data.count == byteWidth else {
-                    preconditionFailure("Lecture safetensors tronquée: \(location.url.path)")
-                }
-                data.withUnsafeBytes { raw in
-                    for offset in stride(from: 0, to: byteWidth, by: 2) {
-                        result.append(UInt16(raw[offset]) | UInt16(raw[offset + 1]) << 8)
-                    }
-                }
-            } catch {
-                preconditionFailure("Lecture safetensors impossible: \(error)")
-            }
-        }
-        return result
+        return Self.readContiguousRunsFromFile(
+            UInt16.self, handle: handle, dataStart: location.dataStart, byteWidth: location.rowBytes,
+            rows: rows, url: location.url)
     }
 
     private struct HeaderDescriptor {
@@ -717,18 +751,32 @@ public final class Qwen4ExpNGramEmbedding: Module {
             shardIndices.append(shardIndex(for: value))
         }
 
+        // P5.4: bucket every ID's position by shard in one pass instead of
+        // scanning the whole `shardIndices` array once per distinct shard
+        // (`Set(shardIndices).sorted()` outer loop, `compactMap` inner scan
+        // — O(shards × total IDs), up to 128 × a few hundred thousand IDs on
+        // a long prefill). Measured contribution: this shard-routing loop,
+        // not the row-byte reads it was originally suspected to be, is what
+        // made the PLE layer (couche 1) cost ~30 % of a 2 543-token prefill
+        // (docs/knowledge/log.md "P5.4"). Order within each shard's position
+        // list is preserved (ascending original index), matching the old
+        // `compactMap` traversal exactly.
+        var positionsByShard: [Int: [Int32]] = [:]
+        positionsByShard.reserveCapacity(min(shardOffsets.count, shardIndices.count))
+        for (index, shard) in shardIndices.enumerated() {
+            positionsByShard[shard, default: []].append(Int32(index))
+        }
+
         var groupedValues: [MLXArray] = []
         var groupedPositions: [[Int32]] = []
-        groupedValues.reserveCapacity(Set(shardIndices).count)
-        groupedPositions.reserveCapacity(Set(shardIndices).count)
-        for shard in Set(shardIndices).sorted() {
-            let positions = shardIndices.enumerated().compactMap { index, value in
-                value == shard ? index : nil
-            }
-            let local = positions.map { Int32(hostIDs[$0]) - Int32(shardOffsets[shard]) }
+        groupedValues.reserveCapacity(positionsByShard.count)
+        groupedPositions.reserveCapacity(positionsByShard.count)
+        for shard in positionsByShard.keys.sorted() {
+            let positions = positionsByShard[shard]!
+            let local = positions.map { Int32(hostIDs[Int($0)]) - Int32(shardOffsets[shard]) }
             let values = ngramEmbedding.lookup(shard: shard, rows: local)
             groupedValues.append(values)
-            groupedPositions.append(positions.map(Int32.init))
+            groupedPositions.append(positions)
         }
         // The hash-to-shard routing necessarily evaluates the compact IDs on the
         // host (the checkpoint is split into 128 independent tables). Keep the

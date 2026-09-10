@@ -102,3 +102,21 @@ pas une moyenne d'échantillons `ioreg`) : 14,2 % avant P4.1 → 82-97 % après
 fusion de noyau custom retenue (P4.3, décision documentée) : P2-fusion avait
 déjà montré un gain nul sur des leviers structurellement comparables, et
 P4.1 seul a refermé l'essentiel de l'écart GPU visé par ces fusions.
+
+### P5.4 — préfill 2 543 tokens : la couche PLE domine, routage shard O(n) au lieu de O(shards×n) (2026-09-10)
+
+Deux tours `flash-chat-probe --resident-layers --resident-async --profile-layers
+--trace` (tour 1 court force la résidence, tour 2 mesure un préfill pur, sans
+coût de chargement) ; checkpoint 3-bit, prompt répété, greedy. Détail complet
+et hypothèse initiale réfutée : `docs/knowledge/log.md` 2026-09-10 « P5.4 ».
+
+| Variante | tokens | préfill total (tour 2, pur) | couche PLE (n-gram) | % du préfill | IDs |
+|---|---:|---:|---:|---:|---|
+| Avant | 2 543 | 9,914 s | 2,746 s | 29,2 % | `[78768]` |
+| Après lecture par plages (retenu, sans gain net) | 2 543 | — | 2,746 → 3,101 s | ~31 % | `[78768]` |
+| Après routage shard O(n) (retenu) | 2 543 | **9,753 s** (−1,6 %) | **2,568 s** (−6,5 %) | **27,8 %** | `[78768]` |
+
+La couche PLE reste au-dessus du seuil de 15 % de la consigne après les deux
+correctifs ; le coût résiduel probable (dispatch GPU par shard n-gram touché,
+jusqu'à 128) n'a pas été attaqué — chantier distinct, hors du correctif ciblé
+demandé.

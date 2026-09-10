@@ -2970,3 +2970,70 @@ stall détecté par le profiler (le gel du tour 13 avait des échantillons : ce
 n'est pas une absence d'échantillons mais une famine mémoire). Les compteurs
 n-gram restent à 0 en session partagée (ils ne sont publiés qu'avec le
 profilage par couche) — à brancher sur la session partagée.
+
+## 2026-09-10 — P5.4 : préfill 2 543 tokens, la couche PLE domine (~28-32 %), deux correctifs, gain modeste
+
+Protocole : `flash-chat-probe --resident-layers --resident-async --profile-layers
+--trace` en deux tours (`--prompt "Bonjour"` puis `--second-prompt` avec la
+phrase « Le chat noir traverse la rue tranquillement avant midi. » répétée
+230 fois → 2 543 tokens) — le tour 1 force la résidence des 48 couches
+(`load cumulé` payé une fois), le tour 2 mesure un préfill **pur** (`load
+cumulé : 0.000s`), sans conflit avec le coût de chargement Lexar. Ventilation
+par couche via les paires `B`/`E` du trace Chrome exporté (`ph`) — le tableau
+console `generateReport()` agrège à tort chargement + calcul des deux tours
+sous le même nom de phase, inutilisable pour cette mesure.
+
+**Avant correctif** (`results/p54/chat.trace.json`) : préfill tour 2 = 9,914 s
+pour 2 543 tokens. Couche 1 (PLE, n-gram) = 2,746 s (**29,2 %** du total
+forward, 9,396 s) ; QSA (12 couches) = 1,878 s (20,0 %) ; les 35 autres
+couches (GDN/hyper-connections/MoE) = 4,772 s (50,8 %, ~135 ms/couche
+homogène). La couche PLE coûte à elle seule ~20× une couche « normale ».
+
+**Hypothèse initiale (celle du plan) réfutée** : `Qwen4ExpLazyNGramStorage`
+lit chaque ligne n-gram manquante octet par octet (`for row in rows { for
+offset in stride(from:0,to:byteWidth,by:4) {...} }`, reconstruction
+little-endian manuelle) plutôt qu'un `memcpy` groupé. Correctif appliqué :
+tri des lignes demandées, une copie mémoire (`copyMemory`) par plage
+contiguë au lieu d'une itération par élément (`readContiguousRuns`/
+`readContiguousRunsFromFile`, génériques `UInt32`/`UInt16`, mmap et
+FileHandle). IDs générés identiques (`[78768]`), mais **gain quasi nul**
+(couche PLE 2,746 s → 3,101 s puis 2,568 s sur deux re-mesures — bruit de
+mesure, aucune tendance nette). L'instrumentation `P4.5 n-gram : ... miss
+cumulé 0.0000s` reste à 0 (bug de bookkeeping distinct, `missDuration`
+n'est jamais remonté par `observeNGramCache` — non corrigé ici, hors
+périmètre P5.4) : impossible de confirmer par ce biais que les lectures de
+lignes étaient déjà rapides, mais le résultat avant/après est sans appel.
+
+**Deuxième hypothèse, retenue** : `Qwen4ExpPLE.lookup(_ IDs:)` route chaque
+ID vers un shard (jusqu'à 128) puis, pour **chaque shard distinct**, relit
+l'intégralité du tableau `shardIndices` (`Set(shardIndices).sorted()` +
+`.compactMap` par shard) pour extraire ses positions — O(shards × total IDs)
+au lieu de O(total IDs). Sur un préfill de 2 543 tokens (~245 000 IDs
+cumulés sur les deux tours), avec un grand nombre de shards distincts
+touchés, ce balayage répété est un candidat crédible. Correctif : un seul
+passage sur `shardIndices` qui regroupe les positions par shard dans un
+dictionnaire (`positionsByShard`, ordre préservé), puis un tri des clés —
+même sortie, O(total IDs + shards log shards). IDs identiques (`[78768]`).
+**Gain mesuré, modeste** : couche PLE 2,746 s → 2,568 s (−6,5 %), total
+préfill tour 2 9,914 s → 9,753 s (−1,6 %, dans le bruit de mesure d'un seul
+run par variante).
+
+**Décision** : les deux correctifs sont conservés (corrects, sans risque de
+régression — IDs identiques, 82/82 tests verts — et algorithmiquement
+strictement meilleurs même sans gain mesuré net), mais **le poste dominant
+n'est pas résolu**. La couche PLE reste ~28 % du préfill après les deux
+correctifs (2,568 s / 9,226 s de forward total sur la dernière mesure),
+au-dessus du seuil de 15 % de la consigne P5.4. Le coût résiduel le plus
+probable, non attaqué ici : le nombre d'opérations GPU par shard touché
+(`MLXArray` × 3 + `MLX.dequantized` + `result.at[...].add(...)`, jusqu'à
+~128 shards par tour) — une bascule de dispatch/queue Metal par shard plutôt
+qu'un coût de lecture CPU. Regrouper la déquantification de plusieurs shards
+en un seul appel GPU (moins de dispatches, plus gros tenseurs) est un
+chantier distinct, plus risqué (il faudrait un harnais de parité par shard),
+hors du correctif ciblé demandé par P5.4 rév. 2026-09-10. Documenté ici pour
+une reprise éventuelle avec accès à Instruments/Shader Timeline (même
+limite qu'en P4.3).
+
+Fichiers : `results/p54/chat.trace.json` (avant), `results/p54/chat-after.trace.json`
+(après lecture par plages), `results/p54/chat-after2.trace.json` (après le
+regroupement par shard, retenu) ; stdout correspondants.

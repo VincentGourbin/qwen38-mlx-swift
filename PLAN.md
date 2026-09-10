@@ -3827,3 +3827,18 @@ Q-B, 78+ tests.
 | P5.4 | **Préfill** : profiler par sous-blocs un préfill de 2 700 tokens (Release, `--profile-layers` opt-in) : part de la couche PLE (n-gram : ~20 000 lignes lues une par une, `Qwen4ExpPLE.lookup` → `asArray` + lectures ligne par ligne), du masque QSA/indexer au-delà de 2 048 tokens, du `gatherQMM` trié. Correctif ciblé sur le premier poste : pour le n-gram, lecture **par plages triées** (un `pread` par plage contiguë) et une seule construction d'`MLXArray` par shard et par appel. | TTFT à 2 700 tokens avant/après (référence 23,9 s) ; IDs identiques |
 | P5.5 | `serve` : warm-up au démarrage (`engine.warmUp()` comme la GUI, phase « Warm-up » dans la trace) ; compteurs n-gram publiés aussi en session partagée ; `/metrics` expose le budget et l'occupation du LRU. | première requête : TTFT < 3 s pour 60 tokens (contre 71 s) |
 | P5.6 | **Validation** : rejouer `Scripts/agent-dialogue.py --max-minutes 20` contre `qwen38 serve --trace` (sans Metal trace, ou ≤ 60 s) ; tableau avant/après : TTFT par tour, tok/s, similarité, pic mémoire, `cacheRestored` ; `BENCHMARKS.md` ligne « serveur multi-conversations ». | TTFT plat (< 3 s) sur 38 tours, aucune boucle, pic process < 75 Go |
+
+**Statut (2026-09-10)** : P5.1-P5.5 faits, commits séparés. P5.1 : snapshot/restore
+Flash-Next, 252 Mo / 1,2 ms à ~3 080 tokens (< 100 ms). P5.2 : LRU serveur
+(mock, 2 restaurations/0 rejeu). P5.3 : pénalités présence/répétition GPU,
+greedy inchangé, IDs identiques à la référence
+`[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`. P5.5 : warm-up avant
+écoute (TTFT 0,97 s pour 60 tokens contre 71 s) + compteurs n-gram non nuls
+en session partagée. P5.4 : la couche PLE domine bien le préfill (29 % d'un
+préfill pur 2 543 tokens, 9,9 s) mais **la cause n'est pas la lecture ligne
+par ligne** (hypothèse du plan, réfutée par la mesure) — c'est le balayage
+O(shards × IDs) du routage vers les shards n-gram ; corrigé en O(IDs), gain
+modeste (−1,6 % sur le préfill total, PLE reste ~28 %) ; documenté dans
+`docs/knowledge/log.md` (2026-09-10, « P5.4 »), rien de plus implémenté (le
+coût résiduel probable — dispatch GPU par shard — est un chantier distinct).
+Reste : P5.6 (rejeu du dialogue 20 min).
