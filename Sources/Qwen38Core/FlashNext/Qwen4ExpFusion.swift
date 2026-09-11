@@ -37,6 +37,16 @@ public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     /// `op-overhead-probe`'s `SwitchGLU` measurements (docs/knowledge/log.md,
     /// "P8 : ..."). `false` (`.none` through `.f6Compile`) is the original,
     /// leaking behavior.
+    /// Défaut de production depuis le 2026-09-11. Ce n'est pas une
+    /// optimisation mais une **mise en conformité avec la référence** :
+    /// `Scripts/references/vlm_q4_language.py` termine `Qwen4ExpRMSNorm`
+    /// (l. 597) et `Qwen4ExpRMSNormGated` (l. 615) par `.astype(dtype)`,
+    /// c'est-à-dire un retour au dtype d'entrée (bf16). Notre chemin laissait
+    /// fuir le float32 de l'état GDN et des tables MRoPE dans toute la suite
+    /// de la couche, ce qui faisait basculer le MoE sur son chemin lent
+    /// (SwitchGLU isolé : 150 µs en bf16, 4022 µs en fp32). Mesuré sur le
+    /// checkpoint 3-bit réel : 5,91 → 12,92 tok/s, IDs bit-identiques,
+    /// +0,8 Go de pic. Repasser à `.none` pour comparer.
     case f7GatedBranchDtype = 7
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }

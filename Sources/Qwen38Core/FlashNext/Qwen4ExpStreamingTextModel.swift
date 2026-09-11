@@ -43,7 +43,7 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         residentAsyncEval: Bool = false,
         residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
     ) throws {
         let loadedGlobal = try Qwen4ExpGlobalCheckpointLoader.load(
             from: directory, materialize: materializeGlobal, uncachedIO: uncachedIO)

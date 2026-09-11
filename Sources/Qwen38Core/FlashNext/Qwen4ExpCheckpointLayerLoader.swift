@@ -78,7 +78,7 @@ public enum Qwen4ExpCheckpointLayerLoader {
         materialize: Bool = true,
         useCheckpointQuantization: Bool = true,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
     ) throws -> Qwen4ExpLoadedDecoderLayer {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         guard configuration.textConfiguration.layerTypes.indices.contains(layerIndex) else {

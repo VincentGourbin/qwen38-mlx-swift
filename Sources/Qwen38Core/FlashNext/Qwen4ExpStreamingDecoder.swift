@@ -127,7 +127,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         residentAsyncEval: Bool = false,
         residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
     ) throws {
         precondition(residentEvaluationInterval > 0)
         precondition(residentAsyncInterval > 0)

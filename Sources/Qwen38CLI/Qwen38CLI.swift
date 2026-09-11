@@ -557,7 +557,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         help:
             "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA) — s'applique aussi au chemin --mtp"
     )
-    var fusionLevel: Int = 0
+    var fusionLevel: Int = 7
 
     func run() async throws {
         guard maxNewTokens > 0 else {
@@ -876,7 +876,7 @@ struct FlashLayerBench: AsyncParsableCommand {
         help:
             "P2-fusion : niveau cumulatif F1-F7 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
     )
-    var fusionLevel: Int = 0
+    var fusionLevel: Int = 7
 
     @Flag(
         name: .long,
@@ -1285,7 +1285,7 @@ struct FlashChatProbe: AsyncParsableCommand {
         help:
             "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
     )
-    var fusionLevel: Int = 0
+    var fusionLevel: Int = 7
 
     func run() async throws {
         guard maxNewTokens > 0 else {

@@ -4012,3 +4012,38 @@ long de la session.
    chemin MTP — cohérent avec la décision de ne pas changer le défaut de
    production (point 2), documenté comme limite de portée plutôt que
    contourné.
+
+## 2026-09-11 (soir) — F7 passé en défaut de production : ce n'était pas une optimisation mais un écart à la référence
+
+Vérification indépendante du résultat P8, puis bascule du défaut.
+
+**L'argument qui a décidé.** La référence Python vendorée
+`Scripts/references/vlm_q4_language.py` termine `Qwen4ExpRMSNorm` (l. 597) et
+`Qwen4ExpRMSNormGated` (l. 615) par `.astype(dtype)` — retour explicite au
+dtype d'entrée (bf16). Notre chemin ne le faisait pas : le float32 de l'état
+récurrent GDN et des tables MRoPE (conservé à dessein, piège §6.3-6) fuyait
+dans toute la suite de la couche, et le MoE héritait d'une entrée fp32.
+`SwitchGLU` isolé coûte 150 µs en bf16 et **4 022 µs en fp32** : les « 88 % de
+la couche » attribués au MoE en P7.1 étaient cet artefact, pas un défaut du
+MoE. F7 (`f7GatedBranchDtype`) rétablit le comportement de la référence.
+
+**Mesures faites ici, checkpoint 3-bit hybride, Release, résident, 32 tokens :**
+
+| | F0 (ancien défaut) | F7 (nouveau défaut) |
+|---|---|---|
+| greedy | 5,24 s · **5,91 tok/s** | 2,43 s · **12,9 tok/s** |
+| MTP bloc 2 | — | 2,28 s · **13,6 tok/s** · 55 % d'acceptation |
+| IDs greedy | référence | **identiques** (bit-exact) |
+| garde Q-B | 10/28 · −4,8003182 | **10/28 · −4,8003182** (inchangée) |
+| pic MLX | 56,59 Go | 57,42 Go |
+
+**×2,2 sur la génération, à sortie bit-identique et garde Q-B inchangée.**
+L'acceptation MTP monte aussi à 55 % (47,6 % auparavant), cohérent avec un
+drafter qui voit enfin la même arithmétique que la cible.
+
+**Bascule** : `Qwen4ExpStreamingDecoder`, `Qwen4ExpStreamingTextModel` et
+`Qwen4ExpCheckpointLayerLoader` ont `.f7GatedBranchDtype` en défaut ;
+`Qwen38FlashNextEngine` ne passe pas le paramètre, donc **la GUI et le serveur
+en héritent**. Les probes CLI passaient explicitement `0` : leur défaut est
+passé à `7` pour que les mesures reflètent la production. `--fusion-level 0`
+reste le moyen de comparer.

@@ -1,0 +1,11 @@
+=== tour 1 ===
+Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire centrale
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501, 4372, 41196, 67763, 85041, 3717, 181876, 8358, 3717, 179342, 47561, 68, 215309, 11, 501, 183435, 401, 1147, 9364, 198070, 175030]
+TTFT: 61.488s
+prefill: 61.488s
+decode: 5.259s
+couches: 1536 visites · load cumulé 60.539s
+P4.2 fin de token (cumulé) : lm_head 0.0920s · sampler.sample 0.0001s · .item() 0.0078s
+MLX mémoire active: 56,18 GB
+MLX mémoire peak: 56,59 GB
