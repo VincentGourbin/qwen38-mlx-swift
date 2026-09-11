@@ -18,16 +18,23 @@ public final class Qwen4ExpGatedResidual: Module {
     @ModuleInfo(key: "input_mix_weight_up") public var inputMixWeightUp: Linear
     @ModuleInfo(key: "block_inject_weight") public var blockInjectWeight: Linear?
 
+    /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
+    /// `flash-layer-bench --ablate`. `.none` everywhere in production —
+    /// see `Qwen4ExpLayerBenchAblation`.
+    public let ablation: Qwen4ExpLayerBenchAblation
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
         useCombine: Bool = true,
         quantization: Qwen4ExpQuantizationSpec? = nil,
-        parityPrefix: String = ""
+        parityPrefix: String = "",
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) {
         hiddenSize = configuration.hiddenSize
         streamCount = configuration.hcCount
         self.parityPrefix = parityPrefix
+        self.ablation = ablation
         let streamHiddenSize = streamCount * hiddenSize
         _hcNorm.wrappedValue = Qwen4ExpRMSNorm(
             dimensions: streamHiddenSize, groupSize: hiddenSize, eps: rmsNormEps)
@@ -50,7 +57,25 @@ public final class Qwen4ExpGatedResidual: Module {
     ) {
         precondition(hyperInput.ndim == 3)
         precondition(hyperInput.dim(-1) == streamCount * hiddenSize)
-        let normed = hcNorm(hyperInput)
+
+        // P7.1 (`--ablate hyper`): skip the mix (`hc_norm` plus the two
+        // low-rank gating matmuls), keeping only the plain stream-mean
+        // needed for `mixedInput`'s shape and a constant injection-weight
+        // tensor of the right shape. `inject` itself keeps running (see
+        // `Qwen4ExpLayerBenchAblation`). Never numerically correct.
+        if ablation == .hyper {
+            let streams = hyperInput.reshaped(
+                [hyperInput.dim(0), hyperInput.dim(1), streamCount, hiddenSize])
+            let mixed = streams.mean(axis: -2)
+            let injection = MLXArray.ones(
+                [hyperInput.dim(0), hyperInput.dim(1), streamCount], dtype: hyperInput.dtype)
+            return (mixed, hyperInput, injection)
+        }
+
+        // P7.1 (`--ablate norms`): skip hc_norm, reusing its already
+        // shape-correct input for the rest of the mix. Never numerically
+        // correct.
+        let normed = ablation == .norms ? hyperInput : hcNorm(hyperInput)
         var mix = silu(inputMixWeightDown(normed) / Float(streamCount))
         mix = sigmoid(inputMixWeightUp(mix))
             .reshaped([hyperInput.dim(0), hyperInput.dim(1), streamCount, hiddenSize])

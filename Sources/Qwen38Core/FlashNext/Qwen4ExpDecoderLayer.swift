@@ -32,7 +32,11 @@ public final class Qwen4ExpDecoderLayer: Module {
         /// time (unlike F1/F2, which are applied post-load by
         /// `prepareFusion` — F4 changes a runtime behavior flag, not a
         /// loaded weight).
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .none,
+        /// P7.1: which sub-block, if any, this layer's `flash-layer-bench`
+        /// build short-circuits. `.none` everywhere in production — see
+        /// `Qwen4ExpLayerBenchAblation`.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
         self.layerIndex = layerIndex
@@ -41,22 +45,23 @@ public final class Qwen4ExpDecoderLayer: Module {
         if isLinear {
             _linearAttn.wrappedValue = Qwen4ExpGatedDeltaNet(
                 configuration: configuration, rmsNormEps: rmsNormEps,
-                quantization: quantization)
+                quantization: quantization, ablation: ablation)
         } else {
             _selfAttn.wrappedValue = Qwen4ExpQSAAttention(
                 configuration: configuration, rmsNormEps: rmsNormEps,
-                quantization: quantization)
+                quantization: quantization, ablation: ablation)
         }
 
         _mlp.wrappedValue = Qwen4ExpSparseMoE(
             configuration: configuration, quantization: quantization,
-            expertsQuantization: expertsQuantization, fusionLevel: fusionLevel)
+            expertsQuantization: expertsQuantization, fusionLevel: fusionLevel,
+            ablation: ablation)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
-            quantization: quantization, parityPrefix: "attn_")
+            quantization: quantization, parityPrefix: "attn_", ablation: ablation)
         _mlpHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
-            quantization: quantization, parityPrefix: "mlp_")
+            quantization: quantization, parityPrefix: "mlp_", ablation: ablation)
         if let pleLayerIndex {
             _ple.wrappedValue = Qwen4ExpPLELayer(
                 configuration: configuration,

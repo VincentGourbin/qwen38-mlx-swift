@@ -57,17 +57,24 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
     /// `callAsFunction` for why dropping `precise` is safe for routing.
     private let preciseRouterSoftmax: Bool
 
+    /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
+    /// `flash-layer-bench --ablate`. `.none` everywhere in production —
+    /// see `Qwen4ExpLayerBenchAblation`.
+    public let ablation: Qwen4ExpLayerBenchAblation
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         normalizeTopK: Bool = true,
         quantization: Qwen4ExpQuantizationSpec? = nil,
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .none,
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) {
         numExperts = configuration.numExperts
         topK = configuration.numExpertsPerToken
         self.normalizeTopK = normalizeTopK
         self.preciseRouterSoftmax = fusionLevel < .f4MoE
+        self.ablation = ablation
 
         precondition(numExperts > 0)
         precondition(topK > 0 && topK <= numExperts)
@@ -111,6 +118,12 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         precondition(x.ndim >= 2)
+        // P7.1 (`--ablate moe`): skip routing, expert gather and the shared
+        // expert entirely — the branch becomes a no-op residual. Never
+        // numerically correct — see `Qwen4ExpLayerBenchAblation`.
+        if ablation == .moe {
+            return x
+        }
         // F4 (P2-fusion): softmax is a strictly monotonic transform of the
         // gate logits (dividing every exp(logit) by the same positive sum
         // preserves relative order), so the top-`topK` *set* selected by
@@ -132,10 +145,17 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         let flatX = x.reshaped([tokenCount, x.dim(-1)])
         let flatIndices = indices.reshaped([tokenCount, topK])
         let flatScores = scores.reshaped([tokenCount, topK])
-        let routed = weightedExpertSum(
-            switchMLP(flatX, flatIndices), flatScores).reshaped(x.shape)
-
-        let shared = sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        // P7.1 sub-probes: the router above always runs for real in every
+        // case reaching this point (only `.moe` above skips it entirely);
+        // these two zero only the expert computation they name, isolating
+        // its cost by subtraction against `.none`. Never numerically
+        // correct — see `Qwen4ExpLayerBenchAblation`.
+        let routed = (ablation == .moeSwitchMLP || ablation == .moeRouting)
+            ? MLXArray.zeros(x.shape, dtype: x.dtype)
+            : weightedExpertSum(switchMLP(flatX, flatIndices), flatScores).reshaped(x.shape)
+        let shared = (ablation == .moeSharedExpert || ablation == .moeRouting)
+            ? MLXArray.zeros(x.shape, dtype: x.dtype)
+            : sigmoid(sharedExpertGate(x)) * sharedExpert(x)
         let output = routed + shared
         if captureParity {
             lastParityCapture = [

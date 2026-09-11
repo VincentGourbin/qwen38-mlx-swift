@@ -36,11 +36,18 @@ public final class Qwen4ExpQSAAttention: Module {
     /// see the identical comment on `Qwen4ExpGatedDeltaNet.fusedInProj`.
     private var fusedQKV: Linear?
 
+    /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
+    /// `flash-layer-bench --ablate`. `.none` everywhere in production —
+    /// see `Qwen4ExpLayerBenchAblation`.
+    public let ablation: Qwen4ExpLayerBenchAblation
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
-        quantization: Qwen4ExpQuantizationSpec? = nil
+        quantization: Qwen4ExpQuantizationSpec? = nil,
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) {
+        self.ablation = ablation
         self.numAttentionHeads = configuration.numAttentionHeads
         self.numKeyValueHeads = configuration.numKeyValueHeads
         self.headDim = configuration.headDim
@@ -107,12 +114,15 @@ public final class Qwen4ExpQSAAttention: Module {
 
         let qOutput = qRaw.reshaped([batch, sequence, numAttentionHeads, headDim * 2])
         let qParts = qOutput.split(parts: 2, axis: -1)
-        let normalizedQueries = qNorm(qParts[0])
+        // P7.1 (`--ablate norms`): skip q_norm/k_norm, reusing their already
+        // shape-correct input. Never numerically correct — see
+        // `Qwen4ExpLayerBenchAblation`.
+        let normalizedQueries = ablation == .norms ? qParts[0] : qNorm(qParts[0])
         var queries = normalizedQueries.transposed(0, 2, 1, 3)
         let outputGate = qParts[1].reshaped([batch, sequence, numAttentionHeads * headDim])
 
-        let normalizedKeys = kNorm(kRaw.reshaped(
-            [batch, sequence, numKeyValueHeads, headDim]))
+        let kReshaped = kRaw.reshaped([batch, sequence, numKeyValueHeads, headDim])
+        let normalizedKeys = ablation == .norms ? kReshaped : kNorm(kReshaped)
         var keys = normalizedKeys.transposed(0, 2, 1, 3)
         let values = vRaw.reshaped(
             [batch, sequence, numKeyValueHeads, headDim]).transposed(0, 2, 1, 3)
@@ -135,12 +145,18 @@ public final class Qwen4ExpQSAAttention: Module {
 
         // QSA must inspect the pre-update offset, then the regular cache is
         // advanced with the already-rotated K/V tensors.
-        let sparseMask = indexer.makeMask(
-            hiddenStates: hiddenStates,
-            positionIDs: positions,
-            cache: cache,
-            compressRatio: cache?.compressRatio ?? 4,
-            budget: cache?.budget ?? 2_048)
+        // P7.1 (`--ablate qsa-attn`): skip the indexer entirely (`nil`
+        // reproduces its "not yet past the sparse-selection boundary"
+        // return, already handled below by the existing mask branches).
+        // Never numerically correct — see `Qwen4ExpLayerBenchAblation`.
+        let sparseMask = ablation == .qsaAttn
+            ? nil
+            : indexer.makeMask(
+                hiddenStates: hiddenStates,
+                positionIDs: positions,
+                cache: cache,
+                compressRatio: cache?.compressRatio ?? 4,
+                budget: cache?.budget ?? 2_048)
         let cached: (MLXArray, MLXArray)
         if let cache {
             cached = cache.update(keys: keys, values: values)
@@ -175,14 +191,19 @@ public final class Qwen4ExpQSAAttention: Module {
             mask = .none
         }
 
-        let attended = MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: cached.0,
-            values: cached.1,
-            scale: scale,
-            mask: mask)
-            .transposed(0, 2, 1, 3)
-            .reshaped([batch, sequence, numAttentionHeads * headDim])
+        // P7.1 (`--ablate qsa-attn`): skip SDPA, substituting a zeroed
+        // tensor of the exact post-SDPA shape. Never numerically correct —
+        // see `Qwen4ExpLayerBenchAblation`.
+        let attended = ablation == .qsaAttn
+            ? MLXArray.zeros([batch, sequence, numAttentionHeads * headDim], dtype: queries.dtype)
+            : MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cached.0,
+                values: cached.1,
+                scale: scale,
+                mask: mask)
+                .transposed(0, 2, 1, 3)
+                .reshaped([batch, sequence, numAttentionHeads * headDim])
 
         let gatedAttended = attended * sigmoid(outputGate)
         let output = oProj(gatedAttended)

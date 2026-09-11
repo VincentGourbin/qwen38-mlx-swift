@@ -43,11 +43,18 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     /// four-separate-matmuls path (unchanged behavior).
     private var fusedInProj: Linear?
 
+    /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
+    /// `flash-layer-bench --ablate`. `.none` everywhere in production —
+    /// see `Qwen4ExpLayerBenchAblation`.
+    public let ablation: Qwen4ExpLayerBenchAblation
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
-        quantization: Qwen4ExpQuantizationSpec? = nil
+        quantization: Qwen4ExpQuantizationSpec? = nil,
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) {
+        self.ablation = ablation
         hiddenSize = configuration.hiddenSize
         numValueHeads = configuration.linearNumValueHeads
         numKeyHeads = configuration.linearNumKeyHeads
@@ -102,6 +109,29 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         precondition(inputs.ndim == 3)
         let batch = inputs.dim(0)
         let sequence = inputs.dim(1)
+
+        // P7.1 (`--ablate gdn-projections`): skip `in_proj_qkv/z/b/a` and
+        // `conv1d` entirely, feeding zeroed but shape-correct q/k/v/z/a/b
+        // straight into the real recurrence and output norm/projection.
+        // Never numerically correct — a bench-only measurement instrument,
+        // see `Qwen4ExpLayerBenchAblation`.
+        if ablation == .gdnProjections {
+            let qkZero = MLXArray.zeros(
+                [batch, sequence, numKeyHeads, keyHeadDim], dtype: inputs.dtype)
+            let vZero = MLXArray.zeros(
+                [batch, sequence, numValueHeads, valueHeadDim], dtype: inputs.dtype)
+            let gateZero = MLXArray.zeros([batch, sequence, numValueHeads], dtype: inputs.dtype)
+            let (out, state) = gatedDeltaUpdate(
+                q: qkZero, k: qkZero, v: vZero, a: gateZero, b: gateZero,
+                aLog: aLog, dtBias: dtBias, state: cache?[1], mask: mask)
+            if let cache {
+                cache[1] = state
+                cache.advance(sequence)
+            }
+            let normalized = norm(
+                out.reshaped([batch, sequence, numValueHeads, valueHeadDim]), gate: vZero)
+            return outProj(normalized.reshaped([batch, sequence, valueDim]))
+        }
 
         var qkv: MLXArray
         let z: MLXArray
@@ -165,7 +195,17 @@ public final class Qwen4ExpGatedDeltaNet: Module {
 
         let out: MLXArray
         let state: MLXArray
-        if let verificationSink {
+        if ablation == .gdnRecurrence {
+            // P7.1: skip the recurrent delta-rule kernel entirely, reusing
+            // `v` (already the exact output shape) and a zeroed state of the
+            // shape `gatedDeltaUpdate` would have produced/consumed
+            // ([B, Hv, Dv, Dk], fp32). Never numerically correct — see
+            // `Qwen4ExpLayerBenchAblation`.
+            out = v
+            state = cache?[1]
+                ?? MLXArray.zeros(
+                    [batch, numValueHeads, valueHeadDim, keyHeadDim], dtype: .float32)
+        } else if let verificationSink {
             // PM4.1: keep every per-token state so a rejection can roll this
             // cache back to any prefix of the T new tokens without a replay
             // forward. `states[:, T-1]` is exactly the final state
@@ -203,7 +243,12 @@ public final class Qwen4ExpGatedDeltaNet: Module {
             cache.advance(sequence)
         }
 
-        let normalized = norm(out.reshaped([batch, sequence, numValueHeads, valueHeadDim]), gate: z)
+        // P7.1 (`--ablate norms`): skip the gated RMSNorm, reusing its
+        // already shape-correct input. Never numerically correct — see
+        // `Qwen4ExpLayerBenchAblation`.
+        let normalized = ablation == .norms
+            ? out.reshaped([batch, sequence, numValueHeads, valueHeadDim]).asType(inputs.dtype)
+            : norm(out.reshaped([batch, sequence, numValueHeads, valueHeadDim]), gate: z)
         let projected = outProj(normalized.reshaped([batch, sequence, valueDim]))
         if captureParity {
             lastParityCapture["norm_output"] = normalized
