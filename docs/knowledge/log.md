@@ -4047,3 +4047,33 @@ drafter qui voit enfin la même arithmétique que la cible.
 en héritent**. Les probes CLI passaient explicitement `0` : leur défaut est
 passé à `7` pour que les mesures reflètent la production. `--fusion-level 0`
 reste le moyen de comparer.
+
+## 2026-09-11 (nuit) — Drafter MTP câblé sur F7, et conséquence inattendue : le MTP ne sert plus à rien
+
+`Qwen4ExpMTPPredictor` construisait sa couche `Qwen4ExpDecoderLayer` **sans**
+niveau de fusion (défaut `.none`) : le drafter subissait donc la fuite fp32
+que F7 corrige sur la cible, et travaillait dans une arithmétique différente
+d'elle. Corrigé : `fusionLevel` traverse `Qwen4ExpMTPPredictor.init` et
+`Qwen4ExpMTPLoader.load`, défaut `.f7GatedBranchDtype` comme partout ailleurs.
+
+**Effet mesuré : nul, et c'est explicable.** Le drafter est **une** couche
+appelée une fois par round ; sur 20 rounds, F7 lui fait gagner ~70 ms sur
+2 300, soit 3 %, dans le bruit. L'acceptation reste identique (11/20, 55,0 %)
+— cohérent avec le reste : F7 change la vitesse, pas la numérique.
+
+**En revanche, le rapport greedy/MTP s'est inversé** (checkpoint 3-bit,
+32 tokens, Release, résident) :
+
+| | avant F7 | après F7 |
+|---|---|---|
+| greedy | 5,24 s | **2,40-2,43 s** |
+| MTP bloc 2 | 2,28 s (×2,3 sur le greedy) | 2,28-2,38 s (**×1,03**) |
+| MTP bloc 3 | — | 3,55 s (plus lent que le greedy) |
+
+Le MTP gagnait 2,3× parce que le forward de la cible coûtait 5 ms ; à 2,4 ms
+son surcoût (drafting + vérification + rollback à 45 % de rejet) annule le
+gain. **Le MTP n'a plus d'intérêt sur ce chemin** tant que l'acceptation
+reste à 55 %. Il demeure opt-in et désactivé par défaut (contrat PM4.3
+inchangé) ; rien à retirer, mais plus rien à en attendre non plus. Le
+chantier P-MTP est donc clos par la disparition de son objet, pas par un
+échec.

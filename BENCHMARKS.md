@@ -76,7 +76,7 @@ Validation du branchement (serveur, `qwen38 serve --model-path
 second tour MTP répond correctement à partir du premier (`cacheReused:
 true`, `mtp: "actif"`), sans rejeu du préfixe.
 
-| 2026-09-11 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP (n-gram sur SSD interne) | **3-bit g64 + F7** | 84 Go | 62,7 s | **12,9 tok/s greedy · 13,6 tok/s MTP** (55 % d'acceptation) | 57,4 Go | 10/28 · −4,80 | F7 = retour au dtype d'entrée en sortie de RMSNorm/RMSNormGated, conforme à la référence Python ; IDs bit-identiques à F0 ; préfill réel 77,6 tok/s (n-gram local) |
+| 2026-09-11 | local/Qwen3.8-Flash-Next-MLX-e3bit-MTP (n-gram sur SSD interne) | **3-bit g64 + F7** | 84 Go | 62,7 s | **12,9 tok/s greedy · 13,1-13,6 tok/s MTP** (55 % d'acceptation) | 57,4 Go | 10/28 · −4,80 | F7 = retour au dtype d'entrée en sortie de RMSNorm/RMSNormGated, conforme à la référence Python ; IDs bit-identiques à F0 ; préfill réel 77,6 tok/s (n-gram local). Le MTP ne gagne plus que ~3 % sur le greedy (×2,3 avant F7) : son surcoût annule le bénéfice à 55 % d'acceptation |
 
 Bench synthétique d'une couche (`flash-layer-bench`, Release, poids aléatoires,
 sans checkpoint) : GDN+MoE 5,5 ms/pas, QSA+MoE 5,8 ms/pas en eager ; 4,5 ms

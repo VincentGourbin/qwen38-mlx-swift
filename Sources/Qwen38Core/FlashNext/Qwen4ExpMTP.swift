@@ -24,7 +24,8 @@ public final class Qwen4ExpMTPPredictor: Module {
     public init(
         configuration: Qwen4ExpTextConfiguration,
         quantization: Qwen4ExpQuantizationSpec? = nil,
-        expertsQuantization: Qwen4ExpQuantizationSpec? = nil
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
     ) {
         self.configuration = configuration
         guard let fullAttentionLayerIndex = configuration.layerTypes.firstIndex(
@@ -55,7 +56,8 @@ public final class Qwen4ExpMTPPredictor: Module {
             layerIndex: fullAttentionLayerIndex,
             pleLayerIndex: nil,
             quantization: quantization,
-            expertsQuantization: expertsQuantization)]
+            expertsQuantization: expertsQuantization,
+            fusionLevel: fusionLevel)]
         _hyperConnectionMixer.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration,
             useCombine: false,
@@ -177,7 +179,8 @@ public enum Qwen4ExpMTPLoader {
         from directory: URL,
         materialize: Bool = true,
         useCheckpointQuantization: Bool = true,
-        uncachedIO: Bool = true
+        uncachedIO: Bool = true,
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
     ) throws -> Qwen4ExpLoadedMTPPredictor {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
@@ -241,10 +244,15 @@ public enum Qwen4ExpMTPLoader {
         weights = normCorrection.weights
         let quantization = Qwen4ExpQuantizationSpec(configuration.quantization)
         let expertsQuantization = Qwen4ExpQuantizationSpec.experts(from: configuration.quantization)
+        // 2026-09-11 : le drafter est une couche Flash complète ; sans le
+        // niveau de fusion il subissait la fuite fp32 corrigée par F7 (couche
+        // ~4 ms au lieu de ~1 ms) ET travaillait dans une arithmétique
+        // différente de la cible, ce qui pénalisait l'acceptation.
         let model = Qwen4ExpMTPPredictor(
             configuration: configuration.textConfiguration,
             quantization: useCheckpointQuantization ? quantization : nil,
-            expertsQuantization: useCheckpointQuantization ? expertsQuantization : nil)
+            expertsQuantization: useCheckpointQuantization ? expertsQuantization : nil,
+            fusionLevel: fusionLevel)
         try update(model: model, weights: weights)
 
         let bytes: Int64
