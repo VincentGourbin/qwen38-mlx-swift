@@ -36,7 +36,10 @@ public final class Qwen4ExpDecoderLayer: Module {
         /// P7.1: which sub-block, if any, this layer's `flash-layer-bench`
         /// build short-circuits. `.none` everywhere in production — see
         /// `Qwen4ExpLayerBenchAblation`.
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        /// P8.1: non-nil only under `flash-layer-bench --moe-stages` —
+        /// see `Qwen4ExpMoEStageProfiler`.
+        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil
     ) {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
         self.layerIndex = layerIndex
@@ -45,17 +48,17 @@ public final class Qwen4ExpDecoderLayer: Module {
         if isLinear {
             _linearAttn.wrappedValue = Qwen4ExpGatedDeltaNet(
                 configuration: configuration, rmsNormEps: rmsNormEps,
-                quantization: quantization, ablation: ablation)
+                quantization: quantization, ablation: ablation, fusionLevel: fusionLevel)
         } else {
             _selfAttn.wrappedValue = Qwen4ExpQSAAttention(
                 configuration: configuration, rmsNormEps: rmsNormEps,
-                quantization: quantization, ablation: ablation)
+                quantization: quantization, ablation: ablation, fusionLevel: fusionLevel)
         }
 
         _mlp.wrappedValue = Qwen4ExpSparseMoE(
             configuration: configuration, quantization: quantization,
             expertsQuantization: expertsQuantization, fusionLevel: fusionLevel,
-            ablation: ablation)
+            ablation: ablation, moeStageProfiler: moeStageProfiler)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
             quantization: quantization, parityPrefix: "attn_", ablation: ablation)

@@ -23,6 +23,21 @@ public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     case f4MoE = 4
     case f5Casts = 5
     case f6Compile = 6
+    /// F7 (P8.2, 2026-09-11 — unrelated to the retired P7.4 gate/up fusion
+    /// that once held this number): restores the checkpoint's intended
+    /// working dtype (bf16) at two points where it was silently promoted to
+    /// float32 and never rounded back down — `Qwen4ExpGatedDeltaNet`'s
+    /// recurrence output before `Qwen4ExpRMSNormGated` (whose own
+    /// `.asType(inputs.dtype)` rounds to *whatever it is handed*, which was
+    /// the recurrence's raw fp32 output, not the network's bf16), and
+    /// `Qwen4ExpQSAAttention`'s query/key after `Qwen4ExpMRoPE.apply` (whose
+    /// float32 `cos`/`sin` tables promote the RoPE output to fp32 with no
+    /// downcast). Both leaks make every downstream op — including the
+    /// entire MoE branch — run its fp32 path, ~12-27× slower per
+    /// `op-overhead-probe`'s `SwitchGLU` measurements (docs/knowledge/log.md,
+    /// "P8 : ..."). `false` (`.none` through `.f6Compile`) is the original,
+    /// leaking behavior.
+    case f7GatedBranchDtype = 7
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 

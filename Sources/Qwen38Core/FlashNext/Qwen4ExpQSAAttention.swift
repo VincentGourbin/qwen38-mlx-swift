@@ -41,13 +41,20 @@ public final class Qwen4ExpQSAAttention: Module {
     /// see `Qwen4ExpLayerBenchAblation`.
     public let ablation: Qwen4ExpLayerBenchAblation
 
+    /// P8.2 (F7): whether query/key are rounded back to the network's
+    /// working dtype after `Qwen4ExpMRoPE.apply` — see
+    /// `Qwen4ExpFusionLevel.f7GatedBranchDtype`.
+    private let fusionLevel: Qwen4ExpFusionLevel
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
         quantization: Qwen4ExpQuantizationSpec? = nil,
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) {
         self.ablation = ablation
+        self.fusionLevel = fusionLevel
         self.numAttentionHeads = configuration.numAttentionHeads
         self.numKeyValueHeads = configuration.numKeyValueHeads
         self.headDim = configuration.headDim
@@ -129,6 +136,19 @@ public final class Qwen4ExpQSAAttention: Module {
 
         queries = rotaryEmbedding.apply(queries, positionIDs: positions)
         keys = rotaryEmbedding.apply(keys, positionIDs: positions)
+        // P8.2 (F7): `Qwen4ExpMRoPE.apply` mixes `queries`/`keys` (the
+        // network's working dtype) with `cos`/`sin` tables deliberately kept
+        // in fp32 for RoPE precision (piège #6) — MLX's type promotion then
+        // makes `apply`'s result fp32, with no downcast back. Below
+        // `f7GatedBranchDtype` that fp32 tensor flows straight into SDPA and
+        // everything after it (including the whole MoE branch), which then
+        // runs its (much slower) fp32 path. Rounding here restores the
+        // network's bf16 working dtype at the RoPE boundary, same as F7 does
+        // for `Qwen4ExpGatedDeltaNet`'s recurrence output.
+        if fusionLevel >= .f7GatedBranchDtype {
+            queries = queries.asType(hiddenStates.dtype)
+            keys = keys.asType(hiddenStates.dtype)
+        }
 
         if captureParity {
             lastParityCapture = [

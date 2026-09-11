@@ -1655,6 +1655,48 @@ func qwen4ExpQSAAttentionAssembly() {
     #expect(!isNaN(output).any().item(Bool.self))
 }
 
+/// P8.2 (F7, docs/knowledge/log.md "P8 : ..."): `Qwen4ExpMRoPE.apply` mixes
+/// query/key with `cos`/`sin` tables deliberately kept in fp32 (piège #6),
+/// promoting its result to fp32 with no downcast back — silently promoting
+/// the whole QSA branch (and everything downstream, including MoE) to
+/// fp32. This pins both the still-reachable leak and F7's fix.
+@Test("P8.2 (F7) : la branche QSA ne fuit plus en float32 sans F7 actif")
+func qwen4ExpQSABranchDtypeLeaksWithoutF7AndIsFixedByF7() {
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 1,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [2], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+    let quantization = Qwen4ExpQuantizationSpec(groupSize: 8, bits: 4)
+    let leaking = Qwen4ExpQSAAttention(configuration: configuration, quantization: quantization)
+    let fixed = Qwen4ExpQSAAttention(
+        configuration: configuration, quantization: quantization,
+        fusionLevel: .f7GatedBranchDtype)
+    let hidden = MLXArray.ones([1, 5, 8], dtype: .bfloat16)
+    let leakingOutput = leaking(
+        hidden, positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 5))
+    let fixedOutput = fixed(
+        hidden, positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 5))
+    eval(leakingOutput, fixedOutput)
+    #expect(leakingOutput.dtype == .float32)
+    #expect(fixedOutput.dtype == .bfloat16)
+}
+
 @Test("Le masque QSA conserve l'axe batch en préremplissage")
 func qwen4ExpQSAMaskKeepsBatchAxis() {
     let query = MLXArray.ones([2, 4, 12, 8], dtype: .float16)
@@ -1697,6 +1739,54 @@ func qwen4ExpGDNCarriesStateAcrossCalls() {
     #expect(second.shape == [1, 2, 8])
     #expect(cache.state.count == 2)
     #expect(cache[1]!.dtype == .float32)
+}
+
+/// P8.2 (F7, docs/knowledge/log.md "P8 : ..."): the recurrence kernel's
+/// output is fp32 (`cache[1]!.dtype == .float32` above, by design — piège
+/// #6), and `Qwen4ExpGatedDeltaNet.callAsFunction` used to hand that fp32
+/// tensor straight to `Qwen4ExpRMSNormGated`, whose own final
+/// `.asType(inputs.dtype)` then rounded to fp32 (a no-op) instead of the
+/// network's bf16 working dtype — silently promoting the entire branch
+/// (and everything downstream, including the whole MoE block) to fp32,
+/// ~12-27× slower per `op-overhead-probe`. This pins both the bug's
+/// still-reachable default behavior and F7's fix.
+@Test("P8.2 (F7) : la branche GDN ne fuit plus en float32 sans F7 actif")
+func qwen4ExpGDNBranchDtypeLeaksWithoutF7AndIsFixedByF7() {
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 1,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [2], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+    // A plain (unquantized) `Linear`'s weight defaults to float32, which
+    // would make `outProj`'s output float32 regardless of this fix — an
+    // explicit quantization spec (bf16 scales, like the real checkpoint)
+    // is needed so the two cases below actually differ only by the fix.
+    let quantization = Qwen4ExpQuantizationSpec(groupSize: 8, bits: 4)
+    let leaking = Qwen4ExpGatedDeltaNet(configuration: configuration, quantization: quantization)
+    let fixed = Qwen4ExpGatedDeltaNet(
+        configuration: configuration, quantization: quantization,
+        fusionLevel: .f7GatedBranchDtype)
+    let input = MLXArray.ones([1, 3, 8], dtype: .bfloat16)
+    let leakingOutput = leaking(input, cache: MambaCache())
+    let fixedOutput = fixed(input, cache: MambaCache())
+    eval(leakingOutput, fixedOutput)
+    #expect(leakingOutput.dtype == .float32)
+    #expect(fixedOutput.dtype == .bfloat16)
 }
 
 @Test("Les hyper-connections Flash-Next mélangent quatre flux")
@@ -2079,7 +2169,13 @@ func flashTeacherForcedRegressionGuardV32() throws {
         248_068, 271, 248_069, 271,
     ]
     let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
-    let model = try Qwen4ExpStreamingTextModel(directory: directory)
+    // P8.2: lets a session re-run this guard under F7 (or any other
+    // fusion level) against the real checkpoint without touching the
+    // production default (`.none`) — `QWEN38_FUSION_LEVEL=7`, same pattern
+    // as `QWEN38_QB_MIN_LOGPROB` below.
+    let fusionLevel = ProcessInfo.processInfo.environment["QWEN38_FUSION_LEVEL"]
+        .flatMap(Int.init).flatMap(Qwen4ExpFusionLevel.init(rawValue:)) ?? .none
+    let model = try Qwen4ExpStreamingTextModel(directory: directory, fusionLevel: fusionLevel)
     let score = try model.scoreTeacherForced(
         promptTokenIDs: [sequence[0]],
         continuationTokenIDs: Array(sequence.dropFirst()))

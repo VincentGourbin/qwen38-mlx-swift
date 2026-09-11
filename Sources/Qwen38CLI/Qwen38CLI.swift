@@ -552,6 +552,13 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     )
     var cachedIO = false
 
+    @Option(
+        name: .long,
+        help:
+            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA) — s'applique aussi au chemin --mtp"
+    )
+    var fusionLevel: Int = 0
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -567,6 +574,9 @@ struct FlashGenerateProbe: AsyncParsableCommand {
         }
         guard residentAsyncInterval > 0 else {
             throw ValidationError("--resident-async-interval doit être positif")
+        }
+        guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
+            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
         }
         if mtp && image != nil {
             throw ValidationError(
@@ -672,7 +682,8 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             profileLayers: profileLayers,
             residentAsyncEval: residentAsync,
             residentAsyncInterval: residentAsyncInterval,
-            uncachedIO: !cachedIO)
+            uncachedIO: !cachedIO,
+            fusionLevel: resolvedFusionLevel)
         profiler.end("Flash globals")
         let generator = Qwen4ExpGreedyGenerator(model: model)
         let stopTokens: Set<Int32> = [
@@ -863,7 +874,7 @@ struct FlashLayerBench: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F6 appliqué à la couche après chargement (0 = chemin d'origine, défaut)"
+            "P2-fusion : niveau cumulatif F1-F7 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
     )
     var fusionLevel: Int = 0
 
@@ -902,6 +913,13 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var compiledStep = false
 
+    @Flag(
+        name: .long,
+        help:
+            "P8.1 : chronomètre séparément chaque sous-étage de Qwen4ExpSparseMoE.callAsFunction (gate, softmax, argPartition, takeAlong+normalize, switchMLP, weightedExpertSum, sharedExpertGate, sharedExpert, shared-combine, add), avec un eval() forcé après chaque étage — instrument de diagnostic uniquement, jamais en production ; incompatible avec --ablate/--check-parity/--step-layers"
+    )
+    var moeStages = false
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -923,7 +941,7 @@ struct FlashLayerBench: AsyncParsableCommand {
             }
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
+            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
         }
         if checkParity && resolvedFusionLevel == .none && stepLayers == 0 {
             throw ValidationError("--check-parity exige --fusion-level 1-6 (comparaison à .none)")
@@ -941,6 +959,15 @@ struct FlashLayerBench: AsyncParsableCommand {
         }
         if checkParity && resolvedAblation != .none {
             throw ValidationError("--check-parity et --ablate sont incompatibles")
+        }
+        if moeStages && resolvedAblation != .none {
+            throw ValidationError("--moe-stages et --ablate sont incompatibles")
+        }
+        if moeStages && checkParity {
+            throw ValidationError("--moe-stages et --check-parity sont incompatibles")
+        }
+        if moeStages && stepLayers > 0 {
+            throw ValidationError("--moe-stages et --step-layers sont incompatibles")
         }
         let expertsQuantization: Qwen4ExpQuantizationSpec? =
             (expertBits != nil || expertGroupSize != nil)
@@ -1081,8 +1108,30 @@ struct FlashLayerBench: AsyncParsableCommand {
         if resolvedAblation != .none {
             print("ablation P7.1 : \(resolvedAblation.rawValue)")
         }
+        // P8.1: independent baseline for the cost of a bare `eval()` sync
+        // barrier on an already-evaluated array (no new compute), measured
+        // the same way as `op-overhead-probe` — a dependent chain of
+        // `reps` calls, warmed up first. `--moe-stages` forces one such
+        // barrier after every sub-stage it times, so this baseline is what
+        // the printed stage sum over-counts by, once per extra barrier
+        // beyond the single `eval` the undisturbed layer already pays.
+        var moeStagesSyncBaselineSeconds: Double?
+        if moeStages {
+            let dummy = MLXArray.zeros([1, 1, 2560], dtype: .bfloat16)
+            eval(dummy)
+            for _ in 0..<20 { eval(dummy) }
+            let reps = 2000
+            let start = ContinuousClock.now
+            for _ in 0..<reps { eval(dummy) }
+            let perCall = durationSeconds(ContinuousClock.now - start) / Double(reps)
+            moeStagesSyncBaselineSeconds = perCall
+            print(
+                "P8.1 : coût d'un eval() sans nouveau calcul (baseline synchro) : "
+                    + "\(String(format: "%.4f", perCall * 1000)) ms/appel (\(reps) appels)")
+        }
         for kind in kinds {
             print("--- couche \(kind.rawValue) ---")
+            let moeStageProfiler = moeStages ? Qwen4ExpMoEStageProfiler() : nil
             let result = Qwen4ExpLayerBench.run(
                 kind: kind,
                 warmupSteps: warmup,
@@ -1093,7 +1142,35 @@ struct FlashLayerBench: AsyncParsableCommand {
                     compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval,
                     skipTrivialCausalMask: skipTrivialMask),
                 fusionLevel: resolvedFusionLevel,
-                ablation: resolvedAblation)
+                ablation: resolvedAblation,
+                moeStageProfiler: moeStageProfiler)
+            if let moeStageProfiler, moeStageProfiler.callCount > 0 {
+                let count = Double(moeStageProfiler.callCount)
+                var sumMs = 0.0
+                print("P8.1 : étage · ms/pas · % du total étages")
+                let stageTotalMsAll = moeStageProfiler.stageOrder.map {
+                    moeStageProfiler.totalSeconds[$0]! / count * 1000
+                }.reduce(0, +)
+                for label in moeStageProfiler.stageOrder {
+                    let ms = moeStageProfiler.totalSeconds[label]! / count * 1000
+                    sumMs += ms
+                    let pct = stageTotalMsAll > 0 ? ms / stageTotalMsAll * 100 : 0
+                    print(
+                        "  \(label.padding(toLength: 22, withPad: " ", startingAt: 0)) "
+                            + "\(String(format: "%7.4f", ms)) ms  \(String(format: "%5.1f", pct)) %")
+                }
+                print("  \("somme des étages".padding(toLength: 22, withPad: " ", startingAt: 0)) \(String(format: "%7.4f", sumMs)) ms")
+                if let moeStagesSyncBaselineSeconds {
+                    let stageCount = Double(moeStageProfiler.stageOrder.count)
+                    let syncOverheadMs = moeStagesSyncBaselineSeconds * stageCount * 1000
+                    let correctedMs = sumMs - syncOverheadMs
+                    print(
+                        "  synchros forcées : \(Int(stageCount)) × "
+                            + "\(String(format: "%.4f", moeStagesSyncBaselineSeconds * 1000)) ms "
+                            + "≈ \(String(format: "%.4f", syncOverheadMs)) ms incluses ci-dessus")
+                    print("  somme corrigée (hors synchros) ≈ \(String(format: "%.4f", correctedMs)) ms")
+                }
+            }
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)
@@ -1206,7 +1283,7 @@ struct FlashChatProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F6 appliqué à chaque couche (0 = chemin d'origine, défaut)"
+            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
     )
     var fusionLevel: Int = 0
 
@@ -1221,7 +1298,7 @@ struct FlashChatProbe: AsyncParsableCommand {
             throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
+            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
         }
         let samplingPreset: Qwen4ExpSamplingPreset
         if temperature != nil || topP != nil || topK != nil {
@@ -2128,6 +2205,91 @@ struct OpOverheadProbe: AsyncParsableCommand {
         let w = MLXArray.ones([dim, dim], dtype: .bfloat16); eval(w)
         measure("matmul [1,2560]×[2560,2560]") { $0.reshaped([1, dim]).matmul(w).reshaped([1, 1, dim]) }
         seed = MLXArray.ones([1, 1, dim], dtype: .bfloat16); eval(seed)
+        // P8.2 : `SwitchGLU`/`Qwen4ExpSparseMoE` appellent deux fermetures
+        // `MLX.compile(shapeless: true)` globales par pas (`compiledSiluProduct`
+        // dans SwitchGLU, `weightedExpertSum` dans Qwen4ExpSparseMoE) — hypothèse
+        // à trancher : le simple appel d'une fermeture compilée coûte-t-il plus
+        // cher, en Swift, que l'op équivalente non compilée, même sans eval
+        // intermédiaire (chaîne dépendante, un seul eval final, comme ci-dessus) ?
+        measure("silu(x)*x (non compilé)") { MLXNN.silu($0) * $0 }
+        measure("compiledSiluProduct(x,x)") { compiledSiluProduct($0, $0) }
+        let expertWeights = MLXArray.ones([1, 10], dtype: .bfloat16); eval(expertWeights)
+        measure("(x*w).sum(axis:-2) (non compilé)") { y in
+            let expanded = MLX.broadcast(y.reshaped([1, 1, dim]), to: [1, 10, dim])
+            let reduced = (expanded * MLX.expandedDimensions(expertWeights, axis: -1))
+                .sum(axis: -2)
+            return reduced.reshaped([1, 1, dim])
+        }
+        measure("weightedExpertSum [1,10,2560] (compilé)") { y in
+            let expanded = MLX.broadcast(y.reshaped([1, 1, dim]), to: [1, 10, dim])
+            let reduced = weightedExpertSum(expanded, expertWeights)
+            return reduced.reshaped([1, 1, dim])
+        }
+        // P8.2 : le seul chiffre gather_qmm de la revue P7 vient de Python
+        // (0,035 ms) — jamais mesuré côté Swift. `SwitchGLU` réel (512
+        // experts, 640 intermédiaire, top-10, 4 bits g32 — mêmes
+        // dimensions que le bench) chronométré seul, hors
+        // `Qwen4ExpSparseMoE`/`Qwen4ExpDecoderLayer`.
+        let switchGLU = SwitchGLU(
+            inputDims: dim, hiddenDims: 640, numExperts: 512,
+            quantization: (groupSize: 32, bits: 4, mode: .affine))
+        eval(switchGLU.parameters().flattened().map { $0.1 })
+        let expertIndices = MLXArray((0 ..< 10).map { UInt32($0) }, [1, 10])
+        eval(expertIndices)
+        // P8.2 (suite 2) : les indices ci-dessus sont séquentiels [0..9] —
+        // un vrai routeur MoE sélectionne 10 experts arbitraires sur 512
+        // (accès mémoire dispersé, pas contigu). Rejoue le même test avec
+        // des indices aléatoires pour trancher si le coût vient du gather
+        // dispersé plutôt que du calcul.
+        let scatteredIndices = MLXArray(
+            (0 ..< 10).map { i -> UInt32 in UInt32((i * 97 + 53) % 512) }, [1, 10])
+        eval(scatteredIndices)
+        measure("SwitchGLU(x,10 idx sur 512) réel") { y in
+            let flatX = y.reshaped([1, dim])
+            let out = switchGLU(flatX, expertIndices)
+            return out.mean(axis: -2).reshaped([1, 1, dim])
+        }
+        measure("SwitchGLU(x,10 idx dispersés)") { y in
+            let flatX = y.reshaped([1, dim])
+            let out = switchGLU(flatX, scatteredIndices)
+            return out.mean(axis: -2).reshaped([1, 1, dim])
+        }
+        // P8.2 (suite) : le nombre ci-dessus amortit le coût de synchro sur
+        // 200 appels (un seul eval final, comme les autres lignes de cette
+        // commande). Isolé (un eval par appel, comme le forcerait
+        // `--moe-stages` mais sans le reste de la couche autour), le même
+        // appel devient :
+        func measureEvalPerCall(_ label: String, _ indices: MLXArray) {
+            for _ in 0 ..< 3 {
+                let flatX = seed.reshaped([1, dim])
+                eval(switchGLU(flatX, indices))
+            }
+            let start = Date()
+            for _ in 0 ..< reps {
+                let flatX = seed.reshaped([1, dim])
+                eval(switchGLU(flatX, indices))
+            }
+            let us = Date().timeIntervalSince(start) * 1e6 / Double(reps)
+            print("\(label.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%8.2f", us)) µs/appel")
+        }
+        measureEvalPerCall("SwitchGLU seul, eval/appel, idx [0..9]", expertIndices)
+        measureEvalPerCall("SwitchGLU seul, eval/appel, idx dispersés", scatteredIndices)
+        // P8.2 (suite 3) : `flash-layer-bench` construit `hidden` en
+        // `.float16` (`MLXRandom.uniform(..., dtype: .float16)`), pas
+        // `.bfloat16` comme les tests ci-dessus — hypothèse : SwitchGLU/
+        // gatherQuantizedMM n'a pas de chemin rapide pour fp16 en entrée.
+        do {
+            let seedF16 = MLXArray.ones([1, 1, dim], dtype: .float16)
+            eval(seedF16)
+            func measureF16(_ label: String, _ indices: MLXArray) {
+                for _ in 0 ..< 3 { eval(switchGLU(seedF16.reshaped([1, dim]), indices)) }
+                let start = Date()
+                for _ in 0 ..< reps { eval(switchGLU(seedF16.reshaped([1, dim]), indices)) }
+                let us = Date().timeIntervalSince(start) * 1e6 / Double(reps)
+                print("\(label.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%8.2f", us)) µs/appel")
+            }
+            measureF16("SwitchGLU fp16 en entrée, eval/appel", expertIndices)
+        }
         print("référence Python MLX 0.31.1 sur la même machine : 4,2 µs/op (addition élémentaire)")
     }
 }

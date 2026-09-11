@@ -48,13 +48,20 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     /// see `Qwen4ExpLayerBenchAblation`.
     public let ablation: Qwen4ExpLayerBenchAblation
 
+    /// P8.2 (F7): whether the recurrence output is rounded to the network's
+    /// working dtype before `Qwen4ExpRMSNormGated` — see
+    /// `Qwen4ExpFusionLevel.f7GatedBranchDtype`.
+    private let fusionLevel: Qwen4ExpFusionLevel
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
         quantization: Qwen4ExpQuantizationSpec? = nil,
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        fusionLevel: Qwen4ExpFusionLevel = .none
     ) {
         self.ablation = ablation
+        self.fusionLevel = fusionLevel
         hiddenSize = configuration.hiddenSize
         numValueHeads = configuration.linearNumValueHeads
         numKeyHeads = configuration.linearNumKeyHeads
@@ -246,9 +253,29 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         // P7.1 (`--ablate norms`): skip the gated RMSNorm, reusing its
         // already shape-correct input. Never numerically correct — see
         // `Qwen4ExpLayerBenchAblation`.
-        let normalized = ablation == .norms
-            ? out.reshaped([batch, sequence, numValueHeads, valueHeadDim]).asType(inputs.dtype)
-            : norm(out.reshaped([batch, sequence, numValueHeads, valueHeadDim]), gate: z)
+        // P8.2 (F7): `out` is the recurrence's raw output — kept in fp32 for
+        // the recurrent state's own precision (piège #6). `norm` (see
+        // `Qwen4ExpRMSNormGated.callAsFunction`) already normalizes and
+        // gates entirely in fp32 for precision, and documents "round once
+        // at the branch boundary" as its intended final step — but its own
+        // `.asType(inputs.dtype)` rounds to *its local `inputs`'* dtype,
+        // which is this fp32 `out`, not the network's bf16 working dtype:
+        // that "round" is therefore a no-op, and the fp32 leaks into every
+        // op downstream, including the whole MoE branch, which then runs
+        // its (much slower) fp32 path. Below `f7GatedBranchDtype`, add the
+        // missing round to bf16 right here, at the true branch boundary —
+        // *after* `norm`'s fp32 reduction/gating, not before (rounding
+        // `out` to bf16 before normalizing would instead throw away
+        // precision `norm`'s own fp32 upcast is meant to preserve).
+        let normalized: MLXArray
+        if ablation == .norms {
+            normalized = out.reshaped([batch, sequence, numValueHeads, valueHeadDim])
+                .asType(inputs.dtype)
+        } else {
+            let gatedNorm = norm(out.reshaped([batch, sequence, numValueHeads, valueHeadDim]), gate: z)
+            normalized = fusionLevel >= .f7GatedBranchDtype
+                ? gatedNorm.asType(inputs.dtype) : gatedNorm
+        }
         let projected = outProj(normalized.reshaped([batch, sequence, valueDim]))
         if captureParity {
             lastParityCapture["norm_output"] = normalized

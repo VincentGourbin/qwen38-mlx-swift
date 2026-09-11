@@ -334,7 +334,11 @@ public enum Qwen4ExpLayerBench {
         /// layer with a shape-correct placeholder, so its cost can be
         /// attributed by subtraction against a `.none` run. Never
         /// numerically correct — see `Qwen4ExpLayerBenchAblation`.
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        /// P8.1 (`--moe-stages`): non-nil forces `Qwen4ExpSparseMoE` onto
+        /// its instrumented, per-stage-synchronized path — see
+        /// `Qwen4ExpMoEStageProfiler`.
+        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil
     ) -> Qwen4ExpLayerBenchResult {
         precondition(warmupSteps >= 0, "--warmup doit être positif ou nul")
         precondition(measuredSteps > 0, "--steps doit être positif")
@@ -359,7 +363,8 @@ public enum Qwen4ExpLayerBench {
             quantization: quantization,
             expertsQuantization: expertsQuantization,
             fusionLevel: fusionLevel,
-            ablation: ablation)
+            ablation: ablation,
+            moeStageProfiler: moeStageProfiler)
         let weightArrays = layer.parameters().flattened().map { $0.1 }
         eval(weightArrays)
         let materializedBytes = weightArrays.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
@@ -413,9 +418,24 @@ public enum Qwen4ExpLayerBench {
         // Builds one step's graph without evaluating it, so both the
         // per-step (`decodeOneStep`) and the grouped `asyncEval` (P2-code
         // (d)) paths share exactly the same forward.
+        //
+        // P8.2: `hidden` was `.float16` here from P0's original commit
+        // (2026-09-07) until this task, while every real checkpoint tensor
+        // — scales, biases, and therefore every dequantized activation
+        // `SwitchGLU`/`gatherQuantizedMM` actually see in production — is
+        // `.bfloat16` (verified on the real checkpoint's safetensors
+        // header: BF16 scales/biases, U32-packed weights, no float16
+        // anywhere). `op-overhead-probe` shows `SwitchGLU` called in
+        // isolation costs ~150-350 µs/call with a `.bfloat16` input but
+        // ~4.0 ms/call — a ~12-27× jump matching the "factor 25" this bench
+        // reported — with the exact same call given a `.float16` input
+        // instead: this dtype mismatch, not any defect in
+        // `Qwen4ExpSparseMoE`/`SwitchGLU`, was the dominant cause of the
+        // inflated MoE cost this bench measured (see docs/knowledge/log.md,
+        // "P8 : ..."). Matching the real checkpoint's dtype here.
         func buildStep() -> MLXArray {
             let hidden = MLXRandom.uniform(
-                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .bfloat16)
             if kind == .gdn {
                 if let compiledGDNForward {
                     return compiledGDNForward(hidden)
@@ -641,7 +661,7 @@ extension Qwen4ExpLayerBench {
 
         func buildStep() -> MLXArray {
             let hidden = MLXRandom.uniform(
-                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .bfloat16)
             var args = [hidden]
             if kind == .qsa {
                 for cache in caches {
@@ -746,6 +766,20 @@ extension Qwen4ExpLayerBench {
         let compiledLayers = makeLayers()
         applyWeights(compiledLayers)
 
+        // P8.2: unlike `run`/`runMultiLayerStep`'s `hidden` (fixed to
+        // `.bfloat16` to match the real checkpoint's activation dtype for
+        // *performance* measurement), this harness compares two PATHS at
+        // the SAME dtype to check they behave alike -- `.bfloat16` here
+        // instead reintroduces the regression this task fixed: bf16's
+        // coarser mantissa (7 bits vs float16's 10) puts F1/F2's tiny,
+        // provably-exact summation-order noise close enough to the
+        // recurrent GDN/QSA system's chaotic-amplification threshold
+        // (same phenomenon as P7.3's compile-vs-eager divergence) that it
+        // blows up over 32 steps on random, untrained weights -- a property
+        // of this synthetic random-weight parity harness, not evidence F1/
+        // F2 are unsafe (both predate this task and are already applied to
+        // the real, trained checkpoint without issue). Left at `.float16`,
+        // this harness's own pre-existing, unrelated convention.
         let hiddenDimensions = dimensions.hiddenSize * dimensions.hcCount
         MLXRandom.seed(seed &+ 1)
         let inputs = (0..<steps).map { _ in
@@ -922,6 +956,20 @@ extension Qwen4ExpLayerBench {
             parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
         fused.prepareFusion(level: fusionLevel)
 
+        // P8.2: unlike `run`/`runMultiLayerStep`'s `hidden` (fixed to
+        // `.bfloat16` to match the real checkpoint's activation dtype for
+        // *performance* measurement), this harness compares two PATHS at
+        // the SAME dtype to check they behave alike -- `.bfloat16` here
+        // instead reintroduces the regression this task fixed: bf16's
+        // coarser mantissa (7 bits vs float16's 10) puts F1/F2's tiny,
+        // provably-exact summation-order noise close enough to the
+        // recurrent GDN/QSA system's chaotic-amplification threshold
+        // (same phenomenon as P7.3's compile-vs-eager divergence) that it
+        // blows up over 32 steps on random, untrained weights -- a property
+        // of this synthetic random-weight parity harness, not evidence F1/
+        // F2 are unsafe (both predate this task and are already applied to
+        // the real, trained checkpoint without issue). Left at `.float16`,
+        // this harness's own pre-existing, unrelated convention.
         let hiddenDimensions = dimensions.hiddenSize * dimensions.hcCount
         MLXRandom.seed(seed &+ 1)
         let inputs = (0..<steps).map { _ in

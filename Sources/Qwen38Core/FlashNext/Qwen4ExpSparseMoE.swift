@@ -2,6 +2,47 @@ import MLX
 import MLXNN
 import MLXLMCommon
 
+/// P8.1: accumulates the wall-clock cost of each `Qwen4ExpSparseMoE.
+/// callAsFunction` sub-stage across many bench steps, forcing an `eval`
+/// after every stage so MLX's laziness cannot silently attribute an earlier
+/// stage's compute to whichever stage happens to trigger the graph's
+/// synchronization (see docs/knowledge/log.md, "P7 revisité", point 5, and
+/// PLAN.md P8.1). **Diagnostic instrument only**: non-nil exclusively behind
+/// `flash-layer-bench --moe-stages`; `nil` everywhere else (including every
+/// production call site), so the extra synchronizations this class forces
+/// never reach `Qwen4ExpStreamingDecoder`. Because each `eval` is itself a
+/// host/GPU synchronization barrier, the sum of stage totals over-counts the
+/// undisturbed layer's cost by roughly (stage count − 1) sync barriers —
+/// `flash-layer-bench --moe-stages` reports and subtracts an independently
+/// measured per-`eval` baseline rather than leaving that caveat implicit.
+public final class Qwen4ExpMoEStageProfiler: @unchecked Sendable {
+    public private(set) var totalSeconds: [String: Double] = [:]
+    public private(set) var stageOrder: [String] = []
+    public private(set) var callCount: Int = 0
+
+    public init() {}
+
+    /// Times `body`, forces an `eval` on its result before stopping the
+    /// clock, and accumulates the elapsed wall time under `label`.
+    func time(_ label: String, _ body: () -> MLXArray) -> MLXArray {
+        let start = ContinuousClock.now
+        let result = body()
+        eval(result)
+        let elapsed = (ContinuousClock.now - start).seconds
+        if totalSeconds[label] == nil { stageOrder.append(label) }
+        totalSeconds[label, default: 0] += elapsed
+        return result
+    }
+
+    func markStepDone() { callCount += 1 }
+}
+
+private extension Duration {
+    var seconds: Double {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+}
+
 /// Dense SwiGLU used by Flash-Next's shared expert.
 public final class Qwen4ExpSharedExpert: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") public var gateProj: Linear
@@ -62,19 +103,25 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
     /// see `Qwen4ExpLayerBenchAblation`.
     public let ablation: Qwen4ExpLayerBenchAblation
 
+    /// P8.1: non-nil only under `flash-layer-bench --moe-stages` — see
+    /// `Qwen4ExpMoEStageProfiler`.
+    public let moeStageProfiler: Qwen4ExpMoEStageProfiler?
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         normalizeTopK: Bool = true,
         quantization: Qwen4ExpQuantizationSpec? = nil,
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
         fusionLevel: Qwen4ExpFusionLevel = .none,
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil
     ) {
         numExperts = configuration.numExperts
         topK = configuration.numExpertsPerToken
         self.normalizeTopK = normalizeTopK
         self.preciseRouterSoftmax = fusionLevel < .f4MoE
         self.ablation = ablation
+        self.moeStageProfiler = moeStageProfiler
 
         precondition(numExperts > 0)
         precondition(topK > 0 && topK <= numExperts)
@@ -124,6 +171,15 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         if ablation == .moe {
             return x
         }
+        // P8.1 diagnostic path: forces an `eval` after every sub-stage so
+        // `flash-layer-bench --moe-stages` measures real, synchronized
+        // wall-clock cost per stage instead of attributing everything to
+        // whichever stage happens to trigger MLX's lazy graph. Never taken
+        // in production (`moeStageProfiler` is `nil` at every real call
+        // site) — see `Qwen4ExpMoEStageProfiler`.
+        if let moeStageProfiler {
+            return callWithStageProfiling(x, moeStageProfiler)
+        }
         // F4 (P2-fusion): softmax is a strictly monotonic transform of the
         // gate logits (dividing every exp(logit) by the same positive sum
         // preserves relative order), so the top-`topK` *set* selected by
@@ -169,6 +225,47 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         } else {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+        return output
+    }
+
+    /// P8.1: same computation as `callAsFunction`'s normal path, staged
+    /// through `Qwen4ExpMoEStageProfiler.time` so each sub-block's cost is
+    /// measured with a forced `eval` boundary. Deliberately a separate
+    /// method (not an `if` inside the single expression above) so the
+    /// production path above stays exactly as lazy/fused as before this
+    /// task — this method is only ever reached when `moeStageProfiler` is
+    /// non-nil, i.e. only from `flash-layer-bench --moe-stages`.
+    private func callWithStageProfiling(
+        _ x: MLXArray, _ stageProfiler: Qwen4ExpMoEStageProfiler
+    ) -> MLXArray {
+        let gateLogits = stageProfiler.time("gate") { gate(x) }
+        let probabilities = stageProfiler.time("softmax") {
+            MLX.softmax(gateLogits, axis: -1, precise: preciseRouterSoftmax)
+        }
+        let kth = numExperts - topK
+        let indices = stageProfiler.time("argPartition") {
+            MLX.argPartition(probabilities, kth: kth, axis: -1)[.ellipsis, kth...]
+        }
+        let scores = stageProfiler.time("takeAlong+normalize") { () -> MLXArray in
+            var s = MLX.takeAlong(probabilities, indices, axis: -1)
+            if normalizeTopK {
+                s = s / s.sum(axis: -1, keepDims: true)
+            }
+            return s
+        }
+        let tokenCount = x.size / x.dim(-1)
+        let flatX = x.reshaped([tokenCount, x.dim(-1)])
+        let flatIndices = indices.reshaped([tokenCount, topK])
+        let flatScores = scores.reshaped([tokenCount, topK])
+        let switchOutput = stageProfiler.time("switchMLP") { switchMLP(flatX, flatIndices) }
+        let routed = stageProfiler.time("weightedExpertSum") {
+            weightedExpertSum(switchOutput, flatScores).reshaped(x.shape)
+        }
+        let sharedGateValue = stageProfiler.time("sharedExpertGate") { sigmoid(sharedExpertGate(x)) }
+        let sharedExpertOutput = stageProfiler.time("sharedExpert") { sharedExpert(x) }
+        let shared = stageProfiler.time("shared-combine") { sharedGateValue * sharedExpertOutput }
+        let output = stageProfiler.time("add") { routed + shared }
+        stageProfiler.markStepDone()
         return output
     }
 
