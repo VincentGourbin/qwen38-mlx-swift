@@ -1,0 +1,138 @@
+prompt tokens: 3137
+generated ids: [26623, 3266]
+decoded: "Voici"
+TTFT: 105.660s
+prefill: 105.659s
+decode: 0.608s
+couches: 96 visites · load cumulé 65.216s · forward cumulé 40.429s
+MLX mémoire active: 56,34 GB
+P6.2 PLE lookup : 2 appels · 6 MLXArray construits · 2 dequantize · lecture hôte cumulée 30.7547s
+MLX mémoire peak: 64,82 GB
+
+╭──────────────────────────────────────────────────────────────────╮
+│  QWEN3.8 FLASH-NEXT GREEDY PROBE                                 │
+├──────────────────────────────────────────────────────────────────┤
+  decoded: Voici  generated_ids: 26623,3266  image: none  layer_forward_seconds: 40.429291  layer_load_seconds: 65.216379  layer_visits: 96  max_new_tokens: 2  model: Qwen3.8-Flash-Next-MLX-e3bit-MTP  mtp: false  ngram_cache_entries: 4096  ngram_cache_hit_rate: 0.5000  ngram_cache_hits: 150624  ngram_cache_misses: 150624  ple_arrays_constructed: 6  ple_dequantize_calls: 2  ple_host_read_seconds: 30.754720  ple_lookup_calls: 2  prompt_tokens: 3137  thinking: false
+  Device: applegpu_g15s  RAM: 96GB  Build: Release  Power: AC Power
+  Sampler: 16 ms, deviceUtilization, 5462 samples
+  pmset: disksleep=10 displaysleep=20 powernap=1 sleep=1 standby=1  (idle sleep held off)
+
+  PHASE TIMINGS                                GPU%   p50   CPU%
+  ──────────────────────────────────────────────────────────────────
+  Prefill                1m 45.7s   49.7% ██       10%    0%  34.7%
+  Generation               607.4ms    0.3%           6%    0%  91.8%
+  Flash globals            581.6ms    0.3%           0%    0%  30.4%
+  Flash couche 0           441.1ms    0.2%          32%    0%  67.3%
+  Flash couche 1           31.26s    14.7%           1%    0%  68.7%
+  Flash couche 2            1.53s     0.7%          15%    0%  19.3%
+  Flash couche 3            1.63s     0.8%          19%    0%  22.5%
+  Flash couche 4            1.59s     0.7%          19%    0%  18.6%
+  Flash couche 5            1.60s     0.8%          16%    0%  18.6%
+  Flash couche 6            1.56s     0.7%          19%    0%  19.0%
+  Flash couche 7            1.58s     0.7%          18%    0%  20.2%
+  Flash couche 8            1.57s     0.7%          13%    0%  20.0%
+  Flash couche 9            1.57s     0.7%          12%    0%  19.4%
+  Flash couche 10           1.58s     0.7%          13%    0%  19.5%
+  Flash couche 11           1.59s     0.7%          16%    0%  19.9%
+  Flash couche 12           1.58s     0.7%          12%    0%  19.6%
+  Flash couche 13           1.59s     0.7%          14%    0%  19.6%
+  Flash couche 14           1.59s     0.7%          14%    0%  19.8%
+  Flash couche 15           1.60s     0.8%          13%    0%  20.0%
+  Flash couche 16           1.59s     0.7%          11%    0%  19.9%
+  Flash couche 17           1.60s     0.8%          14%    0%  18.8%
+  Flash couche 18           1.59s     0.7%          11%    0%  18.9%
+  Flash couche 19           1.63s     0.8%          13%    0%  20.2%
+  Flash couche 20           1.57s     0.7%          12%    0%  19.0%
+  Flash couche 21           1.59s     0.7%          13%    0%  20.1%
+  Flash couche 22           1.58s     0.7%          13%    0%  19.5%
+  Flash couche 23           1.60s     0.8%          13%    0%  20.4%
+  Flash couche 24           1.59s     0.7%          12%    0%  19.9%
+  Flash couche 25           1.57s     0.7%          11%    0%  20.4%
+  Flash couche 26           1.61s     0.8%          11%    0%  19.2%
+  Flash couche 27           1.62s     0.8%          14%    0%  20.6%
+  Flash couche 28           1.58s     0.7%          14%    0%  20.9%
+  Flash couche 29           1.61s     0.8%          12%    0%  21.1%
+  Flash couche 30           1.66s     0.8%          10%    0%  20.9%
+  Flash couche 31           1.63s     0.8%          13%    0%  23.1%
+  Flash couche 32           1.57s     0.7%          11%    0%  20.3%
+  Flash couche 33           1.55s     0.7%          10%    0%  20.9%
+  Flash couche 34           1.61s     0.8%          11%    0%  20.0%
+  Flash couche 35           1.62s     0.8%          13%    0%  20.7%
+  Flash couche 36           1.61s     0.8%          10%    0%  19.8%
+  Flash couche 37           1.54s     0.7%          12%    0%  21.0%
+  Flash couche 38           1.60s     0.8%          11%    0%  19.4%
+  Flash couche 39           1.62s     0.8%          13%    0%  21.3%
+  Flash couche 40           1.57s     0.7%          11%    0%  20.1%
+  Flash couche 41           1.59s     0.7%          11%    0%  20.2%
+  Flash couche 42           1.55s     0.7%          11%    0%  20.1%
+  Flash couche 43           1.59s     0.7%          13%    0%  21.7%
+  Flash couche 44           1.62s     0.8%          15%    0%  20.2%
+  Flash couche 45           1.63s     0.8%          11%    0%  20.5%
+  Flash couche 46           1.65s     0.8%          11%    0%  20.0%
+  Flash couche 47           1.66s     0.8%          12%    0%  20.7%
+  Flash couche 0            11.5ms    0.0%         100%  100%  88.1%
+  Flash couche 1            26.4ms    0.0%          53%  100%  59.3%
+  Flash couche 2             8.8ms    0.0%           0%    0% 134.0%
+  Flash couche 3            13.4ms    0.0%           0%    0% 120.0%
+  Flash couche 4            11.5ms    0.0%           0%    0%  94.2%
+  Flash couche 5            11.1ms    0.0%           0%    0%  64.1%
+  Flash couche 6            10.5ms    0.0%           0%    0%  77.0%
+  Flash couche 7            11.5ms    0.0%           0%    0% 136.0%
+  Flash couche 8            10.7ms    0.0%           0%    0% 109.8%
+  Flash couche 9            10.3ms    0.0%           0%    0% 100.4%
+  Flash couche 10           10.4ms    0.0%           0%    0%  99.7%
+  Flash couche 11           11.1ms    0.0%           0%    0%  99.6%
+  Flash couche 12           10.4ms    0.0%           0%    0%  98.5%
+  Flash couche 13           10.3ms    0.0%           0%    0%  96.9%
+  Flash couche 14           10.4ms    0.0%           0%    0%  67.7%
+  Flash couche 15           11.2ms    0.0%           0%    0%  74.1%
+  Flash couche 16           10.9ms    0.0%           9%    0% 100.8%
+  Flash couche 17           10.4ms    0.0%          30%   30% 109.7%
+  Flash couche 18           10.4ms    0.0%          19%   30% 127.2%
+  Flash couche 19           13.3ms    0.0%           0%    0% 107.6%
+  Flash couche 20           10.5ms    0.0%           0%    0%  91.4%
+  Flash couche 21           10.7ms    0.0%           0%    0%  96.8%
+  Flash couche 22           10.6ms    0.0%           0%    0%  98.2%
+  Flash couche 23           11.2ms    0.0%           0%    0%  64.8%
+  Flash couche 24           10.7ms    0.0%           0%    0%  66.4%
+  Flash couche 25           10.9ms    0.0%           0%    0% 106.5%
+  Flash couche 26           11.1ms    0.0%           0%    0% 113.5%
+  Flash couche 27           12.6ms    0.0%           0%    0% 131.9%
+  Flash couche 28           20.2ms    0.0%           0%    0% 103.1%
+  Flash couche 29           13.2ms    0.0%           0%    0%  69.6%
+  Flash couche 30           13.6ms    0.0%           0%    0%  88.6%
+  Flash couche 31           11.9ms    0.0%          19%   32% 128.5%
+  Flash couche 32           11.2ms    0.0%          32%   32% 110.2%
+  Flash couche 33           11.1ms    0.0%           5%    0% 103.4%
+  Flash couche 34           11.4ms    0.0%           0%    0%  71.9%
+  Flash couche 35           11.7ms    0.0%           0%    0%  77.9%
+  Flash couche 36           11.4ms    0.0%           0%    0% 107.2%
+  Flash couche 37           10.9ms    0.0%           0%    0% 109.5%
+  Flash couche 38           10.8ms    0.0%           0%    0% 112.5%
+  Flash couche 39           11.8ms    0.0%           0%    0%  86.2%
+  Flash couche 40           43.5ms    0.0%           0%    0%  33.7%
+  Flash couche 41           11.3ms    0.0%           0%    0%  55.3%
+  Flash couche 42           12.4ms    0.0%           0%    0% 142.8%
+  Flash couche 43           13.0ms    0.0%           0%    0%  75.7%
+  Flash couche 44           13.2ms    0.0%           0%    0%  77.8%
+  Flash couche 45           12.4ms    0.0%           0%    0% 123.6%
+  Flash couche 46           13.2ms    0.0%           0%    0% 117.0%
+  Flash couche 47           12.0ms    0.0%           0%    0% 101.6%
+  ──────────────────────────────────────────────────────────────────
+  TOTAL                  3m 32.5s  100.0%
+
+  MEMORY
+  ──────────────────────────────────────────────────────────────────
+  Peak MLX Active: 61565.3 MB  at 01:45.707
+  Peak Process: 67982.0 MB  at 01:46.903
+
+  System-wide (peaks):
+    Anonymous:    72399.8 MB    Wired:  30111.9 MB
+    File-backed:  44251.9 MB    Speculative: 32770.2 MB
+    Compressor:     638.4 MB occupied, holding 2203.4 MB (3.45x)
+    Swap used:      207.8 MB
+    Lowest kern.memorystatus_level: 68
+
+╰──────────────────────────────────────────────────────────────────╯
+
+trace profiler: results/ngram-local/E2-local.trace.json

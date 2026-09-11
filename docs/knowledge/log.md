@@ -3292,3 +3292,41 @@ de pic dépassent la machine ; le sampler montre le compresseur à 57 Go et
 greedy 4-bit mesure 0,87 s/token (contre 0,164 s/token en 3-bit) : c'est de la
 décompression, pas du modèle. Le 4-bit reste inutilisable sur cette machine
 sans P3, même après reboot.
+
+## 2026-09-11 — Shards n-gram sur le SSD interne : le préfill réel gagne 37 %
+
+`Scripts/localize-checkpoint.sh` a produit
+`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` : 7 shards
+n-gram copiés (35,7 Go, 53 s), 15 shards liés au Lexar, 138 Go encore libres.
+Le chargement lit les shards liés et n'est pas concerné ; seul le préfill
+touche la table n-gram (mmap paresseux).
+
+**Piège de méthode** : une première série A/B/B/A avec **le même** prompt
+répété n'a montré aucun écart (forward 10-11 s, PLE 3-5,5 s) — un prompt
+redondant réutilise ses lignes n-gram et le cache de pages efface la
+différence. Il faut un prompt **différent par run** pour mesurer des lectures
+froides. Les chiffres ci-dessous utilisent des prompts distincts.
+
+| Prompt | Chemin | forward préfill | couche PLE | ratio PLE/couche | tok/s |
+|---|---|---|---|---|---|
+| mots aléatoires, 2 511-2 563 tok | Lexar | 56,5 / 51,5 s | 49,7 / 44,6 s | 32× / 29× | 45-50 |
+| idem | **SSD** | **33,3 / 32,3 s** | 26,0 / 25,0 s | 17× / 15× | 76-79 |
+| **prose française réelle, 3 137 tok** | Lexar | 64,5 s | 56,6 s (88 %) | 36× | **48,6** |
+| idem (mêmes 150 624 lectures) | **SSD** | **40,4 s** | **31,3 s** (77 %) | 20× | **77,6** |
+
+**−37 % sur le préfill réel**, à nombre de lectures identique (150 624, soit
+48 lignes par token : 6 couches PLE × 8 têtes). Coût par ligne : **0,376 ms
+sur le Lexar contre 0,208 ms sur le SSD**.
+
+**Correction d'un chiffre publié** : les « 87-190 tok/s de préfill » des
+entrées P4/P5 venaient de prompts à phrase répétée (forte réutilisation
+n-gram). Sur du texte varié, le préfill réel est **48,6 tok/s sur le Lexar,
+77,6 sur le SSD**, et la couche n-gram pèse **88 % du forward**, pas 28 %.
+C'est donc le premier poste du préfill, loin devant tout le reste.
+
+Reste : 0,208 ms par ligne sur NVMe est encore ~2-3× le coût d'une lecture
+brute — le chemin hôte (faute de page mmap + copie) domine, pas le disque.
+Levier suivant : `pread` groupés sur offsets triés, LRU de lignes plus grand,
+ou préchargement des lignes du prompt en une passe. Note : le compteur
+`ngram_cache_hit_rate` vaut exactement 0,5000 dans **tous** les runs — c'est
+un artefact structurel (lectures appariées), il ne mesure rien d'utile.
