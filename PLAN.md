@@ -4003,3 +4003,26 @@ Hors périmètre P7 : le préfill (traité le 2026-09-11, la copie SSD des shard
 n-gram donne −37 % ; le reliquat est le chemin hôte de lecture des lignes), le
 chargement du modèle (Vincent : « ça ne le rend pas inutilisable »), le 4-bit,
 P3, P5.7 (GUI/LAN traité en P6.4).
+
+**Statut (2026-09-11, exécuté)** : P7.1 désigne le MoE routé (`switch_mlp`,
+78-88 % de la couche) comme sous-bloc dominant — **pas** la chaîne de
+gating GDN anticipée (0,8 % de la couche, dans le bruit) ; tableau complet
+et sous-sondes MoE dans `log.md`. P7.2 : `captureGPUTrace` ne lève pas
+l'erreur documentée (capture produite mécaniquement) mais aucun nom de
+noyau reconnaissable n'apparaît dans le fichier produit, cohérent avec
+`MLX_METAL_DEBUG` absent du build vendored — obstacle documenté, mlx-swift
+non reconstruit. P7.3 : `MLX.compile` du pas complet (4 et 8 couches)
+n'apporte aucun gain net et casse la parité numérique pour GDN (diff
+croissante avec le nombre de couches, hors tolérance) ; QSA reste correct
+mais 14-16 % plus lent, jamais plus rapide ; `--shapeless` crashe (`Split`
+ne peut pas inférer sa forme). P7.4 : la fusion du sous-bloc dominant (F7,
+gate+up `switch_mlp` fusionnés en un `gatherQuantizedMM`) a été implémentée
+et validée (parité bit-exacte/1e-3 sur le bench) mais **retirée du code**
+après échec sur le checkpoint réel — 17,6× plus lent, +36,7 Go de pic
+mémoire (le tenseur fusionné double transitoirement une partie des poids
+sur 48 couches, cf. H-A). P7.5 non applicable (aucun autre sous-bloc
+> 15 %). P7.6 : garde Q-B PASS (`hits=10/28 meanLogProb=-4.8003182`), IDs
+identiques à la référence en greedy et en MTP ; **jauge ≥ 9 tok/s non
+atteinte** (6,58 tok/s greedy, 8,30 tok/s MTP bloc 2) — aucun changement de
+comportement de production dans ce chantier. Détail complet :
+`docs/knowledge/log.md` « 2026-09-11 — P7 : débit de génération ».

@@ -103,6 +103,41 @@ fusion de noyau custom retenue (P4.3, décision documentée) : P2-fusion avait
 déjà montré un gain nul sur des leviers structurellement comparables, et
 P4.1 seul a refermé l'essentiel de l'écart GPU visé par ces fusions.
 
+### P7 — ablation par sous-bloc : le MoE routé domine, aucune fusion retenue (2026-09-11)
+
+Bench synthétique `flash-layer-bench --ablate <bloc>` (Release, sans
+checkpoint) : le sous-bloc dominant d'une couche Flash-Next est le MoE
+routé (`switch_mlp`/`SwitchGLU`), **78-88 % de la couche**, pas la chaîne
+de gating GDN anticipée. Détail, tableau complet et sous-sondes MoE :
+`docs/knowledge/log.md` « 2026-09-11 — P7 : débit de génération ». Une
+fusion (F7 — gate+up `switch_mlp` en un seul `gatherQuantizedMM`) a été
+implémentée, validée bit-exacte/1e-3 sur le bench, mais **retirée** après
+validation sur le checkpoint réel : 17,6× plus lent (84,1 s contre 4,8 s
+pour 32 tokens) et +36,7 Go de pic mémoire (93,7 Go contre 57,0 Go) — le
+tenseur fusionné double transitoirement une partie des poids `switch_mlp`
+sur les 48 couches, poussant la résidence en zone de pression mémoire.
+`MLX.compile` du pas complet (4 et 8 couches empilées, pas une couche
+isolée) n'apporte aucun gain net et casse la parité numérique pour GDN
+(diff relative croissante avec le nombre de couches) ; pour QSA il reste
+correct mais 14-16 % plus lent, jamais plus rapide. Aucun changement de
+comportement de production : `Qwen4ExpFusionLevel` s'arrête à F6.
+
+Mesure finale (checkpoint 3-bit, prompt de référence, greedy 32 tokens,
+`--resident-async-interval 8`, IDs identiques à la référence dans tous les
+cas) :
+
+| Variante | s/token | tok/s |
+|---|---:|---:|
+| Greedy | 0,152 | 6,58 |
+| MTP bloc 2 | 0,120 | 8,30 |
+
+Jauge ≥ 9 tok/s (PLAN.md P7.6) : non atteinte. Le goulot identifié n'est
+pas le bookkeeping hôte de petits noyaux (hypothèse de P2-fusion/P4.3) mais
+le gather-matmul quantifié du MoE routé (512 experts, top-10) à l'intérieur
+de `Vendor/mlx-swift-lm` — non modifiable sans toucher le paquet vendored
+(interdit) ni réimplémentable à la main dans le temps disponible avec un
+harnais de parité suffisant.
+
 ### P5.4 — préfill 2 543 tokens : la couche PLE domine, routage shard O(n) au lieu de O(shards×n) (2026-09-10)
 
 Deux tours `flash-chat-probe --resident-layers --resident-async --profile-layers

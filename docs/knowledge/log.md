@@ -3330,3 +3330,263 @@ Levier suivant : `pread` groupés sur offsets triés, LRU de lignes plus grand,
 ou préchargement des lignes du prompt en une passe. Note : le compteur
 `ngram_cache_hit_rate` vaut exactement 0,5000 dans **tous** les runs — c'est
 un artefact structurel (lectures appariées), il ne mesure rien d'utile.
+
+## 2026-09-11 — P7 : débit de génération
+
+Protocole PLAN.md « P7 — Débit de génération : attribuer le coût par
+sous-bloc, puis fusionner » (2026-09-11). Ordre exécuté : P7.1 → P7.2 → P7.3
+→ P7.4 (implémenté puis **retiré** après échec sur le checkpoint réel) →
+P7.5 (non applicable) → P7.6. Toutes les mesures P7.1-P7.4 : `flash-layer-bench
+--steps 300 --async-interval 8` (Release, sans checkpoint), médiane
+« horloge interne », deux runs par variante sauf mention contraire.
+
+### P7.1 — profil par ablation : le MoE routé domine, pas la chaîne de gating GDN
+
+Nouveau `Qwen4ExpLayerBenchAblation` (`Sources/Qwen38Core/FlashNext/Qwen4ExpLayerBenchAblation.swift`)
+et `--ablate <bloc>` sur `flash-layer-bench` : chaque cas court-circuite un
+sous-bloc en renvoyant un tenseur de forme correcte (jamais numériquement
+correct, instrument de mesure uniquement, `.none` partout en production —
+piège 11/8 respecté). Threading par constructeur (comme `fusionLevel`),
+`.none` par défaut sur `Qwen4ExpGatedDeltaNet`, `Qwen4ExpQSAAttention`,
+`Qwen4ExpSparseMoE`, `Qwen4ExpGatedResidual`, `Qwen4ExpDecoderLayer`.
+
+**Résultat contraire à l'hypothèse du plan** (« candidat attendu : la chaîne
+de gating GDN, ~15-20 ops »): le gating GDN pèse **0,8 %** de la couche.
+Le sous-bloc dominant, et de loin, est le **MoE routé** (`switch_mlp`) :
+
+| Sous-bloc | GDN ms | GDN % couche | QSA ms | QSA % couche |
+|---|---:|---:|---:|---:|
+| **moe** (routage + experts + partagé) | 3,955 | **88,1 %** | 3,465 | **77,8 %** |
+| — dont routage (gate+softmax+argPartition) | ~0 | ~0 % | ~0 | ~0 % |
+| — dont `switch_mlp` (SwitchGLU) | 3,90 | 86,9 % | 3,415 | 76,7 % |
+| — dont expert partagé | ~0 | ~0 % | ~0 | ~0 % |
+| gdn-recurrence (`gatedDeltaUpdate`) | 0,035 | 0,8 % | — | — |
+| gdn-projections (in_proj×4 + conv1d) | 0,24 | 5,3 % | — | — |
+| qsa-attn (SDPA + indexeur) | — | — | 0,0 | 0,0 % |
+| hyper (mix hyper-connections) | 0,235 | 5,2 % | 0,19 | 4,3 % |
+| norms (hc_norm/q_norm/k_norm/RMSNormGated) | 0,095 | 2,1 % | 0,08 | 1,8 % |
+| **couche complète (baseline)** | **4,49** | 100 % | **4,455** | 100 % |
+| Σ blocs nommés | 4,56 (102 %) | | 3,735 (**84 %**) | |
+
+Sous-sondes MoE (`--ablate moe-routing/moe-switch-mlp/moe-shared-expert`,
+gardent le routeur réel et ne zèrent qu'un terme à la fois) : le routage et
+l'expert partagé sont chacun **dans le bruit de mesure** (Δ négatif de
+quelques centièmes de ms, i.e. ~0 %) ; la totalité du coût MoE est portée
+par le gather-matmul quantifié `switch_mlp` (SwitchGLU, `Vendor/mlx-swift-lm`).
+Confirmé sous la quantification réelle du checkpoint (3-bit g64) :
+GDN 2,715→0,555 ms (moe 79,6 %), QSA 2,73→0,985 ms (moe 63,9 %) — même
+verdict, poids différents.
+
+**Somme des blocs vs couche complète** : GDN 102 % (±15 % respecté). QSA
+84 % — **hors de la fourchette ±15 %**, à signaler explicitement comme
+demandé : l'écart (~16 %, ~0,72 ms) correspond aux projections q/k/v/o et
+au RoPE de `Qwen4ExpQSAAttention`, qui n'ont pas de case d'ablation dédiée
+dans le plan (seul `qsa-attn`, SDPA+indexeur, existe) — non un artefact de
+mesure mais une lacune assumée du découpage en sous-blocs de P7.1.
+
+Verdict : P7.1 désigne sans ambiguïté un sous-bloc dominant (`moe`/
+`switch_mlp`, 78-88 % de la couche, 87-99 % du budget MoE), **contredisant
+l'hypothèse a priori du plan** (chaîne de gating GDN). C'est ce sous-bloc,
+et lui seul, qui gouverne P7.4.
+
+### P7.2 — `captureGPUTrace` : capture obtenue mais sans noms de noyau
+
+`MTL_CAPTURE_ENABLED=1` + `ProfilingSession.captureGPUTrace(phase:)` (ajout
+`--gpu-trace`, exige `--trace`) : **ne lève pas l'erreur documentée**
+(`captureNotEnabled`/`notProduced`) — un `.gputrace` de 603 Mo est produit
+mécaniquement pour un seul pas de couche synthétique. Mais
+`Vendor/mlx-swift/Package.swift` ne définit `MLX_METAL_DEBUG` nulle part
+(`grep` vide sur les `cxxSettings` du target `Cmlx`), condition que le
+profiler documente lui-même comme nécessaire « pour que `GPU.startCapture`
+fasse quoi que ce soit » d'utile : extraction de chaînes sur `store0`/
+`index`/`metadata` (1511 chaînes) — aucun nom de noyau MLX reconnaissable
+(`copy_gpu`, `QuantizedMatmul`, `binary_op`, `qmv`…). Sans accès à Xcode
+GUI dans cet environnement pour ouvrir la capture et vérifier visuellement,
+impossible de confirmer si les pipelines sont réellement anonymes ou si
+`strings` est simplement le mauvais outil pour ce format binaire. Obstacle
+documenté conformément à la consigne (« rapporter l'obstacle exact et
+s'arrêter ») : la précondition `MLX_METAL_DEBUG` qu'exige un comptage par
+noyau fiable est absente du build vendored, et l'ajouter exigerait de
+reconstruire mlx-swift — hors périmètre sans accord. Comptage analytique de
+repli : voir le tableau P7.1 (attribution par sous-bloc) et P2-code (a) du
+2026-09-07 (familles de noyaux par échantillonnage `sample`, Copy≈260/
+Binaire≈270/QuantizedMatmul≈77) — la dominance mesurée de `switch_mlp`
+recadre ce comptage : les familles Copy/Binaire qu'il pointait comme
+majoritaires sont vraisemblablement pour bonne part la mécanique de
+dispatch de `SwitchGLU` (expand/squeeze/scatter), pas GDN/QSA/hyper comme
+supposé à l'époque. Fichier nettoyé après inspection (603 Mo, non conservé).
+
+### P7.3 — `MLX.compile` du pas complet (4 et 8 couches) : aucun gain, GDN casse la parité
+
+Nouveau `Qwen4ExpLayerBench.runMultiLayerStep`/`checkMultiLayerStepParity`
+(`--step-layers N [--compiled-step] [--shapeless]`) : empile N couches
+indépendantes du même type et compile **tout le pas** (`hidden → couche 0 →
+… → couche N-1`) en un seul `MLX.compile`, chaque cache boxé comme état
+(`Updatable`), au lieu d'un `compile` par couche (P2-code (c)). QSA passe un
+masque explicite par couche (argument de tableau, comme le closure à 2 args
+existant), pas une variable capturée.
+
+| Config | Eager | Compiled | Δ | Parité (32 pas) |
+|---|---:|---:|---:|---|
+| GDN × 4 | 18,56 ms/pas | 18,29 ms/pas | −1,5 % | **FAIL** (diff rel max 3,61, seuil 1) |
+| GDN × 8 | 36,89 ms/pas | 35,86 ms/pas | −2,8 % | **FAIL** (diff rel max 17,04 — croît avec N) |
+| QSA × 4 | 20,16 ms/pas | 23,01 ms/pas | **+14,1 %** | PASS (bit-exact) |
+| QSA × 8 | 41,15 ms/pas | 47,68 ms/pas | **+15,9 %** | PASS (bit-exact) |
+| GDN/QSA, `--shapeless` | — | — | — | **crash** (`Fatal error: [Primitive::output_shapes] Split cannot infer output shapes`) |
+
+QSA : le masque causal change de forme à chaque pas (`cache.offset` croît),
+donc `compile` retrace à chaque appel — bit-exact avec eager (la retrace
+est correcte, juste inutile), mais plus lente que l'eager, et l'écart
+**s'aggrave** avec plus de couches (+14,1 %→+15,9 % de N=4 à N=8) : aucune
+fusion inter-couches ne compense le coût de retracer, contrairement à
+l'hypothèse du plan. GDN : forme de cache fixe (bon candidat *a priori*),
+mais la sortie compilée diverge de l'eager **au-delà** de la tolérance
+1e-3-équivalente, et l'écart croît avec le nombre de couches (3,61 à N=4,
+17,04 à N=8) — signe d'une divergence numérique qui s'accumule couche
+après couche (probablement un ordre de réduction différent dans le noyau
+`gatedDeltaUpdate`/`GatedDeltaKernelManager` sous graphe compilé), pas du
+bruit flottant isolé. `--shapeless` casse net sur un `Split` dont MLX ne
+sait pas inférer la forme sans trace concrète — obstacle documenté, pas
+contourné. **Verdict : aucune configuration testée n'est à la fois plus
+rapide et numériquement sûre — P7.3 ne retient rien.**
+
+### P7.4 — Fusion Metal du sous-bloc dominant : implémentée, PASS en synthétique, **retirée** après échec sur le checkpoint réel
+
+P7.1 désigne `switch_mlp` (SwitchGLU, `Vendor/mlx-swift-lm`), pas la chaîne
+de gating GDN anticipée par le plan — donc pas de candidat « noyau Metal
+maison sur ~15-20 ops élémentaires » au sens littéral de la consigne.
+Investigation du seul point d'entrée public de `SwitchGLU`
+(`callAsFunction(_:_:)`, matérialise `[tokens,topK,hidden]` puis un
+`scatterUnsort`) : `projectExperts`, `supportsDirectWeightedReduction`,
+`callAndWeightedReduce` et le kernel maison `weightedExpertUnsort` déjà
+présent côté Vendor sont `private`/`package` — inaccessibles depuis ce
+paquet sans modifier `Vendor/mlx-swift-lm` (interdit). En revanche
+`gatherQuantizedMM` (le primitif public de gather-matmul quantifié, dans le
+paquet **de base** `mlx-swift`, pas `mlx-swift-lm`) est appelable
+directement, et les poids déjà chargés de `gate_proj`/`up_proj` sont
+lisibles via `Module.parameters()` (réflexion publique de `MLXNN`, qui
+n'a pas besoin que les propriétés `@ModuleInfo` sous-jacentes soient
+`public`).
+
+**F7 implémentée** (`Qwen4ExpFusionLevel.f7MoEGateUp`, réversible, threadée
+comme F1-F6) : concatène `gate_proj`+`up_proj` (poids/`scales`/`biases`
+quantifiés packés, axe de sortie) et appelle un seul `gatherQuantizedMM`
+au lieu de deux, exactement le raisonnement de F1 transposé de `Linear` à
+`SwitchLinear`/`QuantizedSwitchLinear` — `down_proj` reste un second appel
+séparé (dépend de l'activation). Décodage seul (`indices.size < 64`, seuil
+`doSort` de `SwitchGLU` lui-même) ; le préfill retombe intact sur le
+chemin `switchMLP` d'origine.
+
+**Parité (bench synthétique, 32 pas)** : PASS sur les deux types de couche
+— GDN bit-exact (diff 0,0), QSA diff normalisée max 0,32 (bruit bf16,
+même magnitude que F2, sous le seuil 1).
+
+**Mesure bench** (avant tout run checkpoint, comme imposé) : gain
+**marginal et incohérent** — 4-bit g32 : GDN +0,1 % (aucun gain), QSA
+−3,1 % ; 3-bit g64 (quantification réelle du checkpoint) : GDN −5,0 %,
+QSA −0,9 %. Loin d'un effet clair malgré 78-88 % du budget de couche dans
+ce sous-bloc — indice que le coût de `switch_mlp` n'est pas dominé par le
+nombre de dispatches (fusionner 2 appels en 1 n'a presque rien changé)
+mais par le volume de données touchées par le gather quantifié lui-même.
+
+**Validation checkpoint réel (P7.6, avant tout changement de défaut, comme
+imposé)** — prompt de référence, greedy, 32 tokens, `--resident-async
+--resident-async-interval 8` : IDs **identiques** à la référence
+(`[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, …]`) — la fusion
+reste numériquement correcte sur le vrai checkpoint — mais :
+
+| | référence (`.none`) | F7 (`--fusion-level 7`) |
+|---|---:|---:|
+| decode (32 tokens) | 4,775 s (0,149 s/token, 6,7 tok/s) | **84,056 s** (2,627 s/token, 0,38 tok/s) |
+| mémoire pic MLX | 56,99 Go | **93,7 Go** |
+
+**17,6× plus lent, +36,7 Go de pic mémoire.** Cause : `fuseGateUpProjections()`
+matérialise un tenseur fusionné par couche **en plus** des poids
+`gate_proj`/`up_proj` d'origine (toujours résidents via `switchMLP`, jamais
+libérés) — sur ~48 couches à poids quantifiés réels (pas les placeholders
+minuscules du bench), ce doublement partiel pousse la résidence de 57 Go
+vers 93,7 Go sur une machine à 96 Go : exactement le mécanisme de pression
+mémoire (H-A) documenté depuis le début de ce chantier P, ici déclenché
+par la fusion elle-même plutôt que subi passivement. Le bench synthétique
+(poids aléatoires minuscules, quelques Mo par couche) ne pouvait pas
+révéler ce coût — la consigne « mesurer sur le bench avant le checkpoint »
+a été respectée à la lettre, mais le bench n'était structurellement pas en
+mesure de voir ce risque précis (taille des poids, pas leur nombre
+d'opérations).
+
+**Décision : F7 retirée du code** (pas seulement laissée à `.none` comme
+F1/F2/F4/F6) — contrairement à ces derniers (« aucun gain mais aucune
+régression prouvée, conservés »), F7 est **prouvée activement dangereuse**
+sur le modèle réel ; la conserver, même inerte derrière un flag, serait un
+piège pour une session future qui l'activerait sans relire cette entrée.
+`Qwen4ExpFusionLevel` s'arrête à nouveau à F6 ; `Qwen4ExpSparseMoE` est
+revenu à son état P7.1 (ablation uniquement, aucune trace de F7).
+`--fusion-level` CLI redevient 0-6.
+
+### P7.5 — non applicable
+
+Aucun sous-bloc autre que `moe` ne dépasse 15 % de la couche (le plus
+proche : `gdn-projections`/`hyper` à 5,2-5,3 %, ou le résidu QSA non
+attribué à 16 % qui n'est pas un « autre sous-bloc désigné » au sens de la
+consigne) — et P7.4 n'a de toute façon rien retenu. Passage direct à P7.6.
+
+### P7.6 — validation finale sur le checkpoint réel
+
+`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
+hybride SSD), `caffeinate -dimsu` + `Scripts/preflight-resident.sh` (seuil
+35 Go, PASS à 16,8-23,5 Go selon les runs) devant chaque run, jamais deux
+runs simultanés, GUI vérifiée non résidente (`pgrep qwen38-bench-ui`
+négatif). Code final = état post-P7.1 (ablations `.none` par défaut, F7
+retirée) : **aucun changement de comportement de production dans ce
+chantier** — P7 n'a produit qu'un diagnostic, aucune fusion retenue.
+
+| Variante | tokens | temps | s/token | tok/s | IDs = référence |
+|---|---:|---:|---:|---:|---|
+| Greedy | 32 | 4,864 s | 0,152 | 6,58 | oui |
+| MTP bloc 2 | 32 | 3,853 s | 0,120 | 8,30 | oui (identiques token à token) |
+
+MTP : 10/21 acceptés (47,6 %), 11 rollbacks, 0 rejeu — cohérent avec PM3/PM4
+(taux d'acceptation dépendant du prompt, pas un problème de bookkeeping).
+Garde Q-B (`flashTeacherForcedRegressionGuardV32`) : **PASS**,
+`hits=10/28 meanLogProb=-4.8003182`, identique à la valeur de référence.
+87 tests verts (`Scripts/run-tests.sh`), build Release vert tout au long
+de la session.
+
+**Jauge ≥ 9 tok/s (PLAN.md) : non atteinte** (6,58 greedy / 8,30 MTP) —
+consigné tel quel : P7 n'a pas trouvé de sous-bloc fusionnable en toute
+sécurité dans le temps disponible. Le plafond tient à un fait nouveau et
+important pour la suite : **le goulot n'est pas le bookkeeping hôte de
+petits noyaux** (l'hypothèse qui motivait P2-fusion/P4.3/ce chantier), mais
+le **gather-matmul quantifié du MoE routé** (`SwitchGLU`, 512 experts,
+top-10, dans `Vendor/mlx-swift-lm`) — un poste que ce dépôt ne peut pas
+opter d'optimiser sans soit modifier le paquet vendored (interdit), soit
+réimplémenter tout le gather quantifié à la main (risque élevé, non
+tenté ici faute de temps et d'un harnais de parité suffisant pour un
+composant de cette taille).
+
+### Écarts à la consigne P7
+
+1. **Ordre d'exécution** : P7.4 (F7) a été implémentée et mesurée sur le
+   bench **avant** P7.3 (compile du pas complet), pas dans l'ordre strict
+   P7.1→P7.2→P7.3→P7.4 demandé — inversion sans conséquence sur les
+   résultats (tâches indépendantes), corrigée ici en présentant le rapport
+   dans l'ordre du plan.
+2. **Commits regroupés** : P7.1 (ablation) et le reste (CLI `--gpu-trace`
+   P7.2 + `--step-layers`/`--compiled-step` P7.3) sont commités en deux
+   groupes plutôt que quatre commits stricts un-par-tâche — les fichiers
+   `Qwen4ExpLayerBench.swift` et `Qwen38CLI.swift` entremêlent les trois
+   tâches au niveau de la ligne (options CLI ajoutées côte à côte), et une
+   séparation stricte par `git add -p` sur un diff de cette taille était
+   jugée plus risquée (erreur de sélection de hunk) que le gain de
+   traçabilité.
+3. **P7.2** : capture obtenue mécaniquement (pas d'erreur), mais l'absence
+   de noms de noyau n'a pu être confirmée que par `strings` sur le binaire
+   du `.gputrace`, pas par une ouverture Xcode (indisponible dans cet
+   environnement) — documenté comme limite de vérification, pas comme un
+   échec de capture.
+4. **F7 retirée plutôt que « conservée à `.none` »** : traitement plus
+   strict que le précédent F1/F2/F4/F6 (« aucun gain, conservé ») parce que
+   F7 n'est pas neutre — elle est activement dangereuse (17,6× plus lent,
+   +36,7 Go de pic) si jamais activée. Écart assumé et documenté plutôt
+   qu'une application mécanique du même traitement que les leviers
+   précédents.
