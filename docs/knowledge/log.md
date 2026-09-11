@@ -3590,3 +3590,51 @@ composant de cette taille).
    +36,7 Go de pic) si jamais activée. Écart assumé et documenté plutôt
    qu'une application mécanique du même traitement que les leviers
    précédents.
+
+## 2026-09-11 — P7 revisité : le MoE du bench coûte 25× le même calcul écrit à la main
+
+Vérification de la conclusion de P7.1 (« le MoE routé domine, 88 % de la
+couche ») par comparaison avec MLX Python et par micro-bench Swift. Toutes les
+mesures ci-dessous sont reproductibles sans checkpoint.
+
+**1. Ce n'est ni le calcul ni la bande passante.** Les 10 experts routés
+représentent 49 M paramètres par couche, soit 0,10 GFLOP — 4,7 GFLOP par
+token sur 48 couches. À 6,6 tok/s cela fait **0,03 TFLOP/s** pour un M3 Max à
+~14 TFLOP/s de crête, et ~5,8 Go/s de bande passante pour ~400 Go/s
+disponibles. Le MoE ne calcule quasiment rien.
+
+**2. Ce n'est pas `gather_qmm`, ni la version de MLX.** En Python, mêmes
+formes (512 experts, 640×2560, 3 bits g64, M=1), coût **par op** avec un seul
+`eval` pour N ops : `gather_qmm` 0,035 ms, contre 0,028 ms pour un
+`quantized_matmul` dense sur les 10 experts déjà rassemblés — le gather ne
+coûte que **1,1×** le dense. Bloc MoE complet (routage + 3 `gather_qmm` +
+silu + réduction) : **0,138 ms** en ops indépendants, **0,168 ms** en chaîne
+dépendante (donc ce n'est pas non plus un effet de parallélisme). MLX 0.31.1
+(la version C++ embarquée par mlx-swift 0.31.6) et MLX 0.32.2 donnent le même
+chiffre à 1 % près : **la version de MLX n'est pas en cause**.
+
+**3. Coût fixe par op côté Swift** (`qwen38 op-overhead-probe`, Release,
+chaîne dépendante de 200 ops) : addition 8,79 µs, multiplication 6,80 µs,
+silu 6,94 µs, reshape 1,78 µs, et matmul `[1,2560]×[2560,2560]` bf16
+**65 µs** — soit 200 Go/s, la moitié de la crête : le GPU est sain. Python
+sur la même machine : 4,2 µs pour l'addition. Swift paie donc ~2× le coût
+hôte de Python par op, pas 10×.
+
+**4. La contradiction.** Ablation rejouée à la main (Release,
+`flash-layer-bench --layer-kind gdn --steps 200`) : couche complète
+**4,88 ms**, MoE ablaté **1,03 ms** ⇒ le MoE coûte **3,85 ms (79 %)**. Or un
+micro-bench Swift du **même** bloc (routage + 3 `gatherQuantizedMM` + silu +
+réduction, mêmes formes, chaîne dépendante) coûte **0,373 ms en Debug**, donc
+~0,1-0,2 ms en Release. **Écart d'un facteur ~25 entre le MoE du bench et le
+même calcul écrit à la main.** Ce n'est ni MLX, ni le gather, ni le matériel :
+c'est dans notre chemin `Qwen4ExpSparseMoE`/`SwitchGLU`.
+
+**5. Les sous-attributions de P7.1 ne tiennent pas.** Les trois ablations
+`moe` (1,03 ms), `moe-switch-mlp` (1,05) et `moe-routing` (0,97) font chacune
+tomber la couche au même niveau : chaque sous-ablation retire l'essentiel du
+coût, donc elles ne sont pas indépendantes et la répartition « switch_mlp
+86,9 % / routage ~0 % » n'en découle pas. À refaire avec des ablations qui
+n'ôtent que leur propre sous-bloc.
+
+Piste écartée en passant : `captureParity` est bien à `false` par défaut et le
+bench ne l'active pas.

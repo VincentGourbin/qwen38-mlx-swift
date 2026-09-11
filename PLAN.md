@@ -4026,3 +4026,23 @@ identiques à la référence en greedy et en MTP ; **jauge ≥ 9 tok/s non
 atteinte** (6,58 tok/s greedy, 8,30 tok/s MTP bloc 2) — aucun changement de
 comportement de production dans ce chantier. Détail complet :
 `docs/knowledge/log.md` « 2026-09-11 — P7 : débit de génération ».
+
+### P8 — Le MoE coûte 25× ce qu'il devrait : localiser et corriger — plan du 2026-09-11
+
+**Le fait** (`log.md` « P7 revisité ») : la couche GDN du bench coûte 4,88 ms,
+dont **3,85 ms de MoE (79 %)**, alors que le **même bloc écrit à la main en
+Swift** (routage + 3 `gatherQuantizedMM` + silu + réduction, mêmes formes)
+coûte ~0,1-0,2 ms en Release, et que MLX Python fait 0,168 ms. Ce n'est ni le
+calcul (0,03 TFLOP/s sur 14 de crête), ni la bande passante (5,8 Go/s sur
+400), ni `gather_qmm` (1,1× un dense équivalent), ni la version de MLX
+(0.31.1 ≡ 0.32.2), ni le matériel (un matmul bf16 atteint 200 Go/s). **C'est
+dans `Qwen4ExpSparseMoE` / `SwitchGLU`.** Si on ferme cet écart, le décodage
+passe de ~7 tok/s à ~25 tok/s sans rien fusionner.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P8.1 | **Chronométrer étage par étage** `Qwen4ExpSparseMoE.callAsFunction` : `gate` (matmul routeur), `softmax(precise:)`, `argPartition`, `takeAlong`+normalisation, `switchMLP(...)`, `weightedExpertSum`, expert partagé + sa gate, addition finale. Horloge `ContinuousClock` cumulée sur 200 pas, derrière un flag (`--moe-stages`) pour ne rien coûter en production, avec un `eval` par étage **uniquement** en mode diagnostic (sinon la mesure est fausse : les ops sont paresseuses). | tableau « étage · ms · % du MoE » ; la somme doit approcher 3,85 ms |
+| P8.2 | **Corriger l'étage dominant.** Suspects, par ordre de probabilité : (a) `weightedExpertSum` du Vendor (comparer au `(o * scores).sum(axis:-2)` écrit à la main, qui coûte ~0 en Python) ; (b) le passage par `SwitchGLU.callAsFunction` → `projectExperts` (`expandedDimensions(axes:[-2,-3])`, `doSort`, `squeezed`) ; (c) l'expert partagé et `sharedExpertGate` ; (d) `MLX.argPartition` sur 512 en Swift ; (e) une matérialisation cachée (`.item()`, `asArray`, copie) dans un de ces chemins. Corriger **uniquement** ce que P8.1 désigne, derrière `Qwen4ExpFusionLevel` si le changement touche la numérique, avec test de parité. | bench : ms/pas avant/après ; le MoE doit tomber sous 1 ms |
+| P8.3 | **Rendre les ablations indépendantes** : chaque flag ne doit ôter que son sous-bloc (aujourd'hui `moe`, `moe-switch-mlp` et `moe-routing` donnent toutes ~1 ms). Rejouer l'attribution complète GDN et QSA une fois P8.2 appliqué, et corriger l'entrée `log.md` de P7.1. | Σ des sous-blocs ≈ couche ±15 %, et chaque ablation retire un coût distinct |
+| P8.4 | **Budget d'ops** : compter les ops MLX réellement émis par couche (instrumentation ou lecture du code confrontée aux mesures), et confronter au coût fixe mesuré (8,79 µs/op en Release). Si `N × 8,79 µs` explique le reste de la couche après P8.2, le plafond structurel est connu et chiffré — c'est lui qui dira si une fusion Metal vaut encore la peine. | « N ops × µs = ms/couche » cohérent à ±25 % |
+| P8.5 | **Validation sur le checkpoint réel** (3-bit hybride SSD) : IDs identiques à la référence greedy, garde Q-B (10/28, −4,80), tok/s greedy et MTP avant/après, `BENCHMARKS.md`. | ≥ 12 tok/s si P8.2 tient ses promesses ; sinon consigner le plafond et sa cause |

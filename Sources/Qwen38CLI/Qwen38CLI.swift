@@ -2,6 +2,7 @@ import ArgumentParser
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXProfiler
 import Qwen38Core
 import Qwen38Server
@@ -37,7 +38,7 @@ struct Qwen38CLI: AsyncParsableCommand {
             Generate.self, MTPProbe.self, MTPParity.self,
             MTPConversationProbe.self,
             ConversationBenchmark.self,
-            ConversationParity.self, Download.self, Serve.self
+            ConversationParity.self, Download.self, Serve.self, OpOverheadProbe.self,
         ]
     )
 }
@@ -2094,6 +2095,40 @@ struct FlashSelectedLayersParity: AsyncParsableCommand {
         print("logits chaîne: max \(String(format: "%.6g", report.logitsMaxAbsoluteError))")
         print("token chaîne Swift/Python: \(report.swiftNextToken)/\(report.pythonNextToken) · \(report.tokensMatch ? "IDENTIQUE" : "DIFFÉRENT")")
         print("E1 token Swift/Python: \(logits.swiftTopToken)/\(logits.pythonTopToken) · rang Swift dans Python \(logits.swiftTokenRankInPython) · rang Python dans Swift \(logits.pythonTokenRankInSwift)")
+    }
+}
+
+/// Diagnostic P8 (2026-09-11) : coût fixe d'un op MLX côté Swift, comparé au
+/// même code en Python. Sert à savoir si le décodage est limité par le nombre
+/// d'ops émis plutôt que par le calcul.
+struct OpOverheadProbe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "op-overhead-probe",
+        abstract: "Mesurer le coût fixe par op MLX (chaîne dépendante, sans checkpoint)")
+
+    @Option(name: .long, help: "Nombre d'ops par chaîne") var chain = 200
+    @Option(name: .long, help: "Répétitions") var reps = 20
+
+    func run() async throws {
+        _ = Device.defaultDevice()
+        let dim = 2560
+        var seed = MLXArray.ones([1, 1, dim], dtype: .bfloat16)
+        eval(seed)
+        func measure(_ label: String, _ body: (MLXArray) -> MLXArray) {
+            for _ in 0 ..< 3 { var y = seed; for _ in 0 ..< chain { y = body(y) }; eval(y) }
+            let start = Date()
+            for _ in 0 ..< reps { var y = seed; for _ in 0 ..< chain { y = body(y) }; eval(y) }
+            let us = Date().timeIntervalSince(start) * 1e6 / Double(reps) / Double(chain)
+            print("\(label.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%8.2f", us)) µs/op")
+        }
+        measure("addition scalaire [1,1,2560]") { $0 + 1.0 }
+        measure("multiplication élémentaire") { $0 * $0 }
+        measure("silu") { MLXNN.silu($0) }
+        measure("reshape (sans calcul)") { $0.reshaped([1, dim, 1]).reshaped([1, 1, dim]) }
+        let w = MLXArray.ones([dim, dim], dtype: .bfloat16); eval(w)
+        measure("matmul [1,2560]×[2560,2560]") { $0.reshaped([1, dim]).matmul(w).reshaped([1, 1, dim]) }
+        seed = MLXArray.ones([1, 1, dim], dtype: .bfloat16); eval(seed)
+        print("référence Python MLX 0.31.1 sur la même machine : 4,2 µs/op (addition élémentaire)")
     }
 }
 
