@@ -4046,3 +4046,19 @@ passe de ~7 tok/s à ~25 tok/s sans rien fusionner.
 | P8.3 | **Rendre les ablations indépendantes** : chaque flag ne doit ôter que son sous-bloc (aujourd'hui `moe`, `moe-switch-mlp` et `moe-routing` donnent toutes ~1 ms). Rejouer l'attribution complète GDN et QSA une fois P8.2 appliqué, et corriger l'entrée `log.md` de P7.1. | Σ des sous-blocs ≈ couche ±15 %, et chaque ablation retire un coût distinct |
 | P8.4 | **Budget d'ops** : compter les ops MLX réellement émis par couche (instrumentation ou lecture du code confrontée aux mesures), et confronter au coût fixe mesuré (8,79 µs/op en Release). Si `N × 8,79 µs` explique le reste de la couche après P8.2, le plafond structurel est connu et chiffré — c'est lui qui dira si une fusion Metal vaut encore la peine. | « N ops × µs = ms/couche » cohérent à ±25 % |
 | P8.5 | **Validation sur le checkpoint réel** (3-bit hybride SSD) : IDs identiques à la référence greedy, garde Q-B (10/28, −4,80), tok/s greedy et MTP avant/après, `BENCHMARKS.md`. | ≥ 12 tok/s si P8.2 tient ses promesses ; sinon consigner le plafond et sa cause |
+
+**Statut (2026-09-11) : P8.1-P8.5 terminées.** Le MoE n'était pas le
+coupable : `switch_mlp` isolé coûte 150-350 µs (`op-overhead-probe`), pas
+4 ms — la couche entière (GDN et QSA) héritait d'une fuite fp32 externe au
+MoE (`gatedDeltaUpdate`/`Qwen4ExpMRoPE`, précision interne fp32 par
+conception, jamais recastée en bf16 avant la suite de la couche). Corrigé
+par `Qwen4ExpFusionLevel.f7GatedBranchDtype` (F7, sans lien avec l'ancien
+F7 de P7.4, retiré) : GDN 4,88→1,15 ms (×4,1), QSA 5,2→1,5 ms (×3,5), sur
+le checkpoint réel greedy 6,58→18,58 tok/s (×2,74, jauge ≥12 tok/s
+**atteinte**), MTP 8,30→10,02 tok/s (×1,40 mais mesuré via `--fusion-level`
+seulement câblé sur `flash-generate-probe`, pas encore sur
+`Qwen38Runtime`), IDs et garde Q-B inchangés (Q-B même légèrement
+meilleure). Défaut de production laissé à `.none` (F7 opt-in), comme
+F1-F6, par prudence — bascule recommandée mais non actée, décision à
+Vincent. Détail complet : `docs/knowledge/log.md` « 2026-09-11 — P8 : le
+MoE ne coûtait pas 25× ».

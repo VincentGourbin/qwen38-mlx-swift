@@ -138,6 +138,44 @@ de `Vendor/mlx-swift-lm` — non modifiable sans toucher le paquet vendored
 (interdit) ni réimplémentable à la main dans le temps disponible avec un
 harnais de parité suffisant.
 
+### P8 — la fuite fp32 GDN/QSA (F7), pas le MoE : ×2,7-4,1 sur le checkpoint réel (2026-09-11)
+
+Le « MoE domine à 78-88 % » de P7 était correct comme mesure mais faux
+comme diagnostic : `SwitchGLU` isolé coûte 150-350 µs (`op-overhead-probe`),
+pas 4 ms — sauf entrée `.float32`, où il retombe exactement sur ce chiffre.
+GDN (`gatedDeltaUpdate`, état récurrent fp32 par conception) et QSA
+(`Qwen4ExpMRoPE`, tables `cos`/`sin` fp32 par conception) ne recastaient
+jamais leur sortie en bf16 avant de la transmettre à la suite de la couche
+— MoE y compris, qui héritait donc d'une entrée fp32 et tournait tout
+entier sur le chemin lent. Nouveau niveau `Qwen4ExpFusionLevel.f7GatedBranchDtype`
+(F7, sans lien avec l'ancien F7 de P7.4, retiré) : arrondit au bon
+endroit dans les deux branches. Détail complet (étages, ablations
+rejouées, budget d'ops, checkpoint) : `docs/knowledge/log.md`
+« 2026-09-11 — P8 : le MoE ne coûtait pas 25× ».
+
+| Couche (bench synthétique) | `--fusion-level 0` | `--fusion-level 7` | Δ |
+|---|---:|---:|---:|
+| GDN | 4,77-4,88 ms | 1,10-1,16 ms | ×4,1-4,3 |
+| QSA | 5,19-5,24 ms | 1,45-2,40 ms | ×2,2-3,6 |
+
+Checkpoint réel (3-bit hybride SSD, prompt de référence, 32 tokens,
+`--resident-async-interval 8`, IDs identiques à la référence et entre
+avant/après dans tous les cas, garde Q-B stable ou meilleure) :
+
+| Variante | avant | après | Δ |
+|---|---:|---:|---:|
+| Greedy | 6,78 tok/s | **18,58 tok/s** | ×2,74 |
+| MTP bloc 2 | 7,14 tok/s | 10,02 tok/s | ×1,40 |
+
+Jauge ≥ 12 tok/s (PLAN.md P8.5) : **atteinte** en greedy (×1,55 la cible) ;
+MTP en progrès net (+40 %) mais sous la cible en absolu — `Qwen38Runtime`/
+GUI/serveur ne branchent pas encore `--fusion-level` sur le chemin MTP.
+**Défaut de production inchangé** (`fusionLevel: .none`, F7 reste opt-in
+`--fusion-level 7`) : gain nettement supérieur à F1-F6 mais bascule du
+défaut laissée à la décision de Vincent, par prudence (précédent F7-de-P7.4,
+désastreux sur checkpoint réel malgré un bench propre), pas par doute sur
+le résultat.
+
 ### P5.4 — préfill 2 543 tokens : la couche PLE domine, routage shard O(n) au lieu de O(shards×n) (2026-09-10)
 
 Deux tours `flash-chat-probe --resident-layers --resident-async --profile-layers

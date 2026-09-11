@@ -3638,3 +3638,377 @@ n'ôtent que leur propre sous-bloc.
 
 Piste écartée en passant : `captureParity` est bien à `false` par défaut et le
 bench ne l'active pas.
+
+## 2026-09-11 — P8 : le MoE ne coûtait pas 25× — une fuite fp32 dans GDN/QSA, corrigée (F7)
+
+Protocole PLAN.md « P8 — Le MoE coûte 25× ce qu'il devrait : localiser et
+corriger » (2026-09-11), P8.1 → P8.5. Verdict : **le MoE n'a jamais été le
+coupable.** L'instrumentation par étage (P8.1) a semblé le confirmer, mais
+en creusant *pourquoi* `SwitchGLU` coûtait 4 ms en contexte de couche alors
+qu'il coûte 150-350 µs isolé, la cause s'est révélée être une fuite de
+dtype : les branches GDN et QSA calculent (à dessein, piège #6) une partie
+de leur état en float32, mais ne l'arrondissent jamais à bf16 avant de le
+transmettre à la suite de la couche — MoE y compris. Tout ce qui suit
+(gate, softmax, `switch_mlp`, expert partagé…) tourne alors sur son chemin
+fp32, ~12-27× plus lent que le chemin bf16 pour le même calcul. Corriger
+cette seule fuite (F7) fait passer une couche GDN de 4,8 ms à 1,15 ms
+(×4,1) et une couche QSA de 5,2 ms à 1,5 ms (×3,5), **sans toucher au
+MoE ni à `Vendor/`**, et sur le checkpoint réel : IDs greedy identiques à
+la référence, garde Q-B toujours PASS, decode ×2,7 (greedy) et ×1,4 (MTP).
+
+### P8.1 — chronométrage par étage : un `eval` par étage, un coupable qui ne résiste pas à l'isolement
+
+Nouveau `Qwen4ExpMoEStageProfiler` (`Qwen4ExpSparseMoE.swift`) : threadé
+comme `ablation`, non-nil uniquement sous `flash-layer-bench --moe-stages`
+(jamais en production). Quand actif, `Qwen4ExpSparseMoE.callAsFunction`
+bascule sur `callWithStageProfiling`, qui chronomètre chaque étage
+(`gate`, `softmax`, `argPartition`, `takeAlong+normalize`, `switchMLP`,
+`weightedExpertSum`, `sharedExpertGate`, `sharedExpert`, `shared-combine`,
+`add`) en forçant un `eval()` après chacun — **avant P8.1 lui-même**, la
+première tentative (non conservée) mesurait sans `eval` intermédiaire et
+attribuait donc tout au dernier étage forcé, exactement le piège que le
+plan demandait d'éviter. Une baseline dédiée (`eval()` sur un tableau déjà
+évalué, 2000 appels) mesure le coût d'une synchro « à vide » : 0,0002 ms —
+négligeable, donc la somme des étages n'est pas gonflée par un simple
+compteur d'appels `eval()`.
+
+**Tableau, couche GDN, `--fusion-level 0` (chemin d'origine)** :
+
+| Étage | ms/pas | % du total étages |
+|---|---:|---:|
+| gate | 0,8647 | 13,2 % |
+| softmax | 0,1833 | 2,8 % |
+| argPartition | 0,2060 | 3,1 % |
+| takeAlong+normalize | 0,1952 | 3,0 % |
+| **switchMLP** | **4,0575** | **62,0 %** |
+| weightedExpertSum | 0,2187 | 3,3 % |
+| sharedExpertGate | 0,2186 | 3,3 % |
+| sharedExpert | 0,2503 | 3,8 % |
+| shared-combine | 0,1783 | 2,7 % |
+| add | 0,1749 | 2,7 % |
+| **somme des étages** | **6,5476** | — |
+
+La somme (6,55 ms) dépasse la couche non instrumentée (4,88 ms) : chaque
+`eval()` forcé casse la fusion/le regroupement que MLX aurait fait
+paresseusement, donc cette somme **n'est pas** directement comparable à la
+mesure de production — c'est un instrument de localisation, pas une
+mesure de coût réel (documenté explicitement dans le code et ici, comme
+demandé). `switchMLP` domine sans ambiguïté (62 %, ~20× le deuxième
+étage) : verdict identique à P7.1, mais cette fois avec un vrai isolement
+par synchronisation plutôt que par soustraction d'ablations qui se sont
+révélées non indépendantes (P8.3).
+
+**Le tournant** : `op-overhead-probe` étendu avec un micro-bench de
+`SwitchGLU` seul (512 experts, 640 intermédiaire, top-10, 4 bits g32 —
+mêmes dimensions que le bench), construit et pesé hors de
+`Qwen4ExpSparseMoE`/`Qwen4ExpDecoderLayer` :
+
+| Mesure | µs/appel |
+|---|---:|
+| `SwitchGLU` seul, chaîne dépendante (200 appels, un seul `eval` final), entrée `.bfloat16` | 150-153 |
+| idem, indices dispersés au lieu de `[0..9]` séquentiels | 153 (aucune différence — écarte l'hypothèse d'un gather mémoire défavorable) |
+| `SwitchGLU` seul, **un `eval` par appel**, entrée `.bfloat16` | 342-350 |
+| `SwitchGLU` seul, **un `eval` par appel**, entrée **`.float16`** | — (voir plus bas) |
+| `SwitchGLU` seul, **un `eval` par appel**, entrée **`.float32`** | **4021,95** |
+
+`SwitchGLU` isolé ne coûte que 150-350 µs — 12-27× moins que les 4,06 ms
+mesurés en contexte de couche — **sauf quand on lui donne du float32 en
+entrée**, où il retombe exactement sur le même ordre de grandeur (4,02 ms)
+que le chiffre « en couche ». `compiledSiluProduct`/`weightedExpertSum`
+(les deux fermetures `MLX.compile(shapeless: true)` utilisées par
+`SwitchGLU`/`Qwen4ExpSparseMoE`) ont aussi été mesurées directement contre
+leur équivalent non compilé : aucun surcoût (silu×up compilé 4,0 µs contre
+5,6 µs non compilé ; réduction pondérée compilée 11,2 µs contre 11,3 µs
+non compilée) — **hypothèse (e) du plan (surcoût d'appel `compile()`)
+écartée par la mesure**, tout comme (a) `weightedExpertSum` (déjà la
+formule écrite à la main), (b) le passage par `SwitchGLU.callAsFunction`
+(coût réel mesuré, cf. ci-dessus) et (d) `argPartition` (0,21 ms, dans le
+bruit). Reste (c)/nouveau : une matérialisation en float32 quelque part en
+amont de `Qwen4ExpSparseMoE`.
+
+Un `DEBUG` temporaire (retiré avant commit) dans `Qwen4ExpDecoderLayer` a
+confirmé : `attentionMix.mixedInput` est bf16, mais **la sortie de la
+branche d'attention (GDN et QSA) est float32** — la fuite est dans
+l'attention, pas dans MoE. Deux causes distinctes, une par type de couche :
+
+- **GDN** (`Qwen4ExpGatedDeltaNet.callAsFunction`) : `gatedDeltaUpdate`
+  (le noyau delta-rule récurrent) rend son état en float32 par conception
+  (piège #6 — précision de l'état récurrent). Son résultat `out` est passé
+  tel quel à `norm(out, gate: z)` (`Qwen4ExpRMSNormGated`), dont le
+  commentaire dit explicitement « round once at the branch boundary » —
+  mais son `.asType(inputs.dtype)` final arrondit à *son propre* `inputs`
+  local (= `out`, float32), donc à un no-op, pas au bf16 du réseau.
+- **QSA** (`Qwen4ExpQSAAttention.callAsFunction`) : `Qwen4ExpMRoPE.apply`
+  mélange q/k (bf16) avec des tables `cos`/`sin` délibérément construites
+  en float32 (piège #6 — précision du RoPE) ; `rotated * cosB + rotateHalf
+  * sinB` promeut donc le résultat en float32, sans jamais redescendre en
+  bf16 ensuite.
+
+Dans les deux cas, la fuite se propage sans interruption jusqu'à
+`Qwen4ExpSparseMoE.callAsFunction` (rien en aval ne recaste), qui hérite
+donc d'un `x` float32 et exécute tout son chemin — gate, `switch_mlp`,
+expert partagé — en float32. **Verdict P8.1 révisé : le sous-bloc qui
+domine la mesure (`switch_mlp`) n'est pas la cause ; il est la victime la
+plus visible d'une fuite de dtype dans la branche d'attention qui le
+précède.**
+
+### P8.2 — F7 : arrondir au bon endroit, pas avant
+
+Nouveau niveau `Qwen4ExpFusionLevel.f7GatedBranchDtype = 7` (sans lien
+avec l'ancien F7 de P7.4, retiré — même numéro réutilisé, sémantique et
+risque totalement différents, signalé explicitement dans le code pour
+qu'une session future ne confonde pas les deux) :
+
+- **GDN** : au lieu d'arrondir `out` *avant* `norm(out, gate: z)` (ce qui
+  jetterait la précision fp32 que la réduction `MLXFast.rmsNorm` est censée
+  exploiter — vérifié : ça ne change pas la taille de l'écart de parité,
+  seulement son signe), F7 laisse `norm` tourner sur le `out` fp32 brut
+  (comportement inchangé pour la normalisation elle-même) et ajoute
+  l'arrondi **après**, sur la sortie de `norm` : `gatedNorm.asType(inputs.dtype)`
+  où `inputs` est bien le paramètre externe de `callAsFunction` (le bf16
+  du réseau), pas le `inputs` local de `Qwen4ExpRMSNormGated`.
+- **QSA** : après les deux appels `rotaryEmbedding.apply(queries/keys,
+  positionIDs:)`, F7 ajoute `queries = queries.asType(hiddenStates.dtype)`
+  / idem pour `keys`, restaurant le bf16 avant que SDPA ne s'exécute.
+
+Threadé comme `ablation` : `fusionLevel` ajouté aux inits de
+`Qwen4ExpGatedDeltaNet`/`Qwen4ExpQSAAttention` (défaut `.none`, comme
+partout), et `Qwen4ExpDecoderLayer` le leur transmet désormais (avant
+cette tâche, seul `Qwen4ExpSparseMoE` le recevait). Deux nouveaux tests
+(« P8.2 (F7) : la branche GDN/QSA ne fuit plus en float32 sans F7 actif »)
+pinguent le dtype de sortie de chaque branche avec/sans F7 sur un spec de
+quantification explicite (un `Linear` non quantifié par défaut a un poids
+float32, ce qui aurait masqué la fuite) — 89 tests verts au total
+(87 + ces 2).
+
+**Gain mesuré (bench synthétique, `flash-layer-bench --steps 200-400`)** :
+
+| Couche | `--fusion-level 0` | `--fusion-level 6` (F1-F6, sans F7) | `--fusion-level 7` (+F7) | Δ (0→7) |
+|---|---:|---:|---:|---:|
+| GDN | 4,77-4,88 ms | 4,72 ms (aucun gain — confirme que F1-F6 n'y sont pour rien) | **1,10-1,16 ms** | **×4,1-4,3** |
+| QSA | 5,19-5,24 ms | 5,15 ms | **1,45-2,40 ms** (bruit plus élevé, voir P8.3) | **×2,2-3,6** |
+| GDN, experts 3-bit g64 réels | 3,03 ms | — | **1,10 ms** | ×2,8 |
+
+`--ablate moe` après F7 : GDN 1,15 → 0,90-1,00 ms (MoE tombe à ~0,15-0,26 ms,
+conforme aux 0,138-0,168 ms Python/écrit-à-la-main de la revue P7 — l'écart
+« ×25 » d'origine est refermé, et il l'est *sans* toucher à
+`Qwen4ExpSparseMoE`/`SwitchGLU`/`Vendor/`).
+
+**Parité — un choix méthodologique délibéré, documenté dans le code** :
+`flash-layer-bench --check-parity --fusion-level 7` **échoue** sur le
+bench synthétique (poids aléatoires, 32 pas) : diff abs max 0,7-2,6 selon
+la couche, dès le premier pas (donc pas un artefact d'accumulation
+récurrente). C'est **attendu et correct**, pas un bug : contrairement à
+F1-F6 (réordonnancements exacts, censés être bit-identiques à `.none`),
+F7 corrige un bug qui changeait déjà les valeurs — comparer son résultat à
+la baseline *buguée* avec une tolérance 1e-3 revient à exiger qu'il
+reproduise le bug. Reproduit aussi en isolant le phénomène : réactiver
+`.bfloat16` (au lieu de `.float16`, la convention pré-existante de ce
+harnais) dans les *entrées* de `checkParity`/`checkMultiLayerStepParity`
+fait échouer un test **F1/F2 déjà validé et sans rapport avec F7**
+(« P2-fusion (F1/F2) », QSA, diff relative 5824×) : la mantisse plus
+grossière de bf16 (7 bits contre 10 pour float16) rapproche le bruit de
+réordonnancement, pourtant prouvé exact, du seuil d'amplification
+chaotique déjà documenté pour GDN/QSA sur poids aléatoires non entraînés
+(P7.3, divergence `compile` vs eager croissante avec le nombre de
+couches). Décision : `run`/`runMultiLayerStep` (mesure de *débit*, doivent
+refléter le dtype réel du checkpoint) passent en `.bfloat16` ; `checkParity`/
+`checkMultiLayerStepParity` (comparent deux chemins entre eux, pas de
+raison de changer leur dtype) restent en `.float16`, avec un commentaire
+expliquant pourquoi — écart au « bit-exact si possible, 1e-3 sinon » de la
+consigne, justifié et documenté plutôt qu'un test relâché en silence.
+
+**La validation qui fait foi est le checkpoint réel** (poids entraînés,
+dynamique bien conditionnée — voir P8.5) : IDs greedy **identiques**,
+0/0 régression sur la garde Q-B (elle s'améliore même légèrement,
+−4,80 → −4,68). PLAN.md §6.1 point 3 a déjà acté l'abandon de l'identité
+bit-à-bit avec une référence Python comme objectif du projet ; ce choix
+est cohérent avec ça.
+
+**Défaut de production inchangé** : `Qwen4ExpCheckpointLayerLoader`/
+`Qwen4ExpStreamingTextModel`/`Qwen4ExpStreamingDecoder` restent à
+`fusionLevel: .none` — comme F1-F6 avant elle (« validées » mais jamais
+activées par défaut), F7 reste strictement opt-in (`--fusion-level 7`),
+malgré un gain nettement supérieur à F1-F6. Décision assumée par prudence
+(précédent F7-de-P7.4 : validée sur bench, désastreuse sur checkpoint réel
+avant d'être testée en conditions réelles) plutôt que par doute sur le
+résultat — **recommandation explicite à Vincent** : les preuves
+réunies ici (gain ×2,7-4,1 sur checkpoint réel, IDs identiques, mémoire
++0,44-1,13 Go seulement, Q-B stable ou meilleure) justifient de basculer
+le défaut, mais c'est une décision produit qui n'a pas été prise
+unilatéralement dans cette tâche.
+
+### P8.3 — ablations rejouées : elles étaient déjà indépendantes, `switch_mlp` les écrasait toutes
+
+P7-revisité (2026-09-11, entrée précédente) avait noté que `moe`,
+`moe-switch-mlp` et `moe-routing` s'effondraient toutes au même niveau
+(~1 ms) et en avait conclu qu'elles n'étaient « pas indépendantes ». Relu
+avec le code sous les yeux : chaque ablation *est* logiquement bien
+définie et cible une combinaison distincte et documentée (`moe-switch-mlp`
+zère `switch_mlp` seul, garde le routeur et l'expert partagé réels ;
+`moe-routing` zère `switch_mlp` et l'expert partagé, garde le routeur réel ;
+`moe-shared-expert` zère l'expert partagé seul). Le symptôme observé
+n'était pas une non-indépendance du câblage, mais la conséquence directe
+de la fuite fp32 : `switch_mlp` pesait 79-88 % de la couche, donc **toute**
+ablation qui l'annule fait mécaniquement retomber la couche au même
+plancher, quel que soit ce qu'elle ablate en plus. Rejouées après F7 (où
+`switch_mlp` ne pèse plus que 15-20 % du budget MoE), les mêmes ablations
+donnent des coûts nettement distincts — aucun changement de code n'était
+nécessaire, seulement la correction de la cause qui les écrasait :
+
+**GDN** (`--fusion-level 7`, `--steps 300`, baseline `.none`(ablation)
+≈ 1,11-1,16 ms) :
+
+| Ablation | ms/pas | Coût isolé (baseline − ablation) |
+|---|---:|---:|
+| `moe` (tout le MoE) | 0,90 | ~0,21-0,26 ms |
+| `moe-switch-mlp` | 0,95 | ~0,16-0,21 ms |
+| `moe-routing` (switch_mlp+partagé) | 0,87 | ~0,24-0,29 ms |
+| `moe-shared-expert` | 1,13 | ~0,00-0,03 ms (bruit) |
+| `gdn-recurrence` | 1,08 | ~0,03-0,08 ms |
+| `gdn-projections` | 0,95 | ~0,16-0,21 ms |
+| `hyper` (mix hyper-connections) | 0,83 | ~0,28-0,33 ms — désormais le plus gros poste nommé |
+| `norms` | 1,09 | ~0,02-0,07 ms (bruit) |
+
+Σ sous-blocs nommés ≈ 0,70-0,95 ms sur 1,11-1,16 ms (63-82 %, hors
+fourchette ±15 % de la consigne P7.1 originale) — mais c'est maintenant un
+**bruit de mesure à l'échelle sous-milliseconde** (p90 souvent 20-30 %
+au-dessus de la médiane à ce niveau), pas un sous-bloc ccaché : aucune
+ablation ne dépasse ~0,3 ms.
+
+**QSA** (mêmes réglages, baseline ≈ 1,45-2,40 ms selon le run — bruit
+sensiblement plus élevé que GDN, cohérent avec le résidu déjà documenté en
+P7.1 pour les projections q/k/v/o + RoPE, qui n'ont pas de case
+d'ablation dédiée) :
+
+| Ablation | ms/pas | Coût isolé |
+|---|---:|---:|
+| `moe` | 1,24 | ~0,26 ms |
+| `moe-switch-mlp` | 1,30 | ~0,20 ms |
+| `moe-routing` | 1,21 | ~0,29 ms |
+| `moe-shared-expert` | 1,48 | ~0,02 ms (bruit) |
+| `qsa-attn` (SDPA+indexeur) | 1,25 | ~0,25 ms |
+
+Σ nommés ≈ 0,51 ms sur ~1,50 ms (34 %) — le résidu (q/k/v/o+RoPE, sans
+case dédiée) est maintenant *proportionnellement* plus large qu'en P7.1
+puisque le MoE, qui dominait, a fondu : lacune de découpage déjà assumée
+en P7.1, pas un artefact nouveau.
+
+**Correctif à l'entrée `log.md` de P7.1** (2026-09-11, « P7 : débit de
+génération ») : le tableau qui y attribue 86,9 % de la couche à
+`switch_mlp` et ~0 % au routage/à l'expert partagé reste **vrai comme
+mesure brute avant F7**, mais son interprétation (« switch_mlp domine
+intrinsèquement ») est **incorrecte** — la mesure était dominée par une
+fuite de dtype externe à `Qwen4ExpSparseMoE`, pas par un coût propre à
+`switch_mlp`/`SwitchGLU`. Voir cette entrée (2026-09-11, « P8 ») pour
+l'attribution corrigée. Rectificatif ajouté ici plutôt que réécrit dans
+l'entrée d'origine, comme demandé.
+
+### P8.4 — budget d'ops : la fusion redevient pertinente
+
+Comptage par lecture du code (pas d'instrumentation automatique — écart
+documenté ci-dessous), pour la configuration réellement mesurée
+(`--fusion-level 7`, donc F1 projections fusionnées + F2 normes
+précalculées + F7 actifs), confronté au coût fixe mesuré par
+`op-overhead-probe` (8,79 µs/op, addition élémentaire en Release) :
+
+| Couche | Ops comptés (approx.) | N × 8,79 µs | Mesuré | Écart |
+|---|---:|---:|---:|---:|
+| GDN | ~106 (44 hyper-connections ×2, 27 attention GDN, 10 injections ×2, 25 MoE) | 0,93 ms | 1,11-1,16 ms | 18-20 % |
+| QSA | ~144 (44 hyper-connections, 65 attention QSA dont ~18 estimés pour l'indexeur, 10 injections, 25 MoE) | 1,27 ms | 1,45-1,50 ms | 12-15 % |
+
+Les deux couches tombent **dans la fourchette ±25 %** demandée par la
+consigne. **Conclusion, qui inverse celle de P7.6/P4.3** : une fois la
+fuite fp32 corrigée, le coût restant d'une couche (~1-1,5 ms) est
+maintenant majoritairement expliqué par le nombre d'ops × leur coût de
+dispatch hôte fixe, pas par un poste unique — P7.6 avait raison de dire
+« le goulot n'est pas le bookkeeping hôte de petits noyaux », mais
+seulement *tant que la fuite dominait* (elle absorbait ~80 % du budget de
+couche, masquant le reste). Elle ne domine plus : **une fusion Metal
+(regrouper plusieurs des ~100-145 ops d'une couche en quelques noyaux
+maison) redeviendrait un levier proportionnellement utile** — contrairement
+à la tentative F7-de-P7.4, qui ciblait `switch_mlp` (le symptôme) plutôt
+que la vraie source du budget d'ops restant (hyper-connections, MoE au
+grand complet, indexeur QSA). Non tentée dans cette tâche (hors périmètre
+P8, qui est diagnostic + correctif ciblé, pas une nouvelle fusion) —
+piste consignée pour une tâche future.
+
+### P8.5 — validation sur le checkpoint réel
+
+`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
+hybride SSD interne). `pgrep -x qwen38-bench-ui` négatif avant chaque run.
+`Scripts/preflight-resident.sh` avec `QWEN38_PREFLIGHT_LIMIT_GB=35` (25,3 Go
+à évincer, sous le seuil retenu pour cette tâche) : PASS. Tous les runs
+sous `caffeinate -dimsu`. `flash-generate-probe`/`flash-chat-probe` gagnent
+`--fusion-level` (jusqu'ici seul `flash-chat-probe` l'avait) pour pouvoir
+comparer avant/après sur le checkpoint réel, y compris en MTP.
+
+Prompt de référence, `--temperature 0`, 32 tokens, `--resident-layers
+--resident-async --resident-async-interval 8` (greedy) / `--mtp
+--mtp-block-size 2` (MTP) :
+
+| | avant (`--fusion-level 0`) | après (`--fusion-level 7`) | Δ |
+|---|---:|---:|---:|
+| Greedy decode (32 tok) | 4,720 s (0,1475 s/tok, **6,78 tok/s**) | 1,720 s (0,0538 s/tok, **18,58 tok/s**) | **×2,74** |
+| MTP bloc 2 decode (32 tok) | 4,482 s (0,1401 s/tok, **7,14 tok/s**) | 3,193 s (0,0998 s/tok, **10,02 tok/s**) | **×1,40** |
+| MLX pic (greedy) | 56,99 Go | 57,43 Go | +0,44 Go |
+| MLX pic (MTP) | 57,87 Go | 59,00 Go | +1,13 Go |
+| IDs greedy = référence | oui | oui (bit-identiques à l'avant aussi) | — |
+| MTP accepté/proposé | 10/21 (47,6 %) | 11/20 (55,0 %) | quasi-égalité (PM4.4) |
+
+IDs générés (greedy et MTP, avant et après, tous identiques) :
+`[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501,
+4372, 41196, 67763, 85041, 3717, 181876, 8358, 3717, 179342, 47561, 68,
+215309, 11, 501, 183435, 401, 1147, 9364, 198070, 175030]` — exactement la
+référence attendue (« Le président de la Chine est Xi Jinping. Il est le
+Secrétaire général du Comité central du Parti communiste chinois, le
+Président de la Commission militaire centrale »).
+
+Garde Q-B (`flashTeacherForcedRegressionGuardV32`, nouveau
+`QWEN38_FUSION_LEVEL` en variable d'environnement pour la rejouer sous un
+niveau de fusion donné sans toucher au défaut de production) :
+
+| | avant (`.none`) | après (F7) |
+|---|---:|---:|
+| hits | 10/28 | 10/28 |
+| meanLogProb | −4,8003182 (référence exacte) | −4,678542 (légèrement meilleur) |
+
+**Jauge ≥ 12 tok/s (P8.5) : ATTEINTE pour le greedy** (18,58 tok/s, ×1,55
+la cible). **MTP** : 10,02 tok/s, sous la cible en valeur absolue mais
++40 % — `Qwen38Runtime`/la GUI/le serveur ne branchent pas encore
+`--fusion-level` sur le chemin MTP (seul `flash-generate-probe --mtp` l'a,
+ajouté pour cette validation) ; le chiffre MTP « après » est donc une
+borne basse de ce qu'un déploiement réel obtiendrait une fois le défaut de
+production aligné sur F7. `Scripts/run-tests.sh` : 89 tests verts (87 +
+2 nouveaux P8.2). `Scripts/build-release.sh` : BUILD SUCCEEDED tout au
+long de la session.
+
+### Écarts à la consigne P8
+
+1. **Commits regroupés** : P8.1 (instrumentation) et P8.2 (correctif F7)
+   sont commités ensemble — les deux touchent les mêmes fichiers
+   (`Qwen4ExpSparseMoE.swift`, `Qwen38CLI.swift`) et sont causalement liés
+   (l'instrumentation a mené directement au diagnostic puis au correctif
+   dans la même session) ; séparer par `git add -p` sur ce diff aurait été
+   plus risqué que le gain de traçabilité (même raisonnement que la
+   déviation n°2 de P7). P8.3-P8.5 (aucun changement de code sauf les
+   petits ajouts CLI/tests de validation P8.5) sont commités ensemble
+   séparément.
+2. **Défaut de production non modifié** : voir P8.2 — décision assumée,
+   pas un oubli, présentée à Vincent comme recommandation plutôt
+   qu'appliquée unilatéralement.
+3. **Parité `--check-parity --fusion-level 7` en échec sur le bench
+   synthétique** : voir P8.2 — comportement attendu et documenté dans le
+   code, la validation qui fait foi (checkpoint réel) passe sans réserve.
+4. **P8.4 par lecture de code, pas par instrumentation automatique** :
+   aucun compteur d'ops n'existait dans le dépôt et MLX_METAL_DEBUG reste
+   indisponible (obstacle déjà documenté en P7.2) ; le compte pour
+   l'indexeur QSA (~18 ops) est une estimation, pas un décompte ligne à
+   ligne exhaustif — signalé explicitement, l'accord à ±25 % avec la
+   mesure tient malgré cette approximation.
+5. **MTP sans `--fusion-level` dans `Qwen38Runtime`** : seul
+   `flash-generate-probe` (probe CLI) a reçu l'option pour cette tâche ;
+   `Qwen38Runtime.load`/la GUI/`serve` n'exposent pas encore F7 sur le
+   chemin MTP — cohérent avec la décision de ne pas changer le défaut de
+   production (point 2), documenté comme limite de portée plutôt que
+   contourné.
