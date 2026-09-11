@@ -1,0 +1,14 @@
+mode : MTP Flash-Next local · bloc 2
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 2831, 35316, 1649, 85648, 401, 1147, 182326, 188209, 401, 183085, 11, 3687, 9370, 501, 176517, 401, 28736, 401, 324, 6, 184267, 1778, 174912]
+decoded: "Le président de la Chine est Xi Jinping. En tant que président de la République populaire de Chine, il assume le rôle de chef de l\'État et joue"
+TTFT: 105.891s
+prefill: 105.744s
+decode: 23.043s
+couches: 1152 visites · load cumulé 101.650s · forward cumulé 26.115s
+MTP : 8/23 acceptés · 23 rounds · 15 rollbacks · 0 tokens rejoués · 46 tokens vérifiés
+accept rate MTP : 34.8%
+MTP step timings (ContinuousClock, cumulé) : draftBlock 0.001s · verify 22.255s · targetIDs 0.010s · rollback 0.004s · commit 0.772s · total 23.041s
+MLX mémoire active: 78,95 GB
+P6.2 PLE lookup : 24 appels · 72 MLXArray construits · 24 dequantize · lecture hôte cumulée 1.1471s
+MLX mémoire peak: 81,3 GB

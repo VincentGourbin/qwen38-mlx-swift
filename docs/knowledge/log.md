@@ -3255,3 +3255,40 @@ avec P5.6 (76 tours, avec `conversation_id`) : `BENCHMARKS.md` « P6.6 ».
 Fichiers : `results/p66/dialogue.jsonl`, `results/p66/dialogue.log`,
 `results/p66/server.log` (rapport profiler complet), `results/p66/
 serve.trace.json` (non versionnée, gitignore).
+
+## 2026-09-11 — PM4.4 : acceptation MTP sur le 4-bit — le 3-bit ne bride pas le drafter
+
+Machine rebootée (8,6 Go d'anonyme, compresseur et swap à zéro), Release,
+résident, `asyncEval`, prompt de référence, 32 tokens.
+
+| | 3-bit (PM4.3) | **4-bit (PM4.4)** |
+|---|---|---|
+| Acceptation MTP bloc 2 | 47,6 % (10/21) | **34,8 % (8/23)** |
+| Acceptation MTP bloc 3 | 28,2 % | **24,4 % (10/41)** |
+| `replayedTokens` | 0 | 0 |
+| Pic MLX | 56,6 Go | 79,55 Go |
+
+**Réponse à la question posée** : non, le 3-bit ne limite pas le drafter — le
+4-bit accepte **moins** (34,8 % contre 47,6 %). La tête MTP est la même dans
+les deux checkpoints (seuls les experts ont été requantifiés en 3-bit) ; c'est
+donc l'accord drafter/cible qui est meilleur avec la cible 3-bit. Le MTP n'a
+pas de réserve cachée dans le 4-bit : revenir au 4-bit (P3) ne se justifie
+plus que par la qualité (0,42 nat de logprob), pas par le débit.
+
+**Les IDs MTP diffèrent du greedy sur le 4-bit** (index 21, `1725` → `9370`,
+identique en bloc 2 et 3 ; le 3-bit était bit-identique). Ce n'est pas un bug :
+le scorer teacher-forced, qui fait un **forward multi-tokens** comme la
+vérification MTP, donne lui aussi `9370` à cette position, avec une **marge de
+0,21 nat** (marges voisines 1,5 à 8,4 ; accord argmax 96,9 %, rang cible
+moyen 1,03). Un forward multi-tokens et une suite de forwards à un token ne
+sont pas bit-identiques (ordre d'accumulation des matmuls), et la chaîne 4-bit
+amplifie l'écart jusqu'à faire basculer une quasi-égalité. **Le critère « IDs
+identiques au greedy » n'est donc valide que tant qu'aucune quasi-égalité ne
+tombe dans un bloc vérifié** — à mentionner dans toute validation MTP future.
+
+**Les temps de ce run ne sont pas comparables** : 8,6 Go d'anonyme + 79,5 Go
+de pic dépassent la machine ; le sampler montre le compresseur à 57 Go et
+**9,9 millions de décompressions**, `memorystatus_level` descendu à 27 %. Le
+greedy 4-bit mesure 0,87 s/token (contre 0,164 s/token en 3-bit) : c'est de la
+décompression, pas du modèle. Le 4-bit reste inutilisable sur cette machine
+sans P3, même après reboot.
