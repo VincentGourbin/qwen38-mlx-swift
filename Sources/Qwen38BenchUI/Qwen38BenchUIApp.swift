@@ -57,6 +57,10 @@ final class BenchViewModel: ObservableObject {
     /// persistée dans UserDefaults, un clic recharge le catalogue autour du
     /// chemin choisi ; le dernier chemin utilisé est restauré au lancement.
     static let defaultProfiles = [
+        // Hybride : shards n-gram sur le SSD interne, le reste lié au Lexar.
+        // Mesuré le 2026-09-11 : préfill réel 48,6 → 77,6 tok/s (−37 %), la
+        // couche n-gram pesant 88 % du préfill sur du texte varié.
+        "/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
         "/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
         "/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
         "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit",
@@ -123,16 +127,25 @@ final class BenchViewModel: ObservableObject {
         let runtime = Qwen38Runtime()
         self.runtime = runtime
         self.inferenceServer = Qwen38InferenceServer(runtime: runtime)
-        let saved = UserDefaults.standard.stringArray(forKey: Self.profilesKey)
-        self.profiles = (saved?.isEmpty == false) ? saved! : Self.defaultProfiles
+        // Fusionne les profils enregistrés avec les défauts : un nouveau
+        // chemin livré avec une version apparaît sans effacer les ajouts de
+        // l'utilisateur ni son ordre.
+        let saved = UserDefaults.standard.stringArray(forKey: Self.profilesKey) ?? []
+        self.profiles = saved.isEmpty
+            ? Self.defaultProfiles
+            : Self.defaultProfiles.filter { !saved.contains($0) } + saved
         self.modelPath = UserDefaults.standard.string(forKey: Self.lastPathKey) ?? Self.defaultProfiles[0]
     }
 
     // MARK: profils de chemins
 
+    /// Nom du modèle préfixé par son volume : deux checkpoints peuvent avoir
+    /// le même dossier parent (`local/`) sur des disques différents.
     static func profileLabel(_ path: String) -> String {
         let parts = path.split(separator: "/").map(String.init)
-        return parts.suffix(2).joined(separator: "/")
+        let name = parts.last ?? path
+        let disk = (parts.first == "Volumes" && parts.count > 1) ? parts[1] : "SSD"
+        return "\(disk) · \(name)"
     }
 
     func applyProfile(_ path: String) {
