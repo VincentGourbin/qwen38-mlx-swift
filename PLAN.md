@@ -3968,3 +3968,38 @@ portée du levier demandé. P6.3's dialogue dédié n'atteint que 61 tours en
 20 min (pas la fenêtre exacte 68-73 de la boucle P5.6). P6.5 n'isole pas
 d'opération précise faute d'outillage GPU natif (mesure et diagnostic
 qualitatif seulement, comme P4.3 avant lui).
+
+### P7 — Débit de génération : attribuer le coût par sous-bloc, puis fusionner — plan du 2026-09-11
+
+**Où on en est.** Décodage 3-bit : **6,1-7,1 tok/s** (0,14-0,16 s/token, 48
+couches ≈ 3 à 3,5 ms par couche). Résidence GPU 89 % en génération, mais le
+bench synthétique donne 4,5 ms par couche pour **~0,5 ms de calcul utile** :
+le GPU est « occupé » à enchaîner une centaine de très petits noyaux dont le
+coût est le lancement, pas le calcul. Deux tentatives ont échoué à déplacer
+ça, et leur échec est informatif : P2-fusion (F1/F2/F4) a supprimé ~10 % des
+ops **sans gain mesurable** (le coût n'est pas concentré), et `MLX.compile`
+par couche a fait −2 % en GDN, **+13 % en QSA**. Deux mesures manquent encore
+pour viser juste : le **coût par sous-bloc** et le **nombre de noyaux**
+réellement lancés. P4.0 et P6.5 n'ont pas pu les obtenir (`xctrace --template`
+ne sait pas activer Shader Timeline, pas d'Instruments en ligne de commande).
+
+**L'idée de ce plan** : ne plus dépendre d'Instruments. Le bench synthétique
+`flash-layer-bench` construit une couche à poids aléatoires, sans checkpoint,
+en quelques secondes. En **désactivant un sous-bloc à la fois** et en
+mesurant, on obtient l'attribution du coût par soustraction. On ne fusionne
+ensuite que ce que la mesure désigne. Règle inchangée : conservé si ≥ 5 % sur
+le **modèle réel** à IDs identiques ; sinon retiré et consigné.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P7.1 | **Profil par ablation** sur `flash-layer-bench` (Release, `--steps 300`, S=1) : option `--ablate <bloc>` qui court-circuite un sous-bloc en renvoyant son entrée (ou un tenseur de forme correcte) — blocs : `moe` (routage + experts + partagé), `gdn-recurrence` (`gatedDeltaUpdate`), `gdn-projections`, `qsa-attn` (SDPA + indexeur), `hyper` (mix + inject), `norms`, `ple` (déjà mesuré). Mesurer chaque variante 2×, en déduire le coût de chaque bloc par soustraction (et vérifier que la somme ≈ la couche complète à ±15 %). | tableau « sous-bloc · ms · % de la couche » pour GDN et QSA dans `log.md` |
+| P7.2 | **Nombre de noyaux** : tenter `ProfilingSession.captureGPUTrace(phase:)` (profiler 1.5.0) autour d'un pas du bench ; si `MTL_CAPTURE_ENABLED=1` et/ou `MLX_METAL_DEBUG` manquent, le rapporter précisément (variable d'environnement, drapeau de build mlx-swift) et **s'arrêter là** — ne pas rebâtir mlx-swift sans accord. À défaut, compter les ops par sous-bloc en lisant le code et en le confrontant aux deltas de P7.1. | `.gputrace` produit **ou** obstacle documenté + comptage analytique par sous-bloc |
+| P7.3 | **`MLX.compile` du pas complet** (et non par couche, seule variante jamais testée) : dans le bench, compiler la fonction « 1 token → logits » sur les N couches résidentes avec les caches en `inputs`/`outputs` ; mesurer `--compiled-step` contre le chemin normal. P2-code (c) n'avait compilé qu'une couche isolée : à l'échelle du pas, `compile` peut fusionner les chaînes élémentaires **entre** couches. Si `compile` refuse (formes dépendant de l'offset de cache), documenter l'obstacle exact. | ms/pas avant/après, parité 1e-3 |
+| P7.4 | **Fusion Metal du sous-bloc dominant** désigné par P7.1 (candidat attendu : la chaîne de gating GDN — `-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`, fenêtre conv1d, RMSNormGated — soit ~15-20 ops élémentaires réductibles à un noyau) via `MLXFast.metalKernel`, derrière `Qwen4ExpFusionLevel`, avec test de parité bit-exacte ou 1e-3 contre le chemin d'origine conservé. Un seul sous-bloc, celui qui domine. | bench : ms/pas avant/après ; parité |
+| P7.5 | **Second sous-bloc** (si P7.1 en désigne un autre > 15 % et que P7.4 a tenu sa promesse) ; sinon passer directement à P7.6. | idem |
+| P7.6 | **Validation sur le checkpoint réel** (3-bit hybride SSD `/Users/vincent/models/local/…e3bit-MTP`) : `flash-chat-probe --temperature 0 --max-new-tokens 32 --resident-layers --resident-async` ⇒ IDs identiques à `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, …]` ; garde Q-B (`-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()`, 10/28 et −4,80) ; tok/s greedy et MTP avant/après ; `BENCHMARKS.md`. **Jauge : ≥ 9 tok/s** (≈ 2,3 ms/couche), à défaut consigner le plafond atteint et ce qui le tient. | tableau récapitulatif |
+
+Hors périmètre P7 : le préfill (traité le 2026-09-11, la copie SSD des shards
+n-gram donne −37 % ; le reliquat est le chemin hôte de lecture des lignes), le
+chargement du modèle (Vincent : « ça ne le rend pas inutilisable »), le 4-bit,
+P3, P5.7 (GUI/LAN traité en P6.4).
