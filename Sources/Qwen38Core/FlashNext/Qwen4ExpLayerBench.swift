@@ -329,7 +329,12 @@ public enum Qwen4ExpLayerBench {
         /// right after its (placeholder) weights are materialized, exactly
         /// where `Qwen4ExpCheckpointLayerLoader.load` applies it to a real
         /// checkpoint layer.
-        fusionLevel: Qwen4ExpFusionLevel = .none
+        fusionLevel: Qwen4ExpFusionLevel = .none,
+        /// P7.1 (`--ablate <bloc>`): short-circuits one sub-block of the
+        /// layer with a shape-correct placeholder, so its cost can be
+        /// attributed by subtraction against a `.none` run. Never
+        /// numerically correct — see `Qwen4ExpLayerBenchAblation`.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) -> Qwen4ExpLayerBenchResult {
         precondition(warmupSteps >= 0, "--warmup doit être positif ou nul")
         precondition(measuredSteps > 0, "--steps doit être positif")
@@ -353,7 +358,8 @@ public enum Qwen4ExpLayerBench {
             pleLayerIndex: nil,
             quantization: quantization,
             expertsQuantization: expertsQuantization,
-            fusionLevel: fusionLevel)
+            fusionLevel: fusionLevel,
+            ablation: ablation)
         let weightArrays = layer.parameters().flattened().map { $0.1 }
         eval(weightArrays)
         let materializedBytes = weightArrays.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
@@ -521,6 +527,323 @@ public enum Qwen4ExpLayerBench {
         return Qwen4ExpLayerBenchResult(
             kind: kind, steps: measured, materializedBytes: materializedBytes,
             lastOutput: lastOutput?.asType(.float32).asArray(Float.self) ?? [])
+    }
+}
+
+/// P7.3 — whether `Qwen4ExpLayerBench.runMultiLayerStep` runs the N-layer
+/// per-token forward eagerly or wraps the *whole step* (every layer, not
+/// one `compile` per layer as P2-code (c) did) in a single `MLX.compile`.
+public struct Qwen4ExpLayerBenchStepComputeMode: Sendable, Equatable {
+    public var compiled: Bool
+    public var shapeless: Bool
+
+    public init(compiled: Bool = false, shapeless: Bool = false) {
+        self.compiled = compiled
+        self.shapeless = shapeless
+    }
+
+    public static let eager = Qwen4ExpLayerBenchStepComputeMode()
+}
+
+extension Qwen4ExpLayerBench {
+    /// P7.3: builds `layerCount` independent decoder layers of `kind`
+    /// (each with its own cache) and benches the full per-token forward
+    /// across all of them — `hidden -> layer0 -> layer1 -> ... ->
+    /// layer(N-1)` — either eagerly or as one `MLX.compile`d function
+    /// spanning every layer, with every layer's cache boxed as compile
+    /// state (the same `Updatable` adapter P2-code (c) used for a single
+    /// layer). Unlike the single-layer `--compiled` in `run`, this is the
+    /// variant PLAN.md P7.3 asks for: compiling the *step*, not one layer
+    /// in isolation, so any op fusion `compile` can do *between* layers has
+    /// a chance to show up.
+    public static func runMultiLayerStep(
+        kind: Qwen4ExpLayerBenchKind,
+        layerCount: Int,
+        dimensions: Qwen4ExpLayerBenchDimensions = .real,
+        warmupSteps: Int = 20,
+        measuredSteps: Int = 200,
+        quantization: Qwen4ExpQuantizationSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4),
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
+        profiler: MLXProfiler = .shared,
+        computeMode: Qwen4ExpLayerBenchStepComputeMode = .eager
+    ) -> Qwen4ExpLayerBenchResult {
+        precondition(layerCount > 0, "--step-layers doit être positif")
+        precondition(warmupSteps >= 0, "--warmup doit être positif ou nul")
+        precondition(measuredSteps > 0, "--steps doit être positif")
+        _ = Device.defaultDevice()
+
+        let layerType: Qwen4ExpTextConfiguration.LayerType =
+            kind == .gdn ? .linearAttention : .fullAttention
+        let configuration = dimensions.textConfiguration(layerType: layerType)
+
+        // Each layer is its own independently (deterministically) packed
+        // instance, exactly like `run`'s single layer — the point is
+        // realistic per-token compute cost, not a shared/meaningful weight
+        // tree across layers.
+        let layers = (0..<layerCount).map { _ in
+            Qwen4ExpDecoderLayer(
+                configuration: configuration, layerIndex: 0, pleLayerIndex: nil,
+                quantization: quantization, expertsQuantization: expertsQuantization)
+        }
+        var materializedBytes: Int64 = 0
+        for layer in layers {
+            let weightArrays = layer.parameters().flattened().map { $0.1 }
+            eval(weightArrays)
+            materializedBytes += weightArrays.reduce(Int64(0)) { $0 + Int64($1.nbytes) }
+        }
+
+        let caches: [any KVCache] = (0..<layerCount).map { _ in
+            kind == .gdn
+                ? MambaCache() as any KVCache
+                : Qwen4ExpQSAKVCache(
+                    budget: dimensions.indexerBudget, compressRatio: dimensions.indexerCompressRatio)
+                    as any KVCache
+        }
+        let cacheBoxes = caches.map { Qwen4ExpLayerBenchCacheBox($0) }
+
+        let hiddenDimensions = dimensions.hiddenSize * dimensions.hcCount
+        let inputIDs = MLXArray([Int32(1)]).reshaped([1, 1])
+        let phaseName = "Bench pas \(kind.rawValue) x\(layerCount)"
+
+        // `args[0]` is the hidden state; `args[1...]` are one causal mask
+        // per layer (QSA only — ignored for GDN). Passing every layer's
+        // mask as an explicit array argument, not a captured free variable,
+        // matches the existing single-layer `--compiled` QSA closure in
+        // `run`. GDN's cache state is fixed-shape every step; QSA's mask
+        // (built from `cache.offset`, which grows every step) is not — see
+        // that closure's documentation for why this is expected to force a
+        // recompile on every call once `shapeless` is not requested (and,
+        // per P2-code (c), even `shapeless` does not avoid it: the mask's
+        // *content*, not just its shape, is baked into the traced graph as
+        // a boolean array literal unless MLX treats it as pure input data).
+        func stepForward(_ args: [MLXArray]) -> [MLXArray] {
+            var state = args[0]
+            for (index, layer) in layers.enumerated() {
+                if kind == .gdn {
+                    state = layer(state, inputIDs: inputIDs, cache: caches[index])
+                } else {
+                    let mask = args[1 + index]
+                    state = layer(
+                        state, inputIDs: inputIDs, mask: mask, cache: caches[index],
+                        positionIDs: nil)
+                }
+            }
+            return [state]
+        }
+
+        let compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])? = computeMode.compiled
+            ? compile(
+                inputs: cacheBoxes, outputs: cacheBoxes, shapeless: computeMode.shapeless,
+                stepForward)
+            : nil
+
+        var lastOutput: MLXArray?
+
+        func buildStep() -> MLXArray {
+            let hidden = MLXRandom.uniform(
+                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+            var args = [hidden]
+            if kind == .qsa {
+                for cache in caches {
+                    let qsaCache = cache as! Qwen4ExpQSAKVCache
+                    args.append(
+                        Qwen4ExpQSAAttention.causalMask(
+                            batch: 1, queryLength: 1,
+                            keyLength: qsaCache.offset + 1, offset: qsaCache.offset))
+                }
+            }
+            if let compiledForward {
+                return compiledForward(args)[0]
+            }
+            return stepForward(args)[0]
+        }
+
+        func decodeOneStep() -> Qwen4ExpLayerBenchStepMetrics {
+            let gpuBefore = Double(SystemMetrics.gpuUtilization())
+            let cpuBefore = SystemMetrics.processCPUTime()
+            let start = ContinuousClock.now
+
+            let output = buildStep()
+            eval(output)
+            lastOutput = output
+
+            let elapsed = ContinuousClock.now - start
+            let cpuAfter = SystemMetrics.processCPUTime()
+            let gpuAfter = Double(SystemMetrics.gpuUtilization())
+            let wallSeconds = elapsed.seconds
+            let cpuPercent = wallSeconds > 0 ? (cpuAfter - cpuBefore) / wallSeconds * 100 : 0
+            return Qwen4ExpLayerBenchStepMetrics(
+                durationSeconds: wallSeconds, cpuPercent: cpuPercent,
+                gpuPercent: (gpuBefore + gpuAfter) / 2)
+        }
+
+        for _ in 0..<warmupSteps {
+            _ = decodeOneStep()
+        }
+
+        var measured: [Qwen4ExpLayerBenchStepMetrics] = []
+        measured.reserveCapacity(measuredSteps)
+        for _ in 0..<measuredSteps {
+            profiler.start(phaseName)
+            let metrics = decodeOneStep()
+            profiler.end(phaseName)
+            measured.append(metrics)
+        }
+
+        return Qwen4ExpLayerBenchResult(
+            kind: kind, steps: measured, materializedBytes: materializedBytes,
+            lastOutput: lastOutput?.asType(.float32).asArray(Float.self) ?? [])
+    }
+
+    /// P7.3 parity: rebuild the same `layerCount`-layer step twice with
+    /// identical seeded random weights (same reasoning as `checkParity`),
+    /// run `steps` synthetic decode steps eagerly and through
+    /// `MLX.compile`, and compare — bit-exact would be a coincidence for a
+    /// GPU reduction order that legitimately differs between the eager and
+    /// compiled graphs, so this uses the same `atol + rtol*|baseline|`
+    /// normalization as `checkParity`, threshold `<= 1`.
+    public static func checkMultiLayerStepParity(
+        kind: Qwen4ExpLayerBenchKind,
+        layerCount: Int,
+        dimensions: Qwen4ExpLayerBenchDimensions = .real,
+        quantization: Qwen4ExpQuantizationSpec = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4),
+        expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
+        shapeless: Bool = false,
+        seed: UInt64 = 20_260_911,
+        steps: Int = 32,
+        relativeTolerance: Float = 1e-3,
+        absoluteTolerance: Float = 1e-3
+    ) -> Qwen4ExpLayerBenchParityResult {
+        _ = Device.defaultDevice()
+        let layerType: Qwen4ExpTextConfiguration.LayerType =
+            kind == .gdn ? .linearAttention : .fullAttention
+        let configuration = dimensions.textConfiguration(layerType: layerType)
+
+        func makeLayers() -> [Qwen4ExpDecoderLayer] {
+            (0..<layerCount).map { _ in
+                Qwen4ExpDecoderLayer(
+                    configuration: configuration, layerIndex: 0, pleLayerIndex: nil,
+                    quantization: quantization, expertsQuantization: expertsQuantization)
+            }
+        }
+
+        MLXRandom.seed(seed)
+        let template = makeLayers()
+        let randomWeightsPerLayer = template.map { layer in
+            Dictionary(
+                uniqueKeysWithValues: layer.parameters().flattened().map { ($0.0, randomLeaf(like: $0.1)) })
+        }
+        for weights in randomWeightsPerLayer { eval(Array(weights.values)) }
+
+        func applyWeights(_ layers: [Qwen4ExpDecoderLayer]) {
+            for (layer, weights) in zip(layers, randomWeightsPerLayer) {
+                try! layer.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+            }
+        }
+
+        let eagerLayers = makeLayers()
+        applyWeights(eagerLayers)
+        let compiledLayers = makeLayers()
+        applyWeights(compiledLayers)
+
+        let hiddenDimensions = dimensions.hiddenSize * dimensions.hcCount
+        MLXRandom.seed(seed &+ 1)
+        let inputs = (0..<steps).map { _ in
+            MLXRandom.uniform(
+                low: Float(-1), high: Float(1), [1, 1, hiddenDimensions], dtype: .float16)
+        }
+        eval(inputs)
+
+        MLXRandom.seed(seed &+ 2)
+        let syntheticVocabulary = 32
+        let lmHead = Linear(hiddenDimensions, syntheticVocabulary, bias: false)
+        eval(lmHead.weight)
+
+        let inputIDs = MLXArray([Int32(1)]).reshaped([1, 1])
+        func makeCaches() -> [any KVCache] {
+            (0..<layerCount).map { _ in
+                kind == .gdn
+                    ? MambaCache() as any KVCache
+                    : Qwen4ExpQSAKVCache(
+                        budget: dimensions.indexerBudget,
+                        compressRatio: dimensions.indexerCompressRatio)
+                        as any KVCache
+            }
+        }
+        let eagerCaches = makeCaches()
+        let compiledCaches = makeCaches()
+        let compiledCacheBoxes = compiledCaches.map { Qwen4ExpLayerBenchCacheBox($0) }
+
+        func stepForward(
+            _ layers: [Qwen4ExpDecoderLayer], _ caches: [any KVCache], _ args: [MLXArray]
+        ) -> [MLXArray] {
+            var state = args[0]
+            for (index, layer) in layers.enumerated() {
+                if kind == .gdn {
+                    state = layer(state, inputIDs: inputIDs, cache: caches[index])
+                } else {
+                    state = layer(
+                        state, inputIDs: inputIDs, mask: args[1 + index], cache: caches[index],
+                        positionIDs: nil)
+                }
+            }
+            return [state]
+        }
+
+        let compiledForward = compile(
+            inputs: compiledCacheBoxes, outputs: compiledCacheBoxes, shapeless: shapeless
+        ) { args in
+            stepForward(compiledLayers, compiledCaches, args)
+        }
+
+        var maxAbsoluteDifference: Float = 0
+        var maxRelativeDifference: Float = 0
+        var argmaxMismatches = 0
+
+        for hidden in inputs {
+            var eagerArgs = [hidden]
+            var compiledArgs = [hidden]
+            if kind == .qsa {
+                for cache in eagerCaches {
+                    let qsaCache = cache as! Qwen4ExpQSAKVCache
+                    eagerArgs.append(
+                        Qwen4ExpQSAAttention.causalMask(
+                            batch: 1, queryLength: 1, keyLength: qsaCache.offset + 1,
+                            offset: qsaCache.offset))
+                }
+                for cache in compiledCaches {
+                    let qsaCache = cache as! Qwen4ExpQSAKVCache
+                    compiledArgs.append(
+                        Qwen4ExpQSAAttention.causalMask(
+                            batch: 1, queryLength: 1, keyLength: qsaCache.offset + 1,
+                            offset: qsaCache.offset))
+                }
+            }
+            let outEager = stepForward(eagerLayers, eagerCaches, eagerArgs)[0]
+            let outCompiled = compiledForward(compiledArgs)[0]
+
+            let eagerF32 = outEager.asType(.float32)
+            let compiledF32 = outCompiled.asType(.float32)
+            let absoluteDiff = MLX.abs(eagerF32 - compiledF32)
+            let tolerance = absoluteTolerance + relativeTolerance * MLX.abs(eagerF32)
+            let normalizedDiff = absoluteDiff / tolerance
+            let logitsEager = lmHead(outEager).argMax(axis: -1)
+            let logitsCompiled = lmHead(outCompiled).argMax(axis: -1)
+            eval(absoluteDiff, normalizedDiff, logitsEager, logitsCompiled)
+
+            maxAbsoluteDifference = max(maxAbsoluteDifference, absoluteDiff.max().item(Float.self))
+            maxRelativeDifference = max(maxRelativeDifference, normalizedDiff.max().item(Float.self))
+            if logitsEager.item(Int32.self) != logitsCompiled.item(Int32.self) {
+                argmaxMismatches += 1
+            }
+        }
+
+        let passed = maxRelativeDifference <= 1 && argmaxMismatches == 0
+        return Qwen4ExpLayerBenchParityResult(
+            kind: kind, fusionLevel: .none, steps: steps,
+            maxAbsoluteDifference: maxAbsoluteDifference,
+            maxRelativeDifference: maxRelativeDifference,
+            argmaxMismatches: argmaxMismatches, passed: passed)
     }
 }
 

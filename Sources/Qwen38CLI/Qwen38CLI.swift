@@ -873,6 +873,34 @@ struct FlashLayerBench: AsyncParsableCommand {
     )
     var checkParity = false
 
+    @Option(
+        name: .long,
+        help:
+            "P7.1 : court-circuite un sous-bloc de la couche (moe, gdn-recurrence, gdn-projections, qsa-attn, hyper, norms, plus les sous-sondes moe-routing/moe-switch-mlp/moe-shared-expert) pour attribuer son coût par soustraction — instrument de mesure, jamais numériquement correct"
+    )
+    var ablate: String?
+
+    @Flag(
+        name: .long,
+        help:
+            "P7.2 : tente ProfilingSession.captureGPUTrace(phase:) autour d'un pas de couche (exige --trace) ; rapporte l'obstacle exact si MTL_CAPTURE_ENABLED / MLX_METAL_DEBUG manquent"
+    )
+    var gpuTrace = false
+
+    @Option(
+        name: .long,
+        help:
+            "P7.3 : nombre de couches empilées à bencher comme un seul pas (hidden -> couche0 -> ... -> couche N-1) au lieu d'une couche isolée ; 0 = comportement inchangé (--steps/--compiled restent sur une couche)"
+    )
+    var stepLayers: Int = 0
+
+    @Flag(
+        name: .long,
+        help:
+            "P7.3 : avec --step-layers, compile le pas complet (toutes les couches) en un seul MLX.compile au lieu de N compile par couche"
+    )
+    var compiledStep = false
+
     func run() async throws {
         guard steps > 0 else {
             throw ValidationError("--steps doit être positif")
@@ -896,8 +924,22 @@ struct FlashLayerBench: AsyncParsableCommand {
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
             throw ValidationError("--fusion-level doit appartenir à 0-6 (P2-fusion F1-F6)")
         }
-        if checkParity && resolvedFusionLevel == .none {
+        if checkParity && resolvedFusionLevel == .none && stepLayers == 0 {
             throw ValidationError("--check-parity exige --fusion-level 1-6 (comparaison à .none)")
+        }
+        let resolvedAblation: Qwen4ExpLayerBenchAblation
+        if let ablate {
+            guard let parsed = Qwen4ExpLayerBenchAblation(rawValue: ablate) else {
+                let choices = Qwen4ExpLayerBenchAblation.allCases
+                    .filter { $0 != .none }.map(\.rawValue).joined(separator: ", ")
+                throw ValidationError("--ablate doit être l'un de : \(choices)")
+            }
+            resolvedAblation = parsed
+        } else {
+            resolvedAblation = .none
+        }
+        if checkParity && resolvedAblation != .none {
+            throw ValidationError("--check-parity et --ablate sont incompatibles")
         }
         let expertsQuantization: Qwen4ExpQuantizationSpec? =
             (expertBits != nil || expertGroupSize != nil)
@@ -907,11 +949,61 @@ struct FlashLayerBench: AsyncParsableCommand {
 
         _ = Device.defaultDevice()
 
+        guard stepLayers >= 0 else {
+            throw ValidationError("--step-layers doit être positif ou nul")
+        }
+        if compiledStep && stepLayers == 0 {
+            throw ValidationError("--compiled-step exige --step-layers > 0")
+        }
+
         let kinds: [Qwen4ExpLayerBenchKind]
         switch layerKind {
         case .both: kinds = [.gdn, .qsa]
         case .gdn: kinds = [.gdn]
         case .qsa: kinds = [.qsa]
+        }
+
+        // P7.3: the full-step, N-layer path is entirely separate from the
+        // single-layer path below (different bench function, different
+        // parity harness) — handled here and returned before any
+        // single-layer-only code (fusion level, ablation, profiler
+        // session) runs.
+        if stepLayers > 0 {
+            if checkParity {
+                for kind in kinds {
+                    let result = Qwen4ExpLayerBench.checkMultiLayerStepParity(
+                        kind: kind, layerCount: stepLayers, expertsQuantization: expertsQuantization,
+                        shapeless: shapeless)
+                    print(
+                        "P7.3 parité pas complet \(kind.rawValue) x\(stepLayers) : "
+                            + "\(result.steps) pas, diff abs max \(result.maxAbsoluteDifference), "
+                            + "diff rel max \(result.maxRelativeDifference), "
+                            + "argmax lm_head désaccords \(result.argmaxMismatches)/\(result.steps) — "
+                            + (result.passed ? "PASS" : "FAIL"))
+                }
+                return
+            }
+            func percentile(_ sortedMs: [Double], _ p: Double) -> Double {
+                guard !sortedMs.isEmpty else { return .nan }
+                let index = Int((Double(sortedMs.count - 1) * p).rounded())
+                return sortedMs[min(max(index, 0), sortedMs.count - 1)]
+            }
+            for kind in kinds {
+                print("--- pas complet \(kind.rawValue) x\(stepLayers) (\(compiledStep ? "compiled" : "eager")) ---")
+                let result = Qwen4ExpLayerBench.runMultiLayerStep(
+                    kind: kind, layerCount: stepLayers, warmupSteps: warmup, measuredSteps: steps,
+                    expertsQuantization: expertsQuantization, profiler: MLXProfiler.shared,
+                    computeMode: Qwen4ExpLayerBenchStepComputeMode(
+                        compiled: compiledStep, shapeless: shapeless))
+                let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
+                let median = percentile(sortedMs, 0.5)
+                let p10 = percentile(sortedMs, 0.1)
+                let p90 = percentile(sortedMs, 0.9)
+                let meanGPU = result.steps.map(\.gpuPercent).reduce(0, +) / Double(result.steps.count)
+                print("mémoire \(stepLayers) couches: \(ByteCountFormatter.string(fromByteCount: result.materializedBytes, countStyle: .file))")
+                print("ms/pas — médiane \(String(format: "%.2f", median))  p10 \(String(format: "%.2f", p10))  p90 \(String(format: "%.2f", p90))  GPU moyen \(String(format: "%.1f", meanGPU)) %")
+            }
+            return
         }
 
         if checkParity {
@@ -963,8 +1055,30 @@ struct FlashLayerBench: AsyncParsableCommand {
             return sortedMs[min(max(index, 0), sortedMs.count - 1)]
         }
 
+        if gpuTrace {
+            guard let profileSession else {
+                throw ValidationError("--gpu-trace exige --trace (session active)")
+            }
+            print("P7.2 : tentative de capture GPU (captureGPUTrace) autour d'un pas de couche…")
+            let dimensions = Qwen4ExpLayerBenchDimensions.real
+            do {
+                try profileSession.captureGPUTrace(phase: "flash-layer-bench-p7.2") {
+                    _ = Qwen4ExpLayerBench.run(
+                        kind: kinds.first ?? .gdn, dimensions: dimensions,
+                        warmupSteps: 0, measuredSteps: 1,
+                        expertsQuantization: expertsQuantization, profiler: profiler)
+                }
+                print("P7.2 : capture GPU réussie.")
+            } catch {
+                print("P7.2 : capture GPU impossible — \(error)")
+            }
+        }
+
         if let expertsQuantization {
             print("experts (switch_mlp): bits=\(expertsQuantization.bits) group_size=\(expertsQuantization.groupSize)")
+        }
+        if resolvedAblation != .none {
+            print("ablation P7.1 : \(resolvedAblation.rawValue)")
         }
         for kind in kinds {
             print("--- couche \(kind.rawValue) ---")
@@ -977,7 +1091,8 @@ struct FlashLayerBench: AsyncParsableCommand {
                 computeMode: Qwen4ExpLayerBenchComputeMode(
                     compiled: compiled, shapeless: shapeless, syncEvery: asyncInterval,
                     skipTrivialCausalMask: skipTrivialMask),
-                fusionLevel: resolvedFusionLevel)
+                fusionLevel: resolvedFusionLevel,
+                ablation: resolvedAblation)
             let sortedMs = result.steps.map { $0.durationSeconds * 1000 }.sorted()
             let median = percentile(sortedMs, 0.5)
             let p10 = percentile(sortedMs, 0.1)
@@ -1090,7 +1205,7 @@ struct FlashChatProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F6 appliqué à chaque couche (0 = chemin d'origine, défaut — F7 valide ce flag sur le vrai checkpoint avant tout changement de défaut)"
+            "P2-fusion : niveau cumulatif F1-F6 appliqué à chaque couche (0 = chemin d'origine, défaut)"
     )
     var fusionLevel: Int = 0
 
