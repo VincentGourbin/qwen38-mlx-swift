@@ -4756,3 +4756,99 @@ main est donc confirmée par la mesure.
 
 Ces chiffres réorientent le chantier de déchargement (désormais P11.5) : son
 objectif n'est plus le débit mais la **mise en service du 4-bit**.
+
+---
+
+## 2026-09-12 (nuit) — P11.1 exécutée : réduire K ne fait pas gagner de débit
+
+Première tâche du plan révisé. L'outillage (surcharge de `num_experts_per_tok`
+à l'exécution) est décrit dans `PLAN.md` P11.1.
+
+### Garde préalable : le réglage ne change rien quand on ne lui demande rien
+
+`flash-chat-probe`, greedy, 8 tokens, prompt de référence, sans drapeau puis
+avec `--routed-experts 10` : IDs identiques entre eux **et** identiques à la
+référence historique du dépôt (2026-09-09, P2-mem-a) —
+`[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171]`. Pic MLX 57,43 Go dans
+les deux cas.
+
+### Qualité — teacher-forcing, déterministe, process neuf par K
+
+Continuation scorée = les 128 tokens produits en greedy à K=10 sur le prompt
+de référence. Mesurer la logprob de **sa propre sortie à K=10** donne
+directement la divergence induite par la réduction.
+
+| K | octets/token | logprob moyenne | Δ nat | accord argmax | rang cible moyen |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 1 005 Mio | −0,3386 | — | 99,2 % | 1,01 |
+| 8 | 804 Mio | −0,3687 | −0,030 | 94,5 % | 1,05 |
+| 6 | 603 Mio | −0,4051 | −0,066 | 92,2 % | 1,16 |
+| 5 | 503 Mio | −0,4799 | −0,141 | 83,6 % | 1,26 |
+| 4 | 402 Mio | −0,7024 | −0,364 | 80,5 % | 1,49 |
+
+Dégradation propre et monotone. Le 99,2 % de la ligne K=10 n'est pas un défaut
+de K : c'est l'écart entre le chemin de décodage (`--resident-async`) et le
+chemin de scoring (teacher-forcing), un token sur 128 (le #73, marge 0,125).
+**C'est le plancher de bruit de cette comparaison.**
+
+### Débit — serveur chaud, tours entrelacés, deux campagnes indépendantes
+
+| K | campagne 1 | campagne 2 | écart-type | gain médian |
+|---:|---:|---:|---:|---:|
+| 10 | 21,02 | 21,12 | 0,05 | — |
+| 8 | 21,31 | 21,44 | 0,05 | **+1,5 %** |
+| 6 | 21,79 | 21,92 | 0,06 | **+3,8 %** |
+| 5 | 22,25 | **22,37** | 0,05 | **+5,9 %** |
+| 4 | 21,97 | 22,12 | 0,09 | +4,7 % |
+
+(tok/s ; 6 puis 8 tours de 5 requêtes entrelacées, greedy, 96 tokens, prompt de
+référence, `/healthz` vérifié à chaque requête)
+
+**Retirer 60 % des octets d'experts par token rapporte 4,7 % de débit.** C'est
+la confirmation expérimentale la plus directe du diagnostic P11.1 : à 3,6 % de
+la bande passante et 0,46 % du calcul, nous ne sommes limités ni par l'un ni
+par l'autre. Le nombre de noyaux lancés ne dépend pas de K — seules la largeur
+d'`argPartition` et la taille du *gather* changent — et c'est lui qui fixe le
+débit.
+
+Le critère de succès de P11.1 (**≥ +15 % pour ≤ 0,2 nat**) n'est **pas
+atteint** : le meilleur point, K=5, donne +5,9 % pour 0,141 nat et fait tomber
+l'accord argmax de 99,2 % à 83,6 %.
+
+**Anomalie reproduite deux fois : K=4 est plus lent que K=5** (−1,1 %) alors
+qu'il lit 20 % d'octets en moins. Piste probable, non vérifiée : un effet de
+tuilage dans `gatherQMM`, dont la forme préférée ne serait pas atteinte à K=4.
+
+### Deux leçons de méthode, à appliquer désormais
+
+1. **Le débit mesuré par une sonde en process neuf n'est pas exploitable.** Le
+   premier passage (un run par K, process neuf à chaque fois) donnait 18,20 /
+   19,92 / 19,63 / 21,48 / 20,58 tok/s — non monotone, avec plusieurs tok/s de
+   dispersion, et un « +18 % » à K=5 qui n'existe pas. Le serveur chaud, en
+   tours entrelacés, descend à 0,05 tok/s d'écart-type. **Toute comparaison de
+   débit doit passer par le serveur chaud et des tours entrelacés**, pour que
+   la dérive de la machine se répartisse également sur toutes les variantes.
+2. **Le débit publié par `/metrics` mélange préfill et décodage.** Sur un
+   prompt de 4 759 tokens il devient bimodal — 7,6 tok/s quand le cache de
+   préfixe implicite rate, 15,4 quand il touche — et l'effet de K y est
+   noyé. **L'effet de K à contexte long n'est donc pas mesuré**, et ce n'est
+   pas une omission mais un manque d'instrumentation : il faudrait un compteur
+   de décodage seul, séparé du préfill, côté serveur.
+
+### Conditions de mesure
+
+Un build Release concurrent (autre session, autre projet) a saturé la mémoire
+entre 23:16 et 23:28 : compresseur à 60 Go, **11 millions de décompressions**.
+La campagne 2 a été relancée machine calme (4,7 Go d'anonyme, **3 127**
+décompressions, RSS 53,1 Go) et **reproduit la campagne 1 à 0,15 tok/s près**.
+Les onze millions de décompressions appartenaient donc au build voisin, pas à
+notre process. Retenir tout de même que `sample-system.sh` devient
+ininterprétable sous contention : la mémoire anonyme y oscille de 60 Go en
+5 secondes, ce qui n'est pas physique.
+
+### Verdict
+
+**La réduction de K n'est pas un levier de débit sur un modèle résident.** Le
+réglage est conservé, mais son usage bascule vers P11.5 : sous déchargement
+disque, où les octets *sont* la contrainte, K=5 divise par deux les entrées-
+sorties pour 0,141 nat. C'est là qu'il faudra le ressortir.

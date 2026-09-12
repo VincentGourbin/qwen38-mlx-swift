@@ -1,0 +1,12 @@
+routed experts (K) : 8/512
+=== tour 1 ===
+Le président de la Chine est Xi Jinping. Il est le président de la République populaire de Chine, le secrétaire général du Comité central du Parti communiste chinois et le président de la Commission militaire centrale. En tant que chef d'État, il joue un rôle de premier plan dans la direction du pays, y compris la formulation des politiques nationales, la promotion du développement économique et social, le maintien de la sécurité nationale et la participation aux affaires internationales. Ses politiques et ses idées ont une influence profonde sur le développement de la Chine et sa position sur la scène internationale.<|im_end|>
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501, 85648, 401, 1147, 182326, 188209, 401, 183085, 11, 501, 217829, 85041, 3717, 181876, 8358, 3717, 179342, 47561, 68, 215309, 1778, 501, 85648, 401, 1147, 9364, 198070, 175030, 13, 2831, 35316, 1649, 28736, 293, 6, 184267, 11, 3687, 174912, 632, 176517, 401, 19871, 3019, 6652, 1147, 4944, 3717, 20589, 11, 374, 176102, 1147, 53041, 909, 179824, 232113, 11, 1147, 19633, 3717, 78709, 177039, 1778, 3471, 11, 501, 216265, 401, 1147, 73750, 174503, 1778, 1147, 19623, 9750, 188632, 162735, 3703, 13, 60806, 179824, 1778, 15081, 185340, 14091, 5992, 9870, 163925, 1668, 501, 78709, 401, 1147, 183085, 1778, 796, 2234, 1668, 1147, 178370, 175565, 13, 248046]
+TTFT: 64.952s
+prefill: 64.952s
+decode: 5.773s
+couches: 5520 visites · load cumulé 64.719s
+P4.2 fin de token (cumulé) : lm_head 0.1934s · sampler.sample 0.0002s · .item() 0.0269s
+MLX mémoire active: 57,39 GB
+MLX mémoire peak: 57,43 GB

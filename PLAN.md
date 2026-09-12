@@ -4186,7 +4186,7 @@ GDN vient de `mlx_lm`, comme le nôtre.
 | Machine | Mac mini M4 Pro 24 Go | MacBook Pro M3 Max 96 Go |
 | Paramètres totaux / actifs | 35 B / ~3 B annoncés | 125 B / ~6 B |
 | Experts routés par token (K) | **4** (le checkpoint en déclare 8) | **10** |
-| Octets d'experts lus par token | ≈ 323 Mio (estimé) | **1 005 Mio (mesuré)** |
+| Octets d'experts lus par token | **270 Mio** (calculé sur leur `config.json`) | **1 005 Mio (mesuré)** |
 | Décodage | 14,9-17,7 tok/s (à ~3,3 k de contexte) | 13,0-13,5 tok/s (court), 9,8 tok/s à 4 367 |
 | Préfill froid / chaud | 113 / 140 tok/s | 108,8 tok/s |
 
@@ -4197,7 +4197,10 @@ GDN vient de `mlx_lm`, comme le nôtre.
    trois fois et demi plus gros. Leur `edge0-35b` tourne en outre à K=4 alors
    que son `config.json` déclare `num_experts_per_tok = 8` :
    `LayerOptions.staged_k4()` divise par deux la largeur de routage native,
-   en préfill comme en décodage. C'est un choix non mis en avant qui explique
+   en préfill comme en décodage. Leur `config.json` donne 40 couches,
+   256 experts, `hidden_size` 2 048, `moe_intermediate_size` 512, 4 bits g64,
+   soit 1,688 Mio par expert (contre 2,094 chez nous) et **270 Mio par token
+   à K=4**, 540 Mio à K=8. C'est un choix non mis en avant qui explique
    une part du débit **et** une part des 3,9 points de qualité perdus.
 
 2. **Le « +59 % » du prérouteur est une atténuation, pas un gain.** La page
@@ -4305,6 +4308,7 @@ drafter. Piège du balayage : changer K en cours de conversation continuée
 mélange des tours calculés à des largeurs différentes — repartir d'une
 conversation neuve à chaque K.
 
+| ~~P11.1~~ | ~~**Réduire K, la largeur de routage.**~~ **Exécutée le 2026-09-12, critère NON atteint.** Le meilleur point (K=5) donne **+5,9 %** de débit pour **0,141 nat** et fait tomber l'accord argmax de 99,2 % à 83,6 % ; le critère demandait ≥ +15 % pour ≤ 0,2 nat. Retirer **60 % des octets d'experts** par token ne rapporte que **4,7 %** : c'est la confirmation expérimentale du diagnostic P11.1. Le réglage est conservé et bascule vers **P11.5**, où les octets sont la contrainte. Détail et tableaux : `docs/knowledge/log.md`, 2026-09-12 (nuit). | ✅ mesuré, ❌ critère |
 | **P11.1** | **Réduire K, la largeur de routage.** Edge0 divise K par deux sur son tier phare. Rendre `num_experts_per_tok` réglable à l'exécution (drapeau moteur + CLI + GUI + serveur, comme `--fusion-level`), puis balayer K ∈ {10, 8, 6, 5, 4} sur le prompt de référence. Mesurer pour chaque K : débit greedy court et long, Q-B V32, logprob moyenne, et la sortie greedy sur le prompt de référence. | Une courbe débit/qualité exploitable. Succès si un K < 10 donne ≥ +15 % de débit pour ≤ 0,2 nat de logprob perdue. |
 | **P11.2** | **Refaire l'attribution du coût par sous-bloc, post-F7.** P7 attribuait 78-88 % au MoE routé — mesuré **avant** la correction de la fuite fp32 (P8), qui a multiplié le débit par 2,74. Cette répartition n'est plus valide et c'est elle qui oriente tout le reste. Instrumenter par sous-bloc (GDN, QSA, MoE routé, expert partagé, hyper-connexions, PLE, normes) avec le profileur 1.5.0, hors profilage par couche. | Un tableau à jour de la part de chaque sous-bloc, et le compte réel d'ops GPU par token (aujourd'hui estimé à ~4 800). |
 | **P11.3** | **Chiffrer les hyper-connexions.** Notre modèle porte 4 flux résiduels et un mélange de rang 320 à chaque couche — Edge0 n'a pas cet étage. C'est un suspect structurel de premier plan pour le compte d'ops, et il n'a jamais été mesuré isolément. Ablation : forcer 1 flux, mesurer débit et parité. | La part exacte des hyper-connexions dans les 74 ms. Si elle dépasse 15 %, ouvrir un chantier de fusion dédié. |
@@ -4333,5 +4337,8 @@ indépendantes et peuvent partir en parallèle si une machine se libère.
 Prérequis inchangés pour toute mesure : build Release
 (`Scripts/build-release.sh`), `Scripts/preflight-resident.sh` au vert,
 `caffeinate -dimsu` autour du run, et vérification du modèle chargé via
-`/healthz` avant d'inscrire un chiffre. **Le réglage de veille sur secteur
+`/healthz` avant d'inscrire un chiffre. **Ajouté le 2026-09-12 par P11.1 :
+toute comparaison de débit passe par le serveur chaud en tours entrelacés**
+(écart-type 0,05 tok/s) et non par une sonde en process neuf (plusieurs tok/s
+de dispersion, qui avaient fabriqué un « +18 % » inexistant). **Le réglage de veille sur secteur
 n'est toujours pas corrigé** (G-8 d).

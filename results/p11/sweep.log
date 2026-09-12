@@ -1,0 +1,22 @@
+23:01:05  décodage K=10
+   code 0 · 
+continuation de référence : 128 tokens
+23:02:19  qualité K=10
+   code 0 · mean logprob: -0.338595
+23:03:26  décodage K=8
+   code 0 · 
+23:04:38  qualité K=8
+   code 0 · mean logprob: -0.368740
+23:05:46  décodage K=6
+   code 0 · 
+23:06:55  qualité K=6
+   code 0 · mean logprob: -0.405074
+23:08:01  décodage K=5
+   code 0 · 
+23:09:10  qualité K=5
+   code 0 · mean logprob: -0.479914
+23:10:16  décodage K=4
+   code 0 · 
+23:11:29  qualité K=4
+   code 0 · mean logprob: -0.702359
+23:12:38  balayage terminé

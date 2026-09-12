@@ -1,0 +1,14 @@
+routed experts (K) : 6/512
+=== tour 1 ===
+Le président de la République populaire de Chine est Xi Jinping. Il est le noyau dirigeant du Parti communiste chinois et du peuple chinois de toutes les ethnies, et a été élu à plusieurs reprises comme président de la Commission militaire centrale et président de la Commission nationale de la Défense nationale. Il a été réélu comme président de la Commission militaire centrale lors de la première session de la 14e Assemblée nationale populaire en mars 2023.
+
+En tant que dirigeant du Parti communiste chinois et de l'État, le président de la Chine joue un rôle important dans la direction du développement
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 182326, 188209, 401, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501, 874, 88, 2770, 162082, 505, 3717, 179342, 47561, 68, 215309, 1778, 3717, 193149, 215309, 401, 38332, 3424, 75405, 536, 11, 1778, 264, 22899, 234864, 3656, 49046, 228332, 20912, 85648, 401, 1147, 9364, 198070, 175030, 1778, 85648, 401, 1147, 9364, 174503, 401, 1147, 219787, 1081, 174503, 13, 7305, 264, 22899, 9056, 933, 9543, 20912, 85648, 401, 1147, 9364, 198070, 175030, 35632, 401, 1147, 52219, 3669, 401, 1147, 220, 16, 19, 68, 1577, 167376, 174503, 188209, 644, 45772, 220, 17, 15, 17, 18, 13, 271, 1642, 35316, 1649, 162082, 505, 3717, 179342, 47561, 68, 215309, 1778, 401, 324, 6, 184267, 11, 501, 85648, 401, 1147, 183085, 174912, 632, 176517, 2894, 6652, 1147, 4944, 3717, 78709]
+TTFT: 61.731s
+prefill: 61.731s
+decode: 6.521s
+couches: 6144 visites · load cumulé 61.504s
+P4.2 fin de token (cumulé) : lm_head 0.2217s · sampler.sample 0.0004s · .item() 0.0347s
+MLX mémoire active: 57,39 GB
+MLX mémoire peak: 57,43 GB
