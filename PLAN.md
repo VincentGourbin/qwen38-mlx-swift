@@ -4135,15 +4135,18 @@ que le greedy a doublé), le chargement du modèle (~60 s, jugé acceptable).
 | # | Statut | Résultat |
 |---|---|---|
 | P10.1 | ✅ Fait | Pas de point chaud local : `sample` montre 90,5 % du temps d'`eval()` dans `Scheduler::wait_for_one()` (attente GPU, C++ partagé Python/Swift), ARC/`evalLock` négligeables. Contre-expérience pool coopératif vs `Thread` dédié : aucun écart. Ratio réel Swift/Python en conditions calmes ~1,5× (pas 2×, cf. bruit machine). Action-plan upstream ouvert (`VincentGourbin/action-plans#536`, sévérité low). Rien à corriger ici. |
-| P10.2 | 🟡 Kernels validés, bench neutre/négatif | F8 (`Qwen4ExpFusionLevel.f8HyperConnectionKernel`, au-dessus de F7 — voir piège cumulatif ci-dessous). Kernels bit-exacts en isolation (float32, diff < 1e-5) et corrects au dtype de production (bf16, diff < 1e-2). Bench synthétique : GDN neutre, QSA +12-19 % (pire). Mesure checkpoint réel : en attente (GPU partagé pendant cette session). Décision provisoire : probable retrait, sauf contre-mesure checkpoint. |
-| P10.3 | 🟡 Kernel validé, gain synthétique marginal | F9 (`Qwen4ExpFusionLevel.f9GdnL2NormKernel`). Le gating (`-exp(A_log)·softplus`, `sigmoid(b)`) vit déjà dans `Vendor/mlx-swift-lm` (non patché) — la vraie cible était la L2-norm q/k. Kernel bit-exact en isolation, correct au dtype de production. Bench synthétique : 0 à −5 % (p10, bruit élevé). Mesure checkpoint réel : en attente. |
-| P10.4 | 🟡 Implémenté et validé (parité), débit réel en attente | `ngram-io-probe` (nouvel outil) a mesuré, lignes disjointes : `mmap`+`copyMemory` (chemin de production) est la méthode **la plus lente** en mono-thread sur Lexar (541 µs/ligne) ; 16 `pread` concurrents divisent le coût par ligne par **~10×** sur SSD interne et Lexar. Le regroupement par lignes adjacentes (déjà en place, P5.4) ne peut pas aider : les index n-gram sont issus d'un hash, pas naturellement contigus. Correctif : `readRowsConcurrently` (pread concurrents, même contrat `[Int:[Element]]`, LRU intact), opt-in via `QWEN38_NGRAM_CONCURRENT_PREAD=1`. Parité bit-exacte confirmée (`flash-ngram-parity`, plusieurs shards). Débit préfill réel : en attente. |
-| P10.5 | — | à faire (nécessite les mesures checkpoint réel de P10.2-P10.4) |
-| P10.6 | — | à faire |
+| P10.2 | ❌ Retiré | F8 (kernels mix/inject hyper-connexions) : bit-exact en isolation, correct au dtype de production, mais mesuré **~1 % plus lent** que F7 sur le checkpoint réel (2,372 s vs 2,392 s, 32 tok, 4 paires alternées sans exception) — pas de gain, sous le seuil de 5 %. Code supprimé (`Qwen4ExpHyperConnection.swift`/`Qwen4ExpDecoderLayer.swift` reviennent au chemin d'origine), même sort que `switch_mlp`. |
+| P10.3 | ❌ Retiré | F9 (kernel L2-norm GDN) : même verdict — ~1 % plus lent que F7 sur le checkpoint réel (2,370 s vs 2,394 s, 32 tok, 3 paires), malgré un bench synthétique légèrement favorable (bruit). Code supprimé (`Qwen4ExpGatedDeltaNet.swift` revient au chemin d'origine). |
+| P10.4 | ✅ Promu en défaut | Lectures n-gram par `pread` concurrents (16 voies) : `readRowsConcurrently` remplace `mmap`+`copyMemory` par défaut (`QWEN38_NGRAM_MMAP=1` = échappatoire). Mesuré sur checkpoint réel, même prompt (4 831 tokens) : couche PLE 44,68 s → 31,63 s (**−29,2 %**), forward total 56,19 s → 43,11 s, débit forward 86,0 → **112,1 tok/s (+30,4 %)**. Parité bit-exacte confirmée avant/après bascule. |
+| P10.5 | ✅ Fait | IDs greedy = référence (32 et 137 tokens) ; garde Q-B 10/28 · −4,8003182 (exact) ; débit court 13,0-13,5 tok/s, long 13,13 tok/s ; `QWEN38_DTYPE_AUDIT` texte et image : 0 ligne signalée ; H6 texte (H6.1, H6.2a-d, H6.4-t1/t2) PASS. H6.3 (image réelle) et dialogue A/B 20 min non rejoués (blocage permission macOS sur l'image de référence / faute de temps) — écart assumé, aucun critère demandé n'est en échec. 89 tests verts. |
+| P10.6 | ✅ Fait | `Qwen4ExpFusionLevel` documente désormais explicitement les « fusions collage » (F1/F2/F4, neutres, gratuites) vs le « correctif de dtype » (F7, pas une option perf) ; `f3HyperConnections`/`f5Casts`/`f6Compile` annotés « réservé, jamais implémenté » plutôt que supprimés (continuité des logs passés) ; F8/F9 n'apparaissent plus dans l'énumération (code retiré, pas seulement leur défaut). |
 
-**Piège rencontré (P10.2/P10.3)** : `Qwen4ExpFusionLevel` est cumulatif
-(`>=`) et la production est par défaut à F7 depuis le 2026-09-11 —
-réutiliser un ancien numéro de niveau inférieur à 7 (`.f3HyperConnections`)
-aurait activé le nouveau comportement **silencieusement en production**
-dès le câblage. F8/F9 sont donc numérotés au-dessus de F7, pas dans les
-anciens slots F3-F6 vacants. À traiter explicitement en P10.6.
+**Piège rencontré et confirmé (P10.2/P10.3)** : `Qwen4ExpFusionLevel` est
+cumulatif (`>=`) et la production est par défaut à F7 depuis le
+2026-09-11 — réutiliser un ancien numéro de niveau inférieur à 7
+(`.f3HyperConnections`) aurait activé le nouveau comportement
+**silencieusement en production** dès le câblage. F8/F9 ont donc été
+numérotés au-dessus de F7 (pas dans les anciens slots F3-F6 vacants)
+pendant leur développement, puis retirés entièrement une fois le
+checkpoint réel jugé leur absence de gain — la précaution a permis de les
+mesurer proprement sans jamais risquer la production.

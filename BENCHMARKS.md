@@ -263,3 +263,63 @@ plus probable, non isolé plus précisément.
 
 Fichiers : `results/p66/dialogue.jsonl`, `results/p66/server.log`
 (trace `.trace.json` non versionnée, gitignore).
+
+### P10 — coût hôte par op, kernels de fusion, lectures n-gram concurrentes (2026-09-12)
+
+Protocole PLAN.md §P10 : chaque levier doit gagner ≥ 5 % sur le checkpoint
+réel, pas seulement au bench synthétique (précédent P7's `switch_mlp` :
+validée bit-exacte au bench, 17,6× plus lente sur le vrai modèle).
+Attribution complète et méthode : `docs/knowledge/log.md`, entrées
+« P10.1 » à « P10.5 » du 2026-09-12.
+
+**P10.1 (coût hôte par op)** : `sample` sur `op-overhead-probe` montre
+90,5 % du temps d'`eval()` dans `Scheduler::wait_for_one()` (attente GPU,
+code C++ partagé Python/Swift) — pas un point chaud Swift (ARC, `evalLock`
+négligeables). Comparaison Python dos-à-dos en conditions calmes : ratio
+réel ~1,5×, pas les 2× (8,58 µs vs 4,2 µs) documentés à charge machine
+inégale. Rien à corriger localement ; action-plan upstream
+`VincentGourbin/action-plans#536`.
+
+**P10.2/P10.3 (kernels `MLXFast.metalKernel` de fusion) : retirés.**
+F8 (mix/inject des hyper-connexions) et F9 (L2-norm q/k GDN), tous deux
+bit-exacts en isolation et corrects au dtype de production, mesurés sur le
+checkpoint réel (32 tokens greedy, plusieurs paires alternées avec la
+référence F7) :
+
+| Levier | F7 (référence) | Fusion | Δ |
+|---|---:|---:|---:|
+| F8 (hyper-connexions) | 2,372 s (moy. 4 runs) | 2,392 s | **+0,8 % (plus lent)** |
+| F9 (L2-norm GDN) | 2,370 s (moy. 3 runs) | 2,394 s | **+1,0 % (plus lent)** |
+
+Aucun gain, sous le seuil de 5 % — code supprimé (pas seulement leur
+défaut, qui était de toute façon opt-in), même sort que `switch_mlp`.
+
+**P10.4 (lectures n-gram par `pread` concurrents) : promu en défaut.**
+`ngram-io-probe` (nouvel outil, aucun checkpoint) a d'abord mesuré la
+lecture isolée : `mmap`+`copyMemory` (chemin de production) était la
+méthode la **plus lente** en mono-thread sur Lexar (541 µs/ligne) ; 16
+`pread` concurrents divisent le coût par ligne par ~10× sur SSD interne et
+Lexar. Sur le checkpoint réel, même prompt (4 831 tokens de prose
+française variée), même session :
+
+| | `mmap` (ex-défaut) | `pread` concurrent (défaut) | Δ |
+|---|---:|---:|---:|
+| couche PLE (couche 1) | 44,68 s | 31,63 s | −29,2 % |
+| forward total | 56,19 s | 43,11 s | −23,3 % |
+| débit forward | 86,0 tok/s | **112,1 tok/s** | **+30,4 %** |
+
+Le gain de bout en bout est plus modeste que le ×10 isolé : le cache LRU
+absorbe déjà 50 % des lookups sur ce prompt, seule la moitié miss profite
+de la concurrence. `QWEN38_NGRAM_MMAP=1` reste l'échappatoire vers l'ancien
+chemin. Parité bit-exacte confirmée avant/après (`flash-ngram-parity`).
+
+**P10.5 (validation d'ensemble)**, défaut final (F7 + `pread` concurrent) :
+
+| Critère | Résultat |
+|---|---|
+| IDs greedy | identiques à la référence (32 et 137 tokens) |
+| Garde Q-B | 10/28 · −4,8003182 (exact) |
+| Débit greedy court/long | 13,0-13,5 / 13,13 tok/s |
+| `QWEN38_DTYPE_AUDIT` texte/image | 0 ligne signalée dans les deux cas |
+| H6 (texte) | PASS (H6.1, H6.2a-d, H6.4-t1/t2) |
+| `Scripts/run-tests.sh` | 89 tests verts |

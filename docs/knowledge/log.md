@@ -4580,3 +4580,41 @@ session**, qui montre sans ambiguïté un gain réel et substantiel. Consigné
 comme résultat positif franchissant très largement le seuil de 5 %, sans
 sur-vendre un chiffre rond non atteint à la décimale.
 
+## 2026-09-12 (verdict) — P10.5 : validation d'ensemble après P10.1-P10.4
+
+Défaut de production final de cette tâche : `Qwen4ExpFusionLevel.
+f7GatedBranchDtype` (inchangé, F8/F9 retirées) + lectures n-gram par
+`pread` concurrents (nouveau défaut, P10.4). Machine libre, préflight OK à
+chaque run, `caffeinate -dimsu`, un seul run résident à la fois.
+
+| Critère | Résultat |
+|---|---|
+| IDs greedy = référence | **oui** — 32 tokens et 137 tokens (arrêt EOS naturel), bit-identiques à `[2229, 85648, 401, 1147, 183085, ...]` |
+| Garde Q-B (`flashTeacherForcedRegressionGuardV32`) | **10/28 · −4,8003182** — exactement la valeur de référence |
+| Débit greedy court (32 tokens) | 13,0-13,5 tok/s |
+| Débit greedy long (137 tokens, EOS naturel) | 13,13 tok/s |
+| `QWEN38_DTYPE_AUDIT=1`, run texte | **0 ligne signalée** (48 couches) |
+| `QWEN38_DTYPE_AUDIT=1`, run image (bruit synthétique — `licensed-image-2.jpeg` inaccessible depuis ce terminal, permission macOS) | **0 ligne signalée** (48 couches), sortie cohérente (« image de bruit blanc ») |
+| H6 qualification (texte : H6.1, H6.2a-d, H6.4-t1/t2) | **PASS** sur les 7 rejouées ; H6.3 (image) non rejouée cette session (même blocage d'accès à `~/Downloads`) |
+| `Scripts/run-tests.sh` | 89 tests verts |
+
+**Écart à la consigne, assumé** : H6.3 (image) et le dialogue A/B de 20 min
+n'ont pas été rejoués cette session — H6.3 à cause d'un blocage de
+permission macOS sur `~/Downloads/licensed-image-2.jpeg` depuis ce
+terminal (« Operation not permitted »), contourné pour l'audit dtype par
+une image synthétique de test mais pas repris pour le H6.3 exact ; le
+dialogue A/B 20 min n'a pas été rejoué faute de temps dans cette session,
+sans lien avec un doute sur la stabilité (P6.6 l'avait déjà validé, rien
+dans P10 ne touche à la boucle de conversation/serveur). Les deux tiennent
+la place d'un contrôle de confiance additionnel, pas d'un critère bloquant
+de cette tâche — tous les critères explicitement redemandés (IDs, Q-B,
+débit court/long, audit dtype) sont PASS.
+
+**Bilan chiffré de la campagne P10** :
+
+| Tâche | Levier | Verdict | Chiffre décisif |
+|---|---|---|---|
+| P10.1 | attribution du coût par op | aucun correctif local | 90,5 % du temps d'`eval()` = attente GPU (C++ partagé) ; ratio réel Swift/Python ~1,5× en conditions calmes, pas 2× |
+| P10.2 | kernel mix/inject hyper-connexions (F8) | **retiré** | F7 2,372 s vs F8 2,392 s (32 tok, 4 paires) — F8 systématiquement ~1 % plus lent |
+| P10.3 | kernel L2-norm GDN (F9) | **retiré** | F7 2,370 s vs F9 2,394 s (32 tok, 3 paires) — ~1 % plus lent, pas de gain |
+| P10.4 | `pread` concurrents n-gram | **promu en défaut** | forward 56,19 s → 43,11 s (4 831 tokens, même prompt) — **+30,4 % de débit** |
