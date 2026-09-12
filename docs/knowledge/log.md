@@ -4218,3 +4218,67 @@ intégralement en bf16. Le décodage après image tombe à 0,478 s pour 2 tokens
 été trouvées par la mesure, pas par la lecture ; l'audit les aurait montrées
 en une commande. À lancer après toute modification touchant une frontière de
 couche, un cache ou un encodeur.
+
+## 2026-09-12 — P10.1 : le facteur ~2x « Swift vs Python » n'est pas l'ARC, pas un lock, pas le pool coopératif
+
+Protocole PLAN.md §P10, P10.1. Point de départ (tableau d'attribution
+post-F7) : 8,58 µs/op mesurés côté Swift (`qwen38 op-overhead-probe`, chaîne
+dépendante de 200 additions, Release) contre 4,2 µs/op en MLX Python, même
+machine, même version C++ (0.31.1 embarquée par mlx-swift 0.31.6).
+
+**Méthode** : `sample <pid> 8` (macOS `sample`, pas Instruments) sur
+`op-overhead-probe --chain 8000 --reps 300` pendant la mesure de la chaîne
+d'additions. Le thread « main » Dispatch reste parqué dans un `CFRunLoop`
+pour toute la durée (`AsyncParsableCommand.main` → async main) ; le travail
+réel tourne sur le pool coopératif de Swift Concurrency. Sur ce thread,
+5331/5419 échantillons (98,4 %) tombent dans `OpOverheadProbe.run() →
+eval(_:) → mlx_eval → mlx::core::eval → eval_impl`. À l'intérieur :
+
+| Poste | Échantillons | % |
+|---|---:|---:|
+| `Scheduler::wait_for_one()` (`condition_variable::wait`, bloquant) | 4677/5165 | 90,5 % |
+| Dispatch hôte réel (command encoder, driver AGX, fences IOKit) | 362/5165 | 7,0 % |
+| Reste (traversée de graphe C++, marshaling `mlx_eval`) | 126/5165 | 2,5 % |
+
+`swift_retain`/`swift_release`/`swift_allocObject` (ARC, allocation
+`MLXArray`) : une poignée d'occurrences sur ~2400 lignes de trace —
+négligeables. `evalLock` (`NSRecursiveLock`,
+`Source/MLX/Transforms+Eval.swift:9,17` du checkout mlx-swift local)
+n'apparaît pas comme poste séparable à la résolution 1 ms de `sample`.
+
+**Contre-expérience** (hypothèse : le réveil d'un thread du pool coopératif
+après le signal de complétion Metal coûte plus cher qu'un thread classique,
+faute d'équivalent côté Python). Ajout temporaire à `OpOverheadProbe.run()`
+(`Sources/Qwen38CLI/Qwen38CLI.swift`) : même chaîne exécutée (a) dans le
+contexte async normal et (b) sur un `Thread` dédié (sémaphore, QoS `.default`
+et `.userInteractive`), chauffe partagée, mesures alternées pour neutraliser
+un biais d'ordre. 3 runs machine calme (`--chain 2000 --reps 60`) :
+cooperative 4,20-6,78 µs/op, Thread `.default` 4,21-7,60 µs/op, Thread
+`.userInteractive` 4,22-5,71 µs/op — **aucun écart mesurable**. Hypothèse
+écartée : ce n'est pas le pool coopératif.
+
+**Comparaison Python dos-à-dos**, même session shell, même état machine
+(python3 système, mlx 0.31.2, proche de 0.31.1) : même chaîne, même chauffe
+→ 2,62-3,18 µs/op sur plusieurs essais entrelacés avec la mesure Swift
+(4,20-4,51 µs/op dans la fenêtre immédiatement adjacente). **Ratio réel et
+reproductible en conditions calmes : ~1,5×, pas 2×** — le 2× documenté
+provenait vraisemblablement d'une charge machine différente entre les deux
+mesures d'origine (variance observée entre runs Swift successifs sur cette
+même machine : 4,2 à 7,6 µs/op selon la charge résiduelle d'Xcode/
+SourceKit).
+
+**Conclusion** : le point chaud n'est pas dans notre usage
+(`Qwen38CLI`/`Qwen4Exp*`) — le budget est presque entièrement consommé à
+l'intérieur de mlx-swift (`Transforms+Eval.swift` → `mlx_eval` → C++
+partagé), avant même d'atteindre notre code, et rien côté ARC/lock/
+allocation Swift ne ressort du profil. Le ratio résiduel ~1,5× est
+vraisemblablement l'indirection architecturale de mlx-swift (binding C
+`mlx-c` avec marshaling/refcounting à la frontière C) contre le binding
+direct pybind11-C++ de Python — pas un bug corrigeable localement. Action
+plan ouvert : `VincentGourbin/action-plans#536` (kind `upstream-blocker`,
+projet `mlx-swift`, sévérité `low` — le gain théorique d'un correctif
+upstream resterait modeste face au budget d'ops qui domine désormais,
+§P8.4). Rien à corriger ici ; passage à P10.2.
+
+Diagnostic conservé dans `op-overhead-probe` (mesures « cooperative pool »
+vs « Thread .default/.userInteractive ») pour reproduction future.

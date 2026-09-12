@@ -2191,14 +2191,61 @@ struct OpOverheadProbe: AsyncParsableCommand {
         let dim = 2560
         var seed = MLXArray.ones([1, 1, dim], dtype: .bfloat16)
         eval(seed)
+        // P10.1 : chauffe partagée AVANT toute mesure comparative — sans ça,
+        // la toute première mesure paie seule la compilation du kernel Metal
+        // "addition" (JIT PSO), ce qui fausserait une comparaison
+        // cooperative-pool vs thread dédié en faveur de la mesure qui passe
+        // en second. `eval()` de quelques additions suffit à forcer cette
+        // compilation une fois pour toutes avant de comparer.
+        do { var y = seed; for _ in 0 ..< 8 { y = y + 1.0 }; eval(y) }
+        func measureAddition() -> Double {
+            for _ in 0 ..< 3 { var y = seed; for _ in 0 ..< chain { y = y + 1.0 }; eval(y) }
+            let start = Date()
+            for _ in 0 ..< reps { var y = seed; for _ in 0 ..< chain { y = y + 1.0 }; eval(y) }
+            return Date().timeIntervalSince(start) * 1e6 / Double(reps) / Double(chain)
+        }
+        func report(_ label: String, _ us: Double) {
+            print("\(label.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%8.2f", us)) µs/op")
+        }
         func measure(_ label: String, _ body: (MLXArray) -> MLXArray) {
             for _ in 0 ..< 3 { var y = seed; for _ in 0 ..< chain { y = body(y) }; eval(y) }
             let start = Date()
             for _ in 0 ..< reps { var y = seed; for _ in 0 ..< chain { y = body(y) }; eval(y) }
-            let us = Date().timeIntervalSince(start) * 1e6 / Double(reps) / Double(chain)
-            print("\(label.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%8.2f", us)) µs/op")
+            report(label, Date().timeIntervalSince(start) * 1e6 / Double(reps) / Double(chain))
         }
-        measure("addition scalaire [1,1,2560]") { $0 + 1.0 }
+        // P10.1 : `measureAddition()` (ci-dessus) tourne sur le thread
+        // coopératif de Swift Concurrency (AsyncParsableCommand.main →
+        // async main → pool "com.apple.root.default-qos.cooperative",
+        // confirmé par `sample` — le thread « main » Dispatch reste parqué
+        // dans un CFRunLoop pendant toute la mesure). Hypothèse à trancher :
+        // le réveil d'un thread coopératif après le signal du gestionnaire
+        // de complétion Metal (`Scheduler::wait_for_one`, condition
+        // variable) coûte-t-il plus cher que sur un thread classique (comme
+        // l'interpréteur Python, qui n'a pas de pool coopératif) ? Même
+        // chaîne, exécutée de façon synchrone sur un `Thread` dédié via un
+        // sémaphore, hors de tout contexte `async`. Alterné 2× avec la
+        // mesure coopérative (même chauffe partagée ci-dessus) pour
+        // neutraliser un biais d'ordre ou de bruit machine transitoire.
+        func measureOnDedicatedThread(qos: QualityOfService) -> Double {
+            var us: Double = 0
+            let sem = DispatchSemaphore(value: 0)
+            let thread = Thread {
+                for _ in 0 ..< 3 { var y = seed; for _ in 0 ..< chain { y = y + 1.0 }; eval(y) }
+                let start = Date()
+                for _ in 0 ..< reps { var y = seed; for _ in 0 ..< chain { y = y + 1.0 }; eval(y) }
+                us = Date().timeIntervalSince(start) * 1e6 / Double(reps) / Double(chain)
+                sem.signal()
+            }
+            thread.qualityOfService = qos
+            thread.start()
+            sem.wait()
+            return us
+        }
+        report("addition, cooperative pool (1)", measureAddition())
+        report("addition, Thread .default (1)", measureOnDedicatedThread(qos: .default))
+        report("addition, cooperative pool (2)", measureAddition())
+        report("addition, Thread .default (2)", measureOnDedicatedThread(qos: .default))
+        report("addition, Thread .userInteractive", measureOnDedicatedThread(qos: .userInteractive))
         measure("multiplication élémentaire") { $0 * $0 }
         measure("silu") { MLXNN.silu($0) }
         measure("reshape (sans calcul)") { $0.reshaped([1, dim, 1]).reshaped([1, 1, dim]) }

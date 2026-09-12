@@ -4129,3 +4129,14 @@ multiplie tout le reste.
 Hors périmètre : P3 (déchargement disque des experts — ne se justifie plus
 que par la qualité du 4-bit), le MTP (clos : il ne gagne plus que 3 % depuis
 que le greedy a doublé), le chargement du modèle (~60 s, jugé acceptable).
+
+**Statut (2026-09-12)** :
+
+| # | Statut | Résultat |
+|---|---|---|
+| P10.1 | ✅ Fait | Pas de point chaud local : `sample` montre 90,5 % du temps d'`eval()` dans `Scheduler::wait_for_one()` (attente GPU, C++ partagé Python/Swift), ARC/`evalLock` négligeables. Contre-expérience pool coopératif vs `Thread` dédié : aucun écart. Ratio réel Swift/Python en conditions calmes ~1,5× (pas 2×, cf. bruit machine). Action-plan upstream ouvert (`VincentGourbin/action-plans#536`, sévérité low). Rien à corriger ici. |
+| P10.2 | — | à faire |
+| P10.3 | — | à faire |
+| P10.4 | — | à faire |
+| P10.5 | — | à faire |
+| P10.6 | — | à faire |
