@@ -878,8 +878,17 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     /// (H3.2's "options ignorées, pas de traduction" contract).
     private(set) var lastGenerateOptions: Qwen38GenerationOptions?
     private(set) var lastGenerateFromMessagesOptions: Qwen38GenerationOptions?
+    /// P11.1 : imite `Qwen4ExpStreamingTextModel.routedExpertCount` — un
+    /// entier concret même sans surcharge (10, la valeur du checkpoint réel).
+    var routedExpertCount = 10
 
     init(directory: URL) { self.directory = directory }
+
+    @discardableResult
+    func setRoutedExpertCount(_ override: Int?) throws -> Int {
+        routedExpertCount = override ?? 10
+        return routedExpertCount
+    }
 
     func resetConversation() { resetConversationCount += 1 }
     func unload() { unloadCount += 1 }
@@ -968,8 +977,11 @@ private final class MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory, @u
     /// here instead of downcasting `Qwen38Runtime`'s private storage.
     private(set) var lastEngine: MockFlashNextEngine?
 
-    func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol {
+    func makeEngine(
+        directory: URL, routedExpertCount: Int? = nil
+    ) async throws -> any Qwen38FlashNextEngineProtocol {
         let engine = MockFlashNextEngine(directory: directory)
+        if let routedExpertCount { engine.routedExpertCount = routedExpertCount }
         lastEngine = engine
         return engine
     }
@@ -2771,4 +2783,66 @@ func qwen4ExpSparseMoERoutingSurvivesImpreciseSoftmax() {
         }
     }
     #expect(mismatches == 0, "\(mismatches)/200 vecteurs de logits ont changé de routage")
+}
+
+// MARK: - P11.1 : largeur de routage MoE réglable à l'exécution
+
+@Test("P11.1 : sans surcharge, la valeur du checkpoint est utilisée telle quelle")
+func qwen4ExpRoutedExpertCountResolvesToCheckpointDefaultWhenAbsent() throws {
+    let resolved = try qwen4ExpResolveRoutedExpertCount(
+        override: nil, checkpointDefault: 10, numExperts: 512)
+    #expect(resolved == 10)
+}
+
+@Test("P11.1 : une surcharge dans les bornes remplace la valeur du checkpoint")
+func qwen4ExpRoutedExpertCountResolvesToOverrideWhenPresent() throws {
+    for candidate in [1, 4, 5, 6, 8, 10, 512] {
+        let resolved = try qwen4ExpResolveRoutedExpertCount(
+            override: candidate, checkpointDefault: 10, numExperts: 512)
+        #expect(resolved == candidate)
+    }
+}
+
+@Test("P11.1 : une surcharge supérieure à la valeur du checkpoint mais ≤ numExperts est acceptée (monotonie K > 10)")
+func qwen4ExpRoutedExpertCountAcceptsOverrideAboveCheckpointDefault() throws {
+    // Edge0 divise K par deux sur son tier phare (K < checkpointDefault) ;
+    // PLAN.md P11.1 demande explicitement de pouvoir aussi vérifier la
+    // monotonie dans l'autre sens (K > checkpointDefault), tant que la
+    // borne dure de `numExperts` est respectée.
+    let resolved = try qwen4ExpResolveRoutedExpertCount(
+        override: 20, checkpointDefault: 10, numExperts: 512)
+    #expect(resolved == 20)
+}
+
+@Test("P11.1 : une surcharge nulle ou négative est rejetée avec un message clair")
+func qwen4ExpRoutedExpertCountRejectsBelowOne() {
+    for invalid in [0, -1, -10] {
+        #expect(throws: Qwen4ExpRoutedExpertCountError.outOfBounds(requested: invalid, numExperts: 512)) {
+            try qwen4ExpResolveRoutedExpertCount(
+                override: invalid, checkpointDefault: 10, numExperts: 512)
+        }
+    }
+}
+
+@Test("P11.1 : une surcharge supérieure à numExperts est rejetée avec un message clair")
+func qwen4ExpRoutedExpertCountRejectsAboveNumExperts() {
+    #expect(throws: Qwen4ExpRoutedExpertCountError.outOfBounds(requested: 513, numExperts: 512)) {
+        try qwen4ExpResolveRoutedExpertCount(
+            override: 513, checkpointDefault: 10, numExperts: 512)
+    }
+}
+
+@Test("P11.1 : la borne haute exacte (override == numExperts) est acceptée")
+func qwen4ExpRoutedExpertCountAcceptsExactNumExperts() throws {
+    let resolved = try qwen4ExpResolveRoutedExpertCount(
+        override: 512, checkpointDefault: 10, numExperts: 512)
+    #expect(resolved == 512)
+}
+
+@Test("P11.1 : le message d'erreur nomme la valeur reçue et la borne haute")
+func qwen4ExpRoutedExpertCountErrorDescriptionIsClear() {
+    let error = Qwen4ExpRoutedExpertCountError.outOfBounds(requested: 0, numExperts: 512)
+    let description = error.errorDescription ?? ""
+    #expect(description.contains("0"))
+    #expect(description.contains("512"))
 }

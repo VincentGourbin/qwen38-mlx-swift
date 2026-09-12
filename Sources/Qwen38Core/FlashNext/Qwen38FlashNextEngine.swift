@@ -51,6 +51,20 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     /// requests it (`options.mtp.enabled`), so this starts as `.fallback`
     /// and flips to `.active` once that load has happened.
     var mtpState: Qwen38MTPAvailability { get }
+    /// P11.1 : largeur de routage MoE effective (`num_experts_per_tok` du
+    /// checkpoint, sauf surcharge) — publiée telle quelle par `/healthz` et
+    /// dans les métriques de chaque tour pour qu'une mesure ne puisse pas
+    /// se croire à un K qui n'est plus en vigueur (PLAN.md P11.1).
+    var routedExpertCount: Int { get }
+    /// P11.1 : change la largeur de routage MoE de l'engin résident sans
+    /// recharger le checkpoint. `nil` revient à la valeur du checkpoint ;
+    /// une valeur hors bornes lève une erreur claire (`Qwen4ExpRoutedExpertCountError`)
+    /// au lieu de faire tomber le process — appelable en toute sécurité
+    /// depuis une requête serveur. Répercutée sur le drafter MTP s'il est
+    /// déjà chargé, avec la même valeur que la cible (voir
+    /// `Qwen4ExpMTPPredictor.setRoutedExpertCount`).
+    @discardableResult
+    func setRoutedExpertCount(_ override: Int?) throws -> Int
     func resetConversation()
     func unload()
     func decode(tokenIDs: [Int32]) -> String
@@ -93,14 +107,24 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
 }
 
 public protocol Qwen38FlashNextEngineFactory: Sendable {
-    func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol
+    /// P11.1 : `routedExpertCount` surcharge `num_experts_per_tok` du
+    /// checkpoint — `nil` (comportement inchangé partout ailleurs) laisse
+    /// le décodeur utiliser sa propre valeur. Pas de valeur par défaut ici :
+    /// Swift n'applique jamais un défaut de paramètre à un appel fait à
+    /// travers un type protocole/existentiel — seul le type concret en
+    /// bénéficie (voir `Qwen38DefaultFlashNextEngineFactory`).
+    func makeEngine(
+        directory: URL, routedExpertCount: Int?
+    ) async throws -> any Qwen38FlashNextEngineProtocol
 }
 
 public struct Qwen38DefaultFlashNextEngineFactory: Qwen38FlashNextEngineFactory {
     public init() {}
 
-    public func makeEngine(directory: URL) async throws -> any Qwen38FlashNextEngineProtocol {
-        try await Qwen38FlashNextEngine(directory: directory)
+    public func makeEngine(
+        directory: URL, routedExpertCount: Int? = nil
+    ) async throws -> any Qwen38FlashNextEngineProtocol {
+        try await Qwen38FlashNextEngine(directory: directory, routedExpertCount: routedExpertCount)
     }
 }
 
@@ -196,7 +220,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     /// used throughout `flash-layer-bench --async-interval`) is the default.
     public init(
         directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true,
-        residentAsyncInterval: Int = 8, uncachedIO: Bool = true
+        residentAsyncInterval: Int = 8, uncachedIO: Bool = true,
+        /// P11.1 : surcharge de `num_experts_per_tok` pour le modèle
+        /// résident — voir `Qwen4ExpStreamingTextModel`'s doc comment.
+        /// `nil` (le défaut) laisse le comportement inchangé.
+        routedExpertCount: Int? = nil
     ) async throws {
         self.sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
@@ -212,7 +240,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             directory: directory, layerLoadingMode: .resident, residentEvaluationInterval: 1,
             profileLayers: profileLayers, residentAsyncEval: residentAsyncEval,
             residentAsyncInterval: residentAsyncInterval,
-            uncachedIO: uncachedIO)
+            uncachedIO: uncachedIO, routedExpertCount: routedExpertCount)
         self.generator = Qwen4ExpStreamingGenerator(model: model)
         self.stopTokenIDs = [
             configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
@@ -232,6 +260,22 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         mtpPredictor != nil
             ? .active
             : .fallback("Flash-Next : MTP local chargé à la demande au premier tour MTP")
+    }
+
+    /// P11.1 : largeur de routage MoE effective du modèle résident.
+    public var routedExpertCount: Int { model.routedExpertCount }
+
+    /// P11.1 : change la largeur de routage MoE de l'engin résident, cible
+    /// et drafter MTP (s'il est déjà chargé) ensemble — voir le commentaire
+    /// du protocole. Ne recharge aucun poids, donc appelable entre deux
+    /// requêtes sans reproduire le coût d'E/S du chargement initial.
+    @discardableResult
+    public func setRoutedExpertCount(_ override: Int?) throws -> Int {
+        let resolved = try model.updateRoutedExpertCount(override)
+        if let mtpPredictor {
+            try mtpPredictor.setRoutedExpertCount(resolved)
+        }
+        return resolved
     }
 
     public func resetConversation() {
@@ -545,7 +589,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                         cacheReused: continueConversation,
                                         conversationReplayed: false,
                                         inputDescription: inputDescription,
-                                        mtpStatus: mtpStatus)))
+                                        mtpStatus: mtpStatus,
+                                        routedExpertCount: self.model.routedExpertCount)))
                         }
                     }
                     continuation.finish()
@@ -590,8 +635,13 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                     if let loaded = self.mtpPredictor {
                         predictor = loaded
                     } else {
+                        // P11.1 : le drafter reçoit la même largeur de
+                        // routage que la cible, sauf distinction explicite
+                        // (aucune ici) — voir `Qwen4ExpMTPLoader.load`'s
+                        // doc comment.
                         let loaded = try Qwen4ExpMTPLoader.load(
-                            from: self.directory, uncachedIO: true)
+                            from: self.directory, uncachedIO: true,
+                            routedExpertCount: self.model.routedExpertCount)
                         predictor = loaded.model
                         self.mtpPredictor = predictor
                     }
@@ -661,7 +711,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 cacheReused: continueConversation,
                                 conversationReplayed: false,
                                 inputDescription: inputDescription,
-                                mtpStatus: mtpStatus)))
+                                mtpStatus: mtpStatus,
+                                routedExpertCount: self.model.routedExpertCount)))
                     continuation.finish()
                     Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 } catch {

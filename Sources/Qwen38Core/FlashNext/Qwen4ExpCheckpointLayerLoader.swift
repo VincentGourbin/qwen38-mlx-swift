@@ -78,7 +78,11 @@ public enum Qwen4ExpCheckpointLayerLoader {
         materialize: Bool = true,
         useCheckpointQuantization: Bool = true,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype,
+        /// P11.1 : surcharge de la largeur de routage MoE, threadée jusqu'à
+        /// `Qwen4ExpDecoderLayer`/`Qwen4ExpSparseMoE`. `nil` (le défaut)
+        /// reproduit exactement le comportement précédent.
+        routedExpertCount: Int? = nil
     ) throws -> Qwen4ExpLoadedDecoderLayer {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         guard configuration.textConfiguration.layerTypes.indices.contains(layerIndex) else {
@@ -189,7 +193,8 @@ public enum Qwen4ExpCheckpointLayerLoader {
             quantization: useCheckpointQuantization ? checkpointQuantization : nil,
             expertsQuantization: useCheckpointQuantization ? checkpointExpertsQuantization : nil,
             lazyNGramStorage: useCheckpointQuantization ? lazyNGramStorage : nil,
-            fusionLevel: fusionLevel)
+            fusionLevel: fusionLevel,
+            routedExpertCount: routedExpertCount)
         try layer.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
         // P2-fusion: applied after the checkpoint-shaped modules above have

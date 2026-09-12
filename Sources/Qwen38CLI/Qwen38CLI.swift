@@ -560,9 +560,19 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     )
     var fusionLevel: Int = 7
 
+    @Option(
+        name: .long,
+        help:
+            "P11.1 : surcharge de la largeur de routage MoE (num_experts_per_tok du checkpoint) — s'applique aussi au chemin --mtp. Absent = valeur du checkpoint (défaut, inchangé)."
+    )
+    var routedExperts: Int?
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
+        }
+        if let routedExperts, routedExperts < 1 {
+            throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
         }
         guard reportTopK >= 0 else {
             throw ValidationError("--report-top-k doit être positif ou nul")
@@ -684,15 +694,23 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             residentAsyncEval: residentAsync,
             residentAsyncInterval: residentAsyncInterval,
             uncachedIO: !cachedIO,
-            fusionLevel: resolvedFusionLevel)
+            fusionLevel: resolvedFusionLevel,
+            routedExpertCount: routedExperts)
         profiler.end("Flash globals")
+        // P11.1 : toujours affiché (pas seulement en cas de surcharge), pour
+        // ne jamais mesurer en croyant à tort avoir changé K — PLAN.md P11.1.
+        print("routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)")
+        profileSession?.metadata["routed_expert_count"] = String(model.routedExpertCount)
         let generator = Qwen4ExpGreedyGenerator(model: model)
         let stopTokens: Set<Int32> = [
             configuration.textConfiguration.eosTokenID,
             Int32(248044), Int32(248046)
         ].compactMap { $0 }.reduce(into: Set<Int32>()) { $0.insert($1) }
         if mtp {
-            let loadedMTP = try Qwen4ExpMTPLoader.load(from: directory, uncachedIO: !cachedIO)
+            // P11.1 : même largeur de routage que la cible, sauf
+            // distinction explicite (aucune ici).
+            let loadedMTP = try Qwen4ExpMTPLoader.load(
+                from: directory, uncachedIO: !cachedIO, routedExpertCount: model.routedExpertCount)
             let result = try generator.generateMTP(
                 promptTokenIDs: promptIDs,
                 predictor: loadedMTP.model,
@@ -1289,6 +1307,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var fusionLevel: Int = 7
 
+    @Option(
+        name: .long,
+        help:
+            "P11.1 : surcharge de la largeur de routage MoE (num_experts_per_tok du checkpoint). Absent = valeur du checkpoint (défaut, inchangé). Outil de référence pour le balayage K ∈ {10,8,6,5,4} — voir PLAN.md P11.1."
+    )
+    var routedExperts: Int?
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -1301,6 +1326,9 @@ struct FlashChatProbe: AsyncParsableCommand {
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
             throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+        }
+        if let routedExperts, routedExperts < 1 {
+            throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
         }
         let samplingPreset: Qwen4ExpSamplingPreset
         if temperature != nil || topP != nil || topK != nil {
@@ -1357,8 +1385,13 @@ struct FlashChatProbe: AsyncParsableCommand {
             residentAsyncEval: residentAsync,
             residentAsyncInterval: residentAsyncInterval,
             uncachedIO: !cachedIO,
-            fusionLevel: resolvedFusionLevel)
+            fusionLevel: resolvedFusionLevel,
+            routedExpertCount: routedExperts)
         profiler.end("Flash globals")
+        // P11.1 : toujours affiché (pas seulement en cas de surcharge), pour
+        // ne jamais mesurer en croyant à tort avoir changé K — PLAN.md P11.1.
+        print("routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)")
+        profileSession?.metadata["routed_expert_count"] = String(model.routedExpertCount)
         let generator = Qwen4ExpStreamingGenerator(model: model)
 
         func runTurn(label: String, promptText: String, imageURL: URL?, continueConversation: Bool)
@@ -1495,6 +1528,13 @@ struct FlashTeacherForcedScore: AsyncParsableCommand {
     @Option(name: .long, help: "Fixture Python teacher-forced à comparer sans second forward")
     var pythonFixture: String?
 
+    @Option(
+        name: .long,
+        help:
+            "P11.1 : surcharge de la largeur de routage MoE (num_experts_per_tok du checkpoint). Absent = valeur du checkpoint (défaut, inchangé). Outil de référence pour Q-B V32 par K — voir PLAN.md P11.1."
+    )
+    var routedExperts: Int?
+
     func run() async throws {
         guard confidentMargin >= 0 else {
             throw ValidationError("--confident-margin doit être positif ou nul")
@@ -1504,6 +1544,9 @@ struct FlashTeacherForcedScore: AsyncParsableCommand {
         }
         guard residentEvalInterval > 0 else {
             throw ValidationError("--resident-eval-interval doit être positif")
+        }
+        if let routedExperts, routedExperts < 1 {
+            throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
         }
         if continuation != nil && continuationIds != nil {
             throw ValidationError("Utiliser une seule forme de continuation")
@@ -1543,7 +1586,11 @@ struct FlashTeacherForcedScore: AsyncParsableCommand {
         let model = try Qwen4ExpStreamingTextModel(
             directory: directory,
             layerLoadingMode: residentLayers ? .resident : .streamed,
-            residentEvaluationInterval: residentEvalInterval)
+            residentEvaluationInterval: residentEvalInterval,
+            routedExpertCount: routedExperts)
+        // P11.1 : toujours affiché (pas seulement en cas de surcharge), pour
+        // ne jamais mesurer un Q-B en croyant à tort avoir changé K.
+        print("routed experts (K) : \(model.routedExpertCount)")
         let score = try model.scoreTeacherForced(
             promptTokenIDs: promptIDs,
             continuationTokenIDs: suffixIDs,
@@ -2520,7 +2567,17 @@ struct Serve: AsyncParsableCommand {
     )
     var conversationCacheGb: Double = 12
 
+    @Option(
+        name: .long,
+        help:
+            "P11.1 : surcharge de la largeur de routage MoE (num_experts_per_tok du checkpoint), Flash-Next uniquement. Absent = valeur du checkpoint (défaut, inchangé). S'applique à tout modèle chargé par ce process, y compris un changement de modèle en cours de service."
+    )
+    var routedExperts: Int?
+
     func run() async throws {
+        if let routedExperts, routedExperts < 1 {
+            throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
+        }
         let runtime = Qwen38Runtime()
         var session: ProfilingSession?
         if let trace {
@@ -2540,7 +2597,9 @@ struct Serve: AsyncParsableCommand {
         }
         print("Chargement du modèle…")
         MLXProfiler.shared.start("Chargement")
-        try await runtime.load(from: URL(fileURLWithPath: modelPath, isDirectory: true))
+        try await runtime.load(
+            from: URL(fileURLWithPath: modelPath, isDirectory: true),
+            routedExpertCount: routedExperts)
         MLXProfiler.shared.end("Chargement")
         // P5.5 : `serve` payait jusqu'ici le chargement de chaque couche
         // Flash-Next dans le TTFT de la toute première requête (71 s mesurés
@@ -2563,7 +2622,8 @@ struct Serve: AsyncParsableCommand {
             apiKey: apiKey,
             modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
                 .deletingLastPathComponent(),
-            conversationCacheGB: conversationCacheGb)
+            conversationCacheGB: conversationCacheGb,
+            routedExpertCount: routedExperts)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
 

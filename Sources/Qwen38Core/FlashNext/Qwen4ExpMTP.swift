@@ -25,7 +25,13 @@ public final class Qwen4ExpMTPPredictor: Module {
         configuration: Qwen4ExpTextConfiguration,
         quantization: Qwen4ExpQuantizationSpec? = nil,
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
-        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype,
+        /// P11.1 : le drafter reçoit la même largeur de routage que la
+        /// cible sauf distinction explicite du caller — voir
+        /// `Qwen4ExpMTPLoader.load` et `Qwen38FlashNextEngine`, qui passent
+        /// systématiquement la valeur déjà résolue de
+        /// `Qwen4ExpStreamingTextModel.routedExpertCount`.
+        routedExpertCount: Int? = nil
     ) {
         self.configuration = configuration
         guard let fullAttentionLayerIndex = configuration.layerTypes.firstIndex(
@@ -57,7 +63,8 @@ public final class Qwen4ExpMTPPredictor: Module {
             pleLayerIndex: nil,
             quantization: quantization,
             expertsQuantization: expertsQuantization,
-            fusionLevel: fusionLevel)]
+            fusionLevel: fusionLevel,
+            routedExpertCount: routedExpertCount)]
         _hyperConnectionMixer.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration,
             useCombine: false,
@@ -131,6 +138,13 @@ public final class Qwen4ExpMTPPredictor: Module {
         precondition(mtpHidden.dim(-1) == configuration.hiddenSize * configuration.hcCount)
         return hyperConnectionMixer.mixedInput(mtpHidden)
     }
+
+    /// P11.1 : répercute un changement de largeur de routage MoE sur le
+    /// drafter déjà chargé — même mécanisme que
+    /// `Qwen4ExpDecoderLayer.setRoutedExpertCount`, aucun poids touché.
+    public func setRoutedExpertCount(_ count: Int) throws {
+        try layers[0].setRoutedExpertCount(count)
+    }
 }
 
 public struct Qwen4ExpLoadedMTPPredictor: @unchecked Sendable {
@@ -180,7 +194,11 @@ public enum Qwen4ExpMTPLoader {
         materialize: Bool = true,
         useCheckpointQuantization: Bool = true,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype,
+        /// P11.1 : surcharge de la largeur de routage MoE — voir
+        /// `Qwen4ExpMTPPredictor.init`. `nil` (le défaut) laisse le
+        /// comportement inchangé.
+        routedExpertCount: Int? = nil
     ) throws -> Qwen4ExpLoadedMTPPredictor {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
@@ -252,7 +270,8 @@ public enum Qwen4ExpMTPLoader {
             configuration: configuration.textConfiguration,
             quantization: useCheckpointQuantization ? quantization : nil,
             expertsQuantization: useCheckpointQuantization ? expertsQuantization : nil,
-            fusionLevel: fusionLevel)
+            fusionLevel: fusionLevel,
+            routedExpertCount: routedExpertCount)
         try update(model: model, weights: weights)
 
         let bytes: Int64

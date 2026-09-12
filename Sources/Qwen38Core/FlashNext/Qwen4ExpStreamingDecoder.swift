@@ -106,6 +106,13 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// default) is the original path, unchanged until F7 validates the fused
     /// path bit-for-bit on the real checkpoint.
     public let fusionLevel: Qwen4ExpFusionLevel
+    /// P11.1 : largeur de routage MoE effective (`num_experts_per_tok` du
+    /// checkpoint, sauf surcharge à la construction ou via
+    /// `updateRoutedExpertCount`). Toujours une valeur concrète et déjà
+    /// validée — jamais `nil` — même quand aucune surcharge n'a été
+    /// demandée, pour que ce champ soit directement publiable dans
+    /// `/healthz`/les métriques sans distinguer "réglé" de "défaut".
+    public private(set) var routedExpertCount: Int
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -127,7 +134,14 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         residentAsyncEval: Bool = false,
         residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype,
+        /// P11.1 : surcharge de `num_experts_per_tok`. `nil` (le défaut)
+        /// laisse le comportement inchangé — la valeur du checkpoint est
+        /// utilisée telle quelle, exactement comme avant cette option.
+        /// Validée ici (contre `numExperts` du checkpoint tout juste
+        /// chargé) via `qwen4ExpResolveRoutedExpertCount`, qui lève une
+        /// erreur claire plutôt qu'un crash pour une valeur hors bornes.
+        routedExpertCount: Int? = nil
     ) throws {
         precondition(residentEvaluationInterval > 0)
         precondition(residentAsyncInterval > 0)
@@ -142,6 +156,10 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         self.residentAsyncInterval = residentAsyncInterval
         self.uncachedIO = uncachedIO
         self.fusionLevel = fusionLevel
+        self.routedExpertCount = try qwen4ExpResolveRoutedExpertCount(
+            override: routedExpertCount,
+            checkpointDefault: self.configuration.numExpertsPerToken,
+            numExperts: self.configuration.numExperts)
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -205,7 +223,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     index: checkpointIndex,
                     materialize: materializeLayers,
                     uncachedIO: uncachedIO,
-                    fusionLevel: fusionLevel)
+                    fusionLevel: fusionLevel,
+                    routedExpertCount: routedExpertCount)
                 loadDuration = ContinuousClock.now - start
                 if layerLoadingMode == .resident {
                     residentLayers[layerIndex] = loaded
@@ -335,6 +354,32 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     public func resetCaches() {
         caches.removeAll(keepingCapacity: true)
         Memory.clearCache()
+    }
+
+    /// P11.1 : change la largeur de routage MoE effective sans recharger le
+    /// checkpoint. `override` suit le même contrat qu'à la construction
+    /// (`nil` revient à la valeur du checkpoint) ; la valeur résolue est
+    /// renvoyée pour qu'un appelant (le serveur, `/healthz`) puisse la
+    /// publier immédiatement.
+    ///
+    /// En mode streamé, seul `routedExpertCount` change : le prochain appel
+    /// à `Qwen4ExpCheckpointLayerLoader.load` en tiendra compte. En mode
+    /// résident, les couches déjà chargées ne repasseraient jamais par ce
+    /// loader (`forward` réutilise `residentLayers`) — cette méthode répercute
+    /// donc aussi le changement directement sur chaque couche déjà résidente
+    /// via `Qwen4ExpDecoderLayer.setRoutedExpertCount`, qui ne touche à aucun
+    /// poids ni au graphe MLX (voir son commentaire).
+    @discardableResult
+    public func updateRoutedExpertCount(_ override: Int?) throws -> Int {
+        let resolved = try qwen4ExpResolveRoutedExpertCount(
+            override: override,
+            checkpointDefault: configuration.numExpertsPerToken,
+            numExperts: configuration.numExperts)
+        for loaded in residentLayers.values {
+            try loaded.layer.setRoutedExpertCount(resolved)
+        }
+        routedExpertCount = resolved
+        return resolved
     }
 
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats {

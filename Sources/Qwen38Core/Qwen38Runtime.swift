@@ -32,6 +32,18 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     /// `repetitionPenalty` (temperature > 0) — greedy decoding is
     /// unaffected regardless of this value.
     public var penaltyContextTokens: Int
+    /// P11.1 : surcharge ponctuelle de la largeur de routage MoE
+    /// (`num_experts_per_tok`) pour Flash-Next, appliquée à l'engin résident
+    /// *avant* ce tour (`Qwen38Runtime.generate`/`generateStateless`) —
+    /// `nil` (le défaut) laisse en vigueur le réglage de démarrage ou le
+    /// dernier réglage explicite, sans jamais revenir silencieusement à la
+    /// valeur du checkpoint. Non consulté par le chemin 27B. Le changement
+    /// n'invalide pas le cache KV en cours (voir `Qwen38FlashNextEngine.
+    /// setRoutedExpertCount`) : comparer des K différents sur la même
+    /// conversation continuée mélangerait des tours calculés avec des
+    /// largeurs différentes — repartir d'une conversation neuve pour
+    /// chaque K du balayage P11.1.
+    public var routedExpertCount: Int?
 
     public init(
         maxTokens: Int = 256,
@@ -44,7 +56,8 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         mtp: Qwen38MTPOptions = .init(),
         presencePenalty: Float = 0,
         repetitionPenalty: Float = 1.0,
-        penaltyContextTokens: Int = 2048
+        penaltyContextTokens: Int = 2048,
+        routedExpertCount: Int? = nil
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -57,6 +70,7 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         self.presencePenalty = presencePenalty
         self.repetitionPenalty = repetitionPenalty
         self.penaltyContextTokens = penaltyContextTokens
+        self.routedExpertCount = routedExpertCount
     }
 
     public var parameters: GenerateParameters {
@@ -93,6 +107,11 @@ public struct Qwen38RunMetrics: Sendable {
     /// of appending to ChatSession's persistent KV cache (M1 MTP path).
     public let conversationReplayed: Bool
     public let mtpStatus: Qwen38MTPRunStatus
+    /// P11.1 : largeur de routage MoE effectivement utilisée par ce tour
+    /// (`Qwen38FlashNextEngine.routedExpertCount` au moment de la requête),
+    /// pour qu'un run ne puisse pas être attribué au mauvais K — voir
+    /// PLAN.md P11.1. `nil` sur la famille 27B, qui n'a pas ce réglage.
+    public let routedExpertCount: Int?
 
     public init(
         metrics: LLMMetrics,
@@ -107,7 +126,8 @@ public struct Qwen38RunMetrics: Sendable {
         cacheReused: Bool = false,
         conversationReplayed: Bool = false,
         inputDescription: String = "Texte",
-        mtpStatus: Qwen38MTPRunStatus = .init(availability: .unavailable)
+        mtpStatus: Qwen38MTPRunStatus = .init(availability: .unavailable),
+        routedExpertCount: Int? = nil
     ) {
         self.metrics = metrics
         self.stopReason = stopReason
@@ -122,6 +142,7 @@ public struct Qwen38RunMetrics: Sendable {
         self.conversationReplayed = conversationReplayed
         self.inputDescription = inputDescription
         self.mtpStatus = mtpStatus
+        self.routedExpertCount = routedExpertCount
     }
 }
 
@@ -276,7 +297,12 @@ public actor Qwen38Runtime {
     public func load(
         from directory: URL,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in },
-        preloadMTP: Bool = true
+        preloadMTP: Bool = true,
+        /// P11.1 : option de démarrage — surcharge `num_experts_per_tok`
+        /// pour tout l'engin Flash-Next résident (cible et drafter MTP).
+        /// `nil` (le défaut) laisse le comportement inchangé. Sans effet
+        /// sur la famille 27B.
+        routedExpertCount: Int? = nil
     ) async throws {
         let info = try Qwen38ModelValidator.validate(directory)
         guard let family = info.family else {
@@ -306,7 +332,8 @@ public actor Qwen38Runtime {
             // while Flash-Next is resident — an unmeasured starting value,
             // to revisit once P (débit) profiles the resident path.
             Memory.cacheLimit = 8 * 1024 * 1024 * 1024
-            flashEngine = try await flashNextEngineFactory.makeEngine(directory: directory)
+            flashEngine = try await flashNextEngineFactory.makeEngine(
+                directory: directory, routedExpertCount: routedExpertCount)
             // PM4.3 (branchement, 2026-09-09): `mtpState` now delegates to
             // the loaded engine's own dynamic availability (predictor loads
             // lazily on the first MTP-enabled turn) instead of a fixed
@@ -378,6 +405,19 @@ public actor Qwen38Runtime {
     public var mtpState: Qwen38MTPAvailability {
         if let flashEngine { return flashEngine.mtpState }
         return mtpAvailability
+    }
+
+    /// P11.1 : largeur de routage MoE actuellement effective sur l'engin
+    /// Flash-Next résident, pour `/healthz` et l'affichage GUI. `nil` quand
+    /// aucun engin Flash-Next n'est chargé (y compris famille 27B).
+    public var flashRoutedExpertCount: Int? { flashEngine?.routedExpertCount }
+
+    /// P11.1 : change la largeur de routage MoE de l'engin résident sans
+    /// recharger le checkpoint — no-op (renvoie `nil`) si aucun engin
+    /// Flash-Next n'est chargé.
+    @discardableResult
+    public func setFlashRoutedExpertCount(_ override: Int?) throws -> Int? {
+        try flashEngine?.setRoutedExpertCount(override)
     }
 
     /// H4.2: whether the resident model currently loaded is Flash-Next —
@@ -1147,6 +1187,11 @@ public actor Qwen38Runtime {
         options: Qwen38GenerationOptions = .init()
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         if let flashEngine {
+            // P11.1 : appliqué avant de générer, jamais après — voir le
+            // commentaire de `Qwen38GenerationOptions.routedExpertCount`.
+            if let requestedRoutedExpertCount = options.routedExpertCount {
+                try flashEngine.setRoutedExpertCount(requestedRoutedExpertCount)
+            }
             // Flash-Next has no per-client persistent cache (contrat
             // §5.1.1, "Stateless v1"): the whole history is rendered as one
             // turn instead of replaying it through the in-process
@@ -1213,6 +1258,11 @@ public actor Qwen38Runtime {
         forceConversationReplay: Bool = false
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         if let flashEngine {
+            // P11.1 : appliqué avant de générer, jamais après — voir le
+            // commentaire de `Qwen38GenerationOptions.routedExpertCount`.
+            if let requestedRoutedExpertCount = options.routedExpertCount {
+                try flashEngine.setRoutedExpertCount(requestedRoutedExpertCount)
+            }
             // The resident engine is shared with the LAN server (single model,
             // §5.1.1): after a server request — or a P5 LRU restore — it holds
             // someone else's conversation. A new GUI conversation must start

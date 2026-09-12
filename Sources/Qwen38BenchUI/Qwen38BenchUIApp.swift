@@ -99,6 +99,21 @@ final class BenchViewModel: ObservableObject {
     /// n'expose pas encore de réglage de température, ce champ reste donc
     /// inerte tant que le chat local reste greedy.
     @Published var presencePenalty: Double = 1.5
+    /// P11.1 : surcharge de la largeur de routage MoE (`num_experts_per_tok`
+    /// du checkpoint), Flash-Next uniquement. Vide = pas de surcharge : la
+    /// valeur du checkpoint est utilisée telle quelle (comportement
+    /// inchangé). Lu à la fois au chargement (`loadModel`, option de
+    /// démarrage de l'engin) et à chaque tour (`run`, surcharge ponctuelle
+    /// appliquée sans recharger le modèle — voir
+    /// `Qwen38GenerationOptions.routedExpertCount`), donc un changement
+    /// prend effet dès le tour suivant sans repasser par "Charger".
+    @Published var routedExpertsText = ""
+    /// `nil` quand le champ est vide ou non numérique — traité comme
+    /// "aucune surcharge", jamais comme une erreur silencieuse (une valeur
+    /// hors bornes est, elle, rejetée par le moteur avec un message clair).
+    var routedExpertsOverride: Int? {
+        Int(routedExpertsText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
     @Published var mtpEnabled = true
     @Published var mtpEngine: Qwen38MTPEngine = .local
     @Published var mtpDraftTokens = 1
@@ -194,10 +209,11 @@ final class BenchViewModel: ObservableObject {
         // real error, if any, still surfaces from runtime.load below.
         let info = try? Qwen38ModelValidator.readInfo(from: directory)
         let expectedLayers = info?.numHiddenLayers ?? 48
+        let routedExpertsOverride = self.routedExpertsOverride
         Task { @MainActor in
             let start = Date()
             do {
-                try await runtime.load(from: directory)
+                try await runtime.load(from: directory, routedExpertCount: routedExpertsOverride)
                 loadedFamily = info?.family
                 // PM4.3 (branchement, 2026-09-09): `mtpEnabled` defaults to
                 // `true` (27B: a present drafter is the common case). For
@@ -337,6 +353,7 @@ final class BenchViewModel: ObservableObject {
         let mtpEngine = self.mtpEngine
         let mtpDraftTokens = self.mtpDraftTokens
         let presencePenalty = self.presencePenalty
+        let routedExpertsOverride = self.routedExpertsOverride
 
         Task { @MainActor in
             do {
@@ -349,7 +366,8 @@ final class BenchViewModel: ObservableObject {
                         draftDepth: .fixed(mtpDraftTokens),
                         engine: mtpEngine
                     ),
-                    presencePenalty: Float(presencePenalty)
+                    presencePenalty: Float(presencePenalty),
+                    routedExpertCount: routedExpertsOverride
                 )
                 let stream = try await runtime.generate(
                     prompt: prompt,
@@ -479,7 +497,11 @@ final class BenchViewModel: ObservableObject {
                     port: port,
                     apiKey: key.isEmpty ? nil : key,
                     modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
-                        .deletingLastPathComponent())
+                        .deletingLastPathComponent(),
+                    // P11.1 : même surcharge que celle utilisée pour charger
+                    // le modèle courant, réappliquée si le serveur LAN
+                    // change ensuite de modèle (`ensureModelLoaded`).
+                    routedExpertCount: routedExpertsOverride)
                 await refreshServer()
                 status = "Serveur LAN actif sur le port \(port)"
             } catch {
@@ -1250,6 +1272,17 @@ private struct SettingsView: View {
                     .monospacedDigit()
                     .frame(width: 28, alignment: .trailing)
             }
+            HStack {
+                Text("Experts routés (K)")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                TextField("checkpoint", text: $model.routedExpertsText)
+                    .frame(width: 70)
+                    .multilineTextAlignment(.trailing)
+            }
+            Text("P11.1 : vide = valeur du checkpoint (10). Pris en compte au chargement et, sans recharger, dès le tour suivant.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
 
             Divider()
             Toggle("MTP spéculatif", isOn: $model.mtpEnabled)
@@ -1332,6 +1365,12 @@ struct MetricsView: View {
                     metric("TTFT réel", String(format: "%.0f ms", timeToFirstToken * 1000))
                 }
                 metric("Cache KV", runCacheLabel)
+                // P11.1 : toujours affiché quand disponible (pas seulement en
+                // cas de surcharge), pour ne jamais lire un débit en croyant
+                // à tort avoir changé K — PLAN.md P11.1.
+                if let routedExpertCount = turnHistory.last?.routedExpertCount {
+                    metric("Experts routés (K)", "\(routedExpertCount)")
+                }
                 if !turnHistory.isEmpty {
                     Divider().padding(.vertical, 4)
                     Text("Tours (\(turnHistory.count))").font(.headline)

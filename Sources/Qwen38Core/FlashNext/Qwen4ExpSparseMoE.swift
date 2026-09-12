@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 import MLXLMCommon
@@ -71,6 +72,44 @@ public final class Qwen4ExpSharedExpert: Module, UnaryLayer {
     }
 }
 
+/// P11.1 : erreur de validation pour `routedExpertCount`, la largeur de
+/// routage du MoE réglable à l'exécution (`num_experts_per_tok` du
+/// checkpoint, surchargeable sans toucher aux poids).
+public enum Qwen4ExpRoutedExpertCountError: LocalizedError, Equatable {
+    case outOfBounds(requested: Int, numExperts: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .outOfBounds(let requested, let numExperts):
+            return
+                "routedExpertCount doit être compris entre 1 et \(numExperts) (nombre total d'experts du checkpoint) ; reçu \(requested)."
+        }
+    }
+}
+
+/// P11.1 : résout la largeur de routage MoE effective. `override`, quand
+/// fourni, remplace `checkpointDefault` (`num_experts_per_tok` décodé par
+/// `Qwen4ExpConfiguration`) ; `nil` laisse le comportement inchangé — c'est
+/// le défaut partout (Edge0 divise K par deux sur son tier phare
+/// `edge0-35b`, PLAN.md P11.1 : le but est de pouvoir balayer K sans
+/// retoucher le checkpoint). `topK` ne dimensionne aucun tenseur — il ne
+/// choisit que combien d'experts `argPartition` sélectionne par token — donc
+/// cette résolution ne recharge jamais de poids.
+///
+/// Fonction pure, testable sans charger de checkpoint réel — voir
+/// `RoutedExpertCountTests`.
+public func qwen4ExpResolveRoutedExpertCount(
+    override: Int?,
+    checkpointDefault: Int,
+    numExperts: Int
+) throws -> Int {
+    guard let override else { return checkpointDefault }
+    guard override >= 1, override <= numExperts else {
+        throw Qwen4ExpRoutedExpertCountError.outOfBounds(requested: override, numExperts: numExperts)
+    }
+    return override
+}
+
 /// Qwen3.8 Flash-Next's routed MoE block.
 ///
 /// The expert projections use MLXLMCommon's `SwitchGLU`, whose checkpoint
@@ -80,7 +119,14 @@ public final class Qwen4ExpSharedExpert: Module, UnaryLayer {
 /// order-sensitive for bfloat16 inference.
 public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
     public let numExperts: Int
-    public let topK: Int
+    /// P11.1 : largeur de routage effective (`num_experts_per_tok` du
+    /// checkpoint, sauf surcharge explicite — voir
+    /// `qwen4ExpResolveRoutedExpertCount`). Mutable (contrairement au reste
+    /// de cette classe) : c'est un entier qui pilote `argPartition` dans
+    /// `callAsFunction`, pas la forme d'un tenseur chargé, donc le changer
+    /// après coup sur une couche déjà résidente ne touche à aucun poids —
+    /// voir `setRoutedExpertCount`.
+    public private(set) var topK: Int
     public let normalizeTopK: Bool
 
     @ModuleInfo(key: "gate") public var gate: Linear
@@ -114,17 +160,30 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         expertsQuantization: Qwen4ExpQuantizationSpec? = nil,
         fusionLevel: Qwen4ExpFusionLevel = .none,
         ablation: Qwen4ExpLayerBenchAblation = .none,
-        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil
+        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil,
+        /// P11.1 : surcharge de `num_experts_per_tok`. `nil` (partout par
+        /// défaut) reproduit exactement le comportement précédent. Un
+        /// appelant qui connaît déjà `numExperts` (le décodeur, qui a
+        /// validé via `qwen4ExpResolveRoutedExpertCount` avant d'arriver
+        /// ici) peut passer une valeur hors bornes par erreur — la
+        /// precondition ci-dessous reste le filet de sécurité local, mais
+        /// le message d'erreur clair et récupérable vit dans cette
+        /// fonction de résolution, pas ici.
+        routedExpertCount: Int? = nil
     ) {
         numExperts = configuration.numExperts
-        topK = configuration.numExpertsPerToken
+        let checkpointDefault = configuration.numExpertsPerToken
+        let resolvedTopK = routedExpertCount ?? checkpointDefault
+        precondition(
+            resolvedTopK >= 1 && resolvedTopK <= numExperts,
+            "routedExpertCount (\(resolvedTopK)) doit être compris entre 1 et numExperts (\(numExperts))")
+        topK = resolvedTopK
         self.normalizeTopK = normalizeTopK
         self.preciseRouterSoftmax = fusionLevel < .f4MoE
         self.ablation = ablation
         self.moeStageProfiler = moeStageProfiler
 
         precondition(numExperts > 0)
-        precondition(topK > 0 && topK <= numExperts)
         // The router is intentionally kept in floating point by the released
         // checkpoint: it has no `.scales`/`.biases` companions. Applying the
         // global 4-bit spec here would create [experts, hidden/8] and strict
@@ -274,5 +333,19 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         if !enabled {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// P11.1 : change `topK` sur une instance déjà construite (couche
+    /// résidente ou non). Ne touche à aucun poids ni au graphe MLX — un
+    /// forward ultérieur voit simplement une autre largeur d'`argPartition`.
+    /// Contrairement à la precondition de l'initialiseur, cette voie est
+    /// `throws` : elle est appelée depuis un chemin où l'appelant (le
+    /// serveur, sur une requête) doit pouvoir rapporter une erreur claire au
+    /// client plutôt que faire tomber le process.
+    public func setRoutedExpertCount(_ count: Int) throws {
+        guard count >= 1, count <= numExperts else {
+            throw Qwen4ExpRoutedExpertCountError.outOfBounds(requested: count, numExperts: numExperts)
+        }
+        topK = count
     }
 }

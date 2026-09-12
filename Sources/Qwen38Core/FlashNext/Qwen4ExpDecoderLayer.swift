@@ -39,7 +39,12 @@ public final class Qwen4ExpDecoderLayer: Module {
         ablation: Qwen4ExpLayerBenchAblation = .none,
         /// P8.1: non-nil only under `flash-layer-bench --moe-stages` —
         /// see `Qwen4ExpMoEStageProfiler`.
-        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil
+        moeStageProfiler: Qwen4ExpMoEStageProfiler? = nil,
+        /// P11.1 : surcharge de la largeur de routage MoE, threadée telle
+        /// quelle jusqu'à `Qwen4ExpSparseMoE` — voir son commentaire et
+        /// `qwen4ExpResolveRoutedExpertCount`. `nil` (le défaut) reproduit
+        /// exactement le comportement précédent.
+        routedExpertCount: Int? = nil
     ) {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
         self.layerIndex = layerIndex
@@ -58,7 +63,8 @@ public final class Qwen4ExpDecoderLayer: Module {
         _mlp.wrappedValue = Qwen4ExpSparseMoE(
             configuration: configuration, quantization: quantization,
             expertsQuantization: expertsQuantization, fusionLevel: fusionLevel,
-            ablation: ablation, moeStageProfiler: moeStageProfiler)
+            ablation: ablation, moeStageProfiler: moeStageProfiler,
+            routedExpertCount: routedExpertCount)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
             quantization: quantization, parityPrefix: "attn_", ablation: ablation)
@@ -143,6 +149,13 @@ public final class Qwen4ExpDecoderLayer: Module {
         attnHyperConnection.setParityCapture(enabled)
         mlpHyperConnection.setParityCapture(enabled)
         mlp.setParityCapture(enabled)
+    }
+
+    /// P11.1 : répercute un changement de largeur de routage MoE sur la
+    /// couche déjà construite (résidente ou non) — voir
+    /// `Qwen4ExpSparseMoE.setRoutedExpertCount`.
+    public func setRoutedExpertCount(_ count: Int) throws {
+        try mlp.setRoutedExpertCount(count)
     }
 
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats? {

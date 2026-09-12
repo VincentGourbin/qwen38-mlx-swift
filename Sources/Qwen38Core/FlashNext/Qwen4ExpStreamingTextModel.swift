@@ -43,7 +43,11 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         residentAsyncEval: Bool = false,
         residentAsyncInterval: Int = 1,
         uncachedIO: Bool = true,
-        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype
+        fusionLevel: Qwen4ExpFusionLevel = .f7GatedBranchDtype,
+        /// P11.1 : surcharge de `num_experts_per_tok`, threadée jusqu'au
+        /// décodeur — voir `Qwen4ExpStreamingDecoder`'s doc comment. `nil`
+        /// (le défaut) laisse le comportement inchangé.
+        routedExpertCount: Int? = nil
     ) throws {
         let loadedGlobal = try Qwen4ExpGlobalCheckpointLoader.load(
             from: directory, materialize: materializeGlobal, uncachedIO: uncachedIO)
@@ -57,8 +61,20 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             residentAsyncEval: residentAsyncEval,
             residentAsyncInterval: residentAsyncInterval,
             uncachedIO: uncachedIO,
-            fusionLevel: fusionLevel)
+            fusionLevel: fusionLevel,
+            routedExpertCount: routedExpertCount)
         self.configuration = decoder.configuration
+    }
+
+    /// P11.1 : largeur de routage MoE actuellement effective — voir
+    /// `Qwen4ExpStreamingDecoder.routedExpertCount`.
+    public var routedExpertCount: Int { decoder.routedExpertCount }
+
+    /// P11.1 : change la largeur de routage MoE sans recharger le
+    /// checkpoint — voir `Qwen4ExpStreamingDecoder.updateRoutedExpertCount`.
+    @discardableResult
+    public func updateRoutedExpertCount(_ override: Int?) throws -> Int {
+        try decoder.updateRoutedExpertCount(override)
     }
 
     public func forward(

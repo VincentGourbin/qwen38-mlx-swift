@@ -4279,6 +4279,32 @@ machinerie nouvelle.
 
 | # | Tâche | Critère de succès |
 |---|---|---|
+**P11.1 — outillage livré le 2026-09-12** (implémentation seule, aucune mesure).
+`routedExpertCount` surcharge `num_experts_per_tok` sans toucher au checkpoint :
+`topK` ne pilote que la largeur d'`argPartition`, il ne dimensionne aucun
+tenseur, donc il est modifiable à chaud sur une couche déjà résidente. Défaut
+inchangé partout (`nil` ⇒ valeur du checkpoint). Surface :
+
+```
+qwen38 flash-chat-probe <dir> --prompt "…" --routed-experts 6
+qwen38 flash-teacher-forced-score <dir> --prompt "…" --continuation "…" --routed-experts 6
+qwen38 serve --model-path <dir> --routed-experts 6
+{"model":"…","messages":[…],"routed_experts":6}      # par requête
+GET /healthz -> {"routed_expert_count": 6}           # toujours publié
+```
+
+La GUI a un champ « Experts routés (K) », vide = checkpoint. `/healthz` et les
+métriques publient **toujours** la valeur effective : c'est la garde contre
+l'erreur qui a déjà coûté une campagne ici, mesurer en croyant à tort avoir
+changé le réglage. Vérifié sans GPU : compilation Release, compilation de
+test, 96/96 tests (dont 7 nouveaux sur la résolution et les bornes, aucun ne
+charge de checkpoint). **Restent à vérifier sur GPU, avant le balayage** :
+(i) `--routed-experts 10` doit rendre les mêmes IDs que sans le drapeau ;
+(ii) la mise à jour à chaud en mode résident ; (iii) le MTP avec un vrai
+drafter. Piège du balayage : changer K en cours de conversation continuée
+mélange des tours calculés à des largeurs différentes — repartir d'une
+conversation neuve à chaque K.
+
 | **P11.1** | **Réduire K, la largeur de routage.** Edge0 divise K par deux sur son tier phare. Rendre `num_experts_per_tok` réglable à l'exécution (drapeau moteur + CLI + GUI + serveur, comme `--fusion-level`), puis balayer K ∈ {10, 8, 6, 5, 4} sur le prompt de référence. Mesurer pour chaque K : débit greedy court et long, Q-B V32, logprob moyenne, et la sortie greedy sur le prompt de référence. | Une courbe débit/qualité exploitable. Succès si un K < 10 donne ≥ +15 % de débit pour ≤ 0,2 nat de logprob perdue. |
 | **P11.2** | **Refaire l'attribution du coût par sous-bloc, post-F7.** P7 attribuait 78-88 % au MoE routé — mesuré **avant** la correction de la fuite fp32 (P8), qui a multiplié le débit par 2,74. Cette répartition n'est plus valide et c'est elle qui oriente tout le reste. Instrumenter par sous-bloc (GDN, QSA, MoE routé, expert partagé, hyper-connexions, PLE, normes) avec le profileur 1.5.0, hors profilage par couche. | Un tableau à jour de la part de chaque sous-bloc, et le compte réel d'ops GPU par token (aujourd'hui estimé à ~4 800). |
 | **P11.3** | **Chiffrer les hyper-connexions.** Notre modèle porte 4 flux résiduels et un mélange de rang 320 à chaque couche — Edge0 n'a pas cet étage. C'est un suspect structurel de premier plan pour le compte d'ops, et il n'a jamais été mesuré isolément. Ablation : forcer 1 flux, mesurer débit et parité. | La part exacte des hyper-connexions dans les 74 ms. Si elle dépasse 15 %, ouvrir un chantier de fusion dédié. |
