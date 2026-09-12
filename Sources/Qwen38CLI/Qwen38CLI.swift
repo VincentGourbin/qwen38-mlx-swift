@@ -555,7 +555,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA) — s'applique aussi au chemin --mtp"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P10.2/P10.3, fusions kernel opt-in) — s'applique aussi au chemin --mtp"
     )
     var fusionLevel: Int = 7
 
@@ -576,7 +576,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+            throw ValidationError("--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P10.2 F8, P10.3 F9)")
         }
         if mtp && image != nil {
             throw ValidationError(
@@ -874,7 +874,7 @@ struct FlashLayerBench: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P10.2/P10.3, fusions kernel opt-in)"
     )
     var fusionLevel: Int = 7
 
@@ -941,10 +941,11 @@ struct FlashLayerBench: AsyncParsableCommand {
             }
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+            throw ValidationError(
+                "--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P10.2 F8, P10.3 F9)")
         }
         if checkParity && resolvedFusionLevel == .none && stepLayers == 0 {
-            throw ValidationError("--check-parity exige --fusion-level 1-6 (comparaison à .none)")
+            throw ValidationError("--check-parity exige --fusion-level 1-9 (comparaison à .none)")
         }
         let resolvedAblation: Qwen4ExpLayerBenchAblation
         if let ablate {
@@ -1038,7 +1039,7 @@ struct FlashLayerBench: AsyncParsableCommand {
             for kind in kinds {
                 let result = Qwen4ExpLayerBench.checkParity(
                     kind: kind, expertsQuantization: expertsQuantization,
-                    fusionLevel: resolvedFusionLevel)
+                    fusionLevel: resolvedFusionLevel, steps: steps)
                 print(
                     "parité \(kind.rawValue) niveau \(resolvedFusionLevel.rawValue) : "
                         + "\(result.steps) pas, diff abs max \(result.maxAbsoluteDifference), "
@@ -1283,7 +1284,7 @@ struct FlashChatProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P10.2/P10.3, fusions kernel opt-in)"
     )
     var fusionLevel: Int = 7
 
@@ -1298,7 +1299,7 @@ struct FlashChatProbe: AsyncParsableCommand {
             throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+            throw ValidationError("--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P10.2 F8, P10.3 F9)")
         }
         let samplingPreset: Qwen4ExpSamplingPreset
         if temperature != nil || topP != nil || topK != nil {

@@ -4135,8 +4135,15 @@ que le greedy a doublé), le chargement du modèle (~60 s, jugé acceptable).
 | # | Statut | Résultat |
 |---|---|---|
 | P10.1 | ✅ Fait | Pas de point chaud local : `sample` montre 90,5 % du temps d'`eval()` dans `Scheduler::wait_for_one()` (attente GPU, C++ partagé Python/Swift), ARC/`evalLock` négligeables. Contre-expérience pool coopératif vs `Thread` dédié : aucun écart. Ratio réel Swift/Python en conditions calmes ~1,5× (pas 2×, cf. bruit machine). Action-plan upstream ouvert (`VincentGourbin/action-plans#536`, sévérité low). Rien à corriger ici. |
-| P10.2 | — | à faire |
-| P10.3 | — | à faire |
-| P10.4 | — | à faire |
-| P10.5 | — | à faire |
+| P10.2 | 🟡 Kernels validés, bench neutre/négatif | F8 (`Qwen4ExpFusionLevel.f8HyperConnectionKernel`, au-dessus de F7 — voir piège cumulatif ci-dessous). Kernels bit-exacts en isolation (float32, diff < 1e-5) et corrects au dtype de production (bf16, diff < 1e-2). Bench synthétique : GDN neutre, QSA +12-19 % (pire). Mesure checkpoint réel : en attente (GPU partagé pendant cette session). Décision provisoire : probable retrait, sauf contre-mesure checkpoint. |
+| P10.3 | 🟡 Kernel validé, gain synthétique marginal | F9 (`Qwen4ExpFusionLevel.f9GdnL2NormKernel`). Le gating (`-exp(A_log)·softplus`, `sigmoid(b)`) vit déjà dans `Vendor/mlx-swift-lm` (non patché) — la vraie cible était la L2-norm q/k. Kernel bit-exact en isolation, correct au dtype de production. Bench synthétique : 0 à −5 % (p10, bruit élevé). Mesure checkpoint réel : en attente. |
+| P10.4 | 🟡 Implémenté et validé (parité), débit réel en attente | `ngram-io-probe` (nouvel outil) a mesuré, lignes disjointes : `mmap`+`copyMemory` (chemin de production) est la méthode **la plus lente** en mono-thread sur Lexar (541 µs/ligne) ; 16 `pread` concurrents divisent le coût par ligne par **~10×** sur SSD interne et Lexar. Le regroupement par lignes adjacentes (déjà en place, P5.4) ne peut pas aider : les index n-gram sont issus d'un hash, pas naturellement contigus. Correctif : `readRowsConcurrently` (pread concurrents, même contrat `[Int:[Element]]`, LRU intact), opt-in via `QWEN38_NGRAM_CONCURRENT_PREAD=1`. Parité bit-exacte confirmée (`flash-ngram-parity`, plusieurs shards). Débit préfill réel : en attente. |
+| P10.5 | — | à faire (nécessite les mesures checkpoint réel de P10.2-P10.4) |
 | P10.6 | — | à faire |
+
+**Piège rencontré (P10.2/P10.3)** : `Qwen4ExpFusionLevel` est cumulatif
+(`>=`) et la production est par défaut à F7 depuis le 2026-09-11 —
+réutiliser un ancien numéro de niveau inférieur à 7 (`.f3HyperConnections`)
+aurait activé le nouveau comportement **silencieusement en production**
+dès le câblage. F8/F9 sont donc numérotés au-dessus de F7, pas dans les
+anciens slots F3-F6 vacants. À traiter explicitement en P10.6.

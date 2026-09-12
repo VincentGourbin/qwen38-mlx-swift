@@ -48,6 +48,38 @@ public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     /// checkpoint 3-bit réel : 5,91 → 12,92 tok/s, IDs bit-identiques,
     /// +0,8 Go de pic. Repasser à `.none` pour comparer.
     case f7GatedBranchDtype = 7
+    /// F8 (P10.2, 2026-09-12): fuses the hyper-connection "mix" reduction
+    /// (`sigmoid(upOut).reshaped(...) * normed.reshaped(...)).mean(axis: -2)`,
+    /// 5 ops) and `Qwen4ExpDecoderLayer.inject`'s broadcast-multiply-add
+    /// (`expandedDimensions` ×2, multiply, reshape, add — also 5 ops) into
+    /// two `MLXFast.metalKernel` calls, called twice per layer
+    /// (`attn_hyper_connection`, `mlp_hyper_connection`) plus once per token
+    /// at the final reduction before `lm_head`. Pure glue around the
+    /// existing (quantized) matmuls, which are untouched.
+    ///
+    /// **Deliberately given a number above `.f7GatedBranchDtype`, not reusing
+    /// the long-unused `.f3HyperConnections` slot**: `Qwen4ExpFusionLevel`'s
+    /// `>=` comparisons are cumulative (a level activates every lever at or
+    /// below its own number), and production has defaulted to F7 since
+    /// 2026-09-11. Wiring new behavior into a number below 7 would have
+    /// silently activated it in production the moment it was wired in,
+    /// skipping the bench-then-checkpoint validation gate every other lever
+    /// in this campaign went through. `.f3HyperConnections` (and `.f4MoE`'s
+    /// original P2-fusion sense — MoE softmax precision is a separate,
+    /// already-cumulative concern) stay as-is; see P10.6 for the promised
+    /// cleanup of this numbering.
+    case f8HyperConnectionKernel = 8
+    /// F9 (P10.3, 2026-09-12): fuses GDN's q/k L2-normalization
+    /// (`x * rsqrt((x*x).sum(axis:-1,keepDims:true) + eps) * scale`, 4-5 ops
+    /// each) into one `MLXFast.metalKernel` call per tensor. Explicitly
+    /// **outside** `gatedDeltaUpdate` (Vendor/mlx-swift-lm, not patched —
+    /// see PLAN.md §1.1): the gating transforms named in PLAN.md's P10.3 row
+    /// (`-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`) already live inside
+    /// that vendored function's own body
+    /// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift`), so
+    /// this only touches `Qwen4ExpGatedDeltaNet`'s own q/k-normalization
+    /// glue.
+    case f9GdnL2NormKernel = 9
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 

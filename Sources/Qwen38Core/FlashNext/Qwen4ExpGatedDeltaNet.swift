@@ -1,6 +1,65 @@
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
+
+// MARK: - P10.3 (F9): fused GDN q/k L2-normalization
+//
+// `q * rsqrt((q*q).sum(axis:-1,keepDims:true) + eps) * scale` is 4-5 tiny
+// elementwise/reduction ops (multiply, sum, rsqrt, multiply, optional
+// multiply-by-scalar) over the last axis (`keyHeadDim`, typically 128) —
+// pure glue, same "~8.58 µs host dispatch per op regardless of tensor size"
+// reasoning as P10.2 (docs/knowledge/log.md, "P10.1"). This is squarely
+// **outside** `gatedDeltaUpdate` (Vendor/mlx-swift-lm, a pinned upstream
+// dependency this project does not patch — see PLAN.md §1.1): the gating
+// transforms named in PLAN.md's P10.3 row (`-exp(A_log)·softplus(a+dt_bias)`,
+// `sigmoid(b)`) already live inside that vendored function
+// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift`,
+// `computeGatedDeltaG`/`gatedDeltaUpdate`), so this task's actual fusable
+// surface is the L2-norm glue in *this* file, not the gating math itself.
+// `eps` is a fixed 1e-6 literal at every call site in this file (never a
+// runtime value), so it is baked directly into the kernel source rather
+// than threaded as a template argument (`KernelTemplateArg` only supports
+// `Bool`/`Int`/`DType`, not `Float`).
+private let qwen4ExpL2NormLastAxisKernel = MLXFast.metalKernel(
+    name: "qwen4exp_gdn_l2norm",
+    inputNames: ["x", "scale"],
+    outputNames: ["out"],
+    source: """
+        uint n = thread_position_in_grid.x;
+        uint base = n * D;
+        float sumSquares = 0.0;
+        for (uint d = 0; d < D; d++) {
+            float v = float(x[base + d]);
+            sumSquares += v * v;
+        }
+        float inv = metal::rsqrt(sumSquares + 1e-6f) * float(scale[0]);
+        for (uint d = 0; d < D; d++) {
+            out[base + d] = static_cast<T>(float(x[base + d]) * inv);
+        }
+    """)
+
+/// L2-normalizes `x`'s last axis (`headDim`) and multiplies by `scale`
+/// (pass `1.0` for no extra scale). Matches
+/// `x * rsqrt((x*x).sum(axis: -1, keepDims: true) + 1e-6) * scale`.
+func qwen4ExpL2NormLastAxisFused(
+    _ x: MLXArray, headDim: Int, scale: Float
+) -> MLXArray {
+    let total = x.size / headDim
+    let width = qwen4ExpKernelThreadGroupWidth(total)
+    // Shaped `[1]`, not a bare 0-d scalar: MLX's custom-kernel codegen emits
+    // a plain (non-subscriptable) scalar parameter for a 0-d input, which
+    // fails to compile against `scale[0]` in the kernel source above.
+    let scaleArray = MLXArray([scale]).asType(.float32)
+    let outputs = qwen4ExpL2NormLastAxisKernel(
+        [x, scaleArray],
+        template: [("D", headDim), ("T", x.dtype)],
+        grid: (total, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [x.dtype])
+    return outputs[0]
+}
 
 /// Gated DeltaNet branch used by Flash-Next's `linear_attention` layers.
 ///
@@ -193,12 +252,23 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         // Keeping this explicit is important: rmsNorm would normalize by the
         // mean square and changes the recurrence scale by sqrt(Dk).
         let scale = 1.0 / Float(keyHeadDim).squareRoot()
-        let qNormed = q * MLX.rsqrt((q * q).sum(axis: -1, keepDims: true) + 1e-6)
-            * MLXArray(scale).asType(q.dtype)
         // The Flash-Next reference scales only the query after L2
         // normalization. Scaling K as well changes the delta-rule update and
         // is especially visible when a recurrent cache is already warm.
-        let kNormed = k * MLX.rsqrt((k * k).sum(axis: -1, keepDims: true) + 1e-6)
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        if fusionLevel >= .f9GdnL2NormKernel {
+            // P10.3 (F9): fuses multiply+sum+rsqrt+multiply(+scale) into one
+            // kernel call each. See Qwen4ExpGatedDeltaNet.swift's top-level
+            // comment for why this stops at the L2-norm glue, not
+            // `gatedDeltaUpdate` itself.
+            qNormed = qwen4ExpL2NormLastAxisFused(q, headDim: keyHeadDim, scale: scale)
+            kNormed = qwen4ExpL2NormLastAxisFused(k, headDim: keyHeadDim, scale: 1)
+        } else {
+            qNormed = q * MLX.rsqrt((q * q).sum(axis: -1, keepDims: true) + 1e-6)
+                * MLXArray(scale).asType(q.dtype)
+            kNormed = k * MLX.rsqrt((k * k).sum(axis: -1, keepDims: true) + 1e-6)
+        }
 
         let out: MLXArray
         let state: MLXArray

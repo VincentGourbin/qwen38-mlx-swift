@@ -4282,3 +4282,117 @@ upstream resterait modeste face au budget d'ops qui domine désormais,
 
 Diagnostic conservé dans `op-overhead-probe` (mesures « cooperative pool »
 vs « Thread .default/.userInteractive ») pour reproduction future.
+
+## 2026-09-12 (suite) — P10.2 : fusion mix+inject des hyper-connexions (F8) — validée juste sur les kernels, neutre au bench synthétique
+
+Protocole PLAN.md §P10, P10.2. Deux `MLXFast.metalKernel` (`Sources/Qwen38Core/
+FlashNext/Qwen4ExpHyperConnection.swift`) : `qwen4ExpHyperMixFused` fusionne
+`sigmoid(upOut).reshaped(...) * normed.reshaped(...)).mean(axis: -2)` (5 ops)
+en un appel ; `qwen4ExpHyperInjectFused` fusionne le
+`expandedDimensions` ×2 + multiply + reshape + add de
+`Qwen4ExpDecoderLayer.inject` (5 ops également) en un autre. Les deux
+matmuls bas-rang (`input_mix_weight_down/up`, `block_inject_weight`) restent
+des `Linear`/`QuantizedLinear` MLX inchangés — seule la glue autour est
+fusionnée. Nouveau niveau `Qwen4ExpFusionLevel.f8HyperConnectionKernel = 8`.
+
+**Piège découvert en écrivant P10.2** : `Qwen4ExpFusionLevel` est cumulatif
+(`>=`), et la production est par défaut à F7 (7) depuis le 2026-09-11. Le
+plan proposait de réutiliser l'ancien slot `.f3HyperConnections` (jamais
+implémenté) — mais 3 < 7, donc câbler un comportement sur ce niveau
+l'aurait **activé silencieusement en production** dès le câblage, sans
+passer par la porte bench-puis-checkpoint. F8 (8 > 7) évite ce piège :
+`.f3HyperConnections` reste un slot mort, à traiter en P10.6.
+
+**Fausse alerte de parité, élucidée** : `Qwen4ExpLayerBench.checkParity`
+compare toujours à `.none` ; comme F8 (8) est cumulatif au-dessus de F7 (7),
+« .none vs F8 » mélange le F8 tout neuf avec le F7 déjà connu pour changer
+la sortie (c'est une correction de bug, pas juste un réordonnancement). Sur
+poids aléatoires en float16 (convention du harnais) mélangés à des
+`QuantizedLinear` à échelles bf16, le chemin d'origine (`.none`) se
+retrouve parfois promu en float32 par la règle de promotion bf16/float16 de
+MLX — un vrai écart mesuré (diff abs jusqu'à 1,6, diff rel jusqu'à 447),
+mais un artefact du mélange de dtypes propre à ce harnais synthétique, pas
+un bug de F8. Deux tests dédiés, à la place :
+- `qwen4ExpHyperKernelsMatchNaiveComputation` : les deux kernels seuls,
+  tenseurs float32 isolés, contre le calcul non fusionné — diff < 1e-5.
+- `qwen4ExpGatedResidualFusionMatchesOriginalPathAtProductionDtype` :
+  `Qwen4ExpGatedResidual` complet, bf16 de bout en bout (le seul dtype réel
+  de production, où `upOut.dtype == normed.dtype` tient toujours) — diff
+  < 1e-2 (bruit d'arrondi bf16 attendu, ~quelques ULP sur des valeurs O(1)).
+93 tests verts au total (91 + ces 2).
+
+**Bench synthétique** (`flash-layer-bench --steps 300`, Release, machine
+partagée avec une autre charge GPU au moment de la mesure — bruit élevé,
+p10 retenu comme le moins pollué) :
+
+| Couche | F7 (défaut) | F8 | Δ |
+|---|---:|---:|---:|
+| GDN médiane | 1,18-1,53 ms | 1,18-1,34 ms | neutre |
+| QSA médiane | 1,47-1,81 ms | 1,75-1,79 ms | **+12 à +19 %** (pire) |
+
+Aucun gain net ; QSA légèrement pire. Cohérent avec le précédent de la
+campagne (3 tentatives de fusion à la main déjà écartées avant les deux
+gains dtype) : un kernel maison n'a pas automatiquement moins de surcoût
+qu'un enchaînement d'ops MLX déjà optimisées, surtout à cette taille de
+tenseur. Mesure checkpoint réel : en attente (GPU partagé au moment de
+cette session — voir note de fin de section P10).
+
+**Décision provisoire** : le bench synthétique ne montre déjà pas le ≥5 %
+requis. Sauf contre-mesure au checkpoint réel, F8 sera retiré du
+défaut (il ne l'était de toute façon pas) et consigné comme résultat
+négatif valide, sans être promu — comportement identique au sort de
+`switch_mlp`/compile-par-couche. `--fusion-level 8` reste disponible pour
+comparer.
+
+## 2026-09-12 (suite) — P10.3 : fusion L2-norm q/k GDN (F9) — kernels corrects, gain synthétique marginal et bruyant
+
+Protocole PLAN.md §P10, P10.3, même méthode que P10.2. Cible : la
+normalisation L2 de q/k dans `Qwen4ExpGatedDeltaNet.callAsFunction`
+(`x * rsqrt((x*x).sum(axis:-1,keepDims:true) + 1e-6) * scale`, 4-5 ops
+chacune) — **hors `gatedDeltaUpdate`**. Vérification faite en lisant
+`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift` : les
+transformations de gating citées par le plan
+(`-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`) vivent déjà dans le corps
+de cette fonction vendue (`computeGatedDeltaG`, l. 14-15 ; `sigmoid(b)`,
+l. 296) — en dehors du kernel récurrent proprement dit, mais dans une
+dépendance amont non patchée (PLAN.md §1.1). La surface fusionnable réelle
+de P10.3, dans notre propre code, est donc la L2-norm elle-même, pas le
+gating.
+
+Nouveau kernel `qwen4ExpL2NormLastAxisFused` (`Qwen4ExpGatedDeltaNet.swift`),
+niveau `Qwen4ExpFusionLevel.f9GdnL2NormKernel = 9` (au-dessus de F8, même
+raison que F8 au-dessus de F7 — cumulatif, ne pas retomber sous le défaut
+de production). `eps` (toujours 1e-6 dans ce fichier) est écrit en dur dans
+la source Metal plutôt que passé en template : `KernelTemplateArg` n'admet
+que `Bool`/`Int`/`DType`, pas `Float`. Piège de compilation Metal rencontré
+et corrigé : un scalaire passé comme `MLXArray(scale)` (0-d) fait générer
+par MLX un paramètre non subscriptable (`scale[0]` ne compile pas) —
+il faut le former en `[1]`, pas en tableau 0-d.
+
+**Deux tests dédiés**, même schéma que P10.2 (le kernel seul en float32,
+puis le module complet en bf16 contre F7 — pas `.none`, pour la même
+raison de cumulativité que P10.2) :
+- `qwen4ExpGdnL2NormKernelMatchesNaiveComputation` : diff < 1e-4 (float32).
+- `qwen4ExpGatedDeltaNetFusionMatchesOriginalPathAtProductionDtype` :
+  diff < 1e-2 (bf16, un seul pas — pas de récurrence sur 32 pas, pour ne
+  pas retomber dans le régime chaotique déjà documenté en P8.2 pour les
+  poids aléatoires non entraînés).
+95 tests verts au total (93 + ces 2).
+
+**Bench synthétique** (`flash-layer-bench --layer-kind gdn --steps 300`,
+même machine partagée, bruit élevé — médianes ponctuellement polluées par
+une charge GPU concurrente jusqu'à ×20-30, p10 retenu) :
+
+| | F7 (défaut) | F9 | Δ (p10) |
+|---|---:|---:|---:|
+| p10 (3 runs) | 1,23 / 1,25 / 1,23 ms | 1,17 / 1,23 / 1,23 ms | 0 à −5 % |
+
+Gain marginal, dans le bruit de mesure de cette session (machine partagée
+avec une autre charge GPU) — à revérifier sur machine calme avant toute
+conclusion. Mesure checkpoint réel : en attente (voir note de fin P10).
+
+**Décision provisoire** : contrairement à F8, F9 ne montre pas de
+régression et un léger mieux au p10 — à confirmer sur machine calme et sur
+le checkpoint réel avant toute promotion. `--fusion-level 9` disponible
+pour comparer.
+

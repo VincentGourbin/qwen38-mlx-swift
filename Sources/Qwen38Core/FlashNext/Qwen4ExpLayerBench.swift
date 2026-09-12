@@ -209,7 +209,9 @@ public struct Qwen4ExpLayerBenchDimensions: Sendable {
     /// A single-layer `Qwen4ExpTextConfiguration` selecting `layerType` at
     /// index 0. P0 never calls `Qwen4ExpConfiguration.validate()`, so this
     /// does not need the real 48-entry `layer_types` array or a PLE layer.
-    fileprivate func textConfiguration(
+    // `internal` (not `fileprivate`): also used directly by
+    // `@testable import`ed diagnostics in Qwen38Tests (P10.2).
+    func textConfiguration(
         layerType: Qwen4ExpTextConfiguration.LayerType
     ) -> Qwen4ExpTextConfiguration {
         Qwen4ExpTextConfiguration(
