@@ -3035,3 +3035,137 @@ func healthzAlwaysPublishesAblation() async throws {
         try JSONSerialization.jsonObject(with: data) as? [String: Any])
     #expect(decoded["ablation"] as? String == "none")
 }
+
+// MARK: - P11.2/P11.4a : logique pure de flash-decode-bench (sans checkpoint)
+
+@Test("P11.4a : le découpage forcé prend les jetons dans l'ordre, par paquets de tokens-per-step")
+func decodeBenchSplitForcedStepsSlicesInOrder() throws {
+    let forced: [Int32] = [10, 11, 12, 13, 14, 15, 16, 17]
+    let steps = try qwen4ExpSplitForcedDecodeSteps(
+        forcedIDs: forced, tokensPerStep: 2, stepCount: 4)
+    #expect(steps == [[10, 11], [12, 13], [14, 15], [16, 17]])
+}
+
+@Test("P11.4a : tokens-per-step 1 redonne un pas par jeton")
+func decodeBenchSplitForcedStepsSingleTokenPerStep() throws {
+    let forced: [Int32] = [1, 2, 3]
+    let steps = try qwen4ExpSplitForcedDecodeSteps(
+        forcedIDs: forced, tokensPerStep: 1, stepCount: 3)
+    #expect(steps == [[1], [2], [3]])
+}
+
+@Test("P11.4a : une séquence forcée plus longue que nécessaire est tronquée à stepCount*tokensPerStep, pas plus")
+func decodeBenchSplitForcedStepsIgnoresSurplus() throws {
+    let forced: [Int32] = [1, 2, 3, 4, 5, 6, 99, 99, 99]
+    let steps = try qwen4ExpSplitForcedDecodeSteps(
+        forcedIDs: forced, tokensPerStep: 3, stepCount: 2)
+    #expect(steps == [[1, 2, 3], [4, 5, 6]])
+}
+
+@Test("P11.4a : une séquence forcée trop courte est une erreur explicite, jamais une troncature silencieuse de stepCount")
+func decodeBenchSplitForcedStepsRejectsShortSequence() {
+    #expect(throws: Qwen4ExpDecodeBenchError.insufficientForcedIDs(required: 6, provided: 4)) {
+        try qwen4ExpSplitForcedDecodeSteps(
+            forcedIDs: [1, 2, 3, 4], tokensPerStep: 2, stepCount: 3)
+    }
+}
+
+@Test("P11.4a : tokens-per-step non positif est rejeté")
+func decodeBenchSplitForcedStepsRejectsInvalidTokensPerStep() {
+    #expect(throws: Qwen4ExpDecodeBenchError.invalidTokensPerStep(0)) {
+        try qwen4ExpSplitForcedDecodeSteps(forcedIDs: [1, 2], tokensPerStep: 0, stepCount: 1)
+    }
+}
+
+@Test("P11.4a : stepCount non positif est rejeté")
+func decodeBenchSplitForcedStepsRejectsInvalidStepCount() {
+    #expect(throws: Qwen4ExpDecodeBenchError.invalidStepCount(0)) {
+        try qwen4ExpSplitForcedDecodeSteps(forcedIDs: [1, 2], tokensPerStep: 1, stepCount: 0)
+    }
+}
+
+@Test("P11.2 : --ablate-sweep résout chaque élément dans l'ordre donné, espaces ignorés")
+func decodeBenchParseAblationSweepResolvesInOrder() throws {
+    let variants = try qwen4ExpParseAblationSweep(" moe , gdn-recurrence ,none")
+    #expect(variants == [.moe, .gdnRecurrence, .none])
+}
+
+@Test("P11.2 : --ablate-sweep accepte une seule variante")
+func decodeBenchParseAblationSweepSingleVariant() throws {
+    #expect(try qwen4ExpParseAblationSweep("hyper") == [.hyper])
+}
+
+@Test("P11.2 : --ablate-sweep accepte des doublons (répète juste la visite à chaque tour)")
+func decodeBenchParseAblationSweepAllowsDuplicates() throws {
+    #expect(try qwen4ExpParseAblationSweep("moe,moe") == [.moe, .moe])
+}
+
+@Test("P11.2 : --ablate-sweep vide ou blanc est rejeté")
+func decodeBenchParseAblationSweepRejectsEmpty() {
+    #expect(throws: Qwen4ExpDecodeBenchError.emptyAblationSweep) {
+        try qwen4ExpParseAblationSweep("   ")
+    }
+}
+
+@Test("P11.2 : --ablate-sweep rejette un élément vide (ex. virgule finale), même erreur que --ablate")
+func decodeBenchParseAblationSweepRejectsEmptyElement() {
+    #expect(throws: Qwen4ExpAblationResolutionError.self) {
+        try qwen4ExpParseAblationSweep("moe,")
+    }
+}
+
+@Test("P11.2 : --ablate-sweep rejette une valeur inconnue")
+func decodeBenchParseAblationSweepRejectsUnknownValue() {
+    #expect(throws: Qwen4ExpAblationResolutionError.self) {
+        try qwen4ExpParseAblationSweep("moe,does-not-exist")
+    }
+}
+
+@Test("P11.1 : le calendrier d'alternance est round-major — tour 1 : toutes les variantes, tour 2 : toutes les variantes")
+func decodeBenchScheduleIsRoundMajor() {
+    let schedule = qwen4ExpDecodeBenchSchedule(variantCount: 3, roundCount: 2)
+    #expect(
+        schedule == [
+            .init(round: 0, variantIndex: 0), .init(round: 0, variantIndex: 1),
+            .init(round: 0, variantIndex: 2),
+            .init(round: 1, variantIndex: 0), .init(round: 1, variantIndex: 1),
+            .init(round: 1, variantIndex: 2),
+        ])
+}
+
+@Test("P11.1 : le calendrier compte exactement variantCount*roundCount visites")
+func decodeBenchScheduleCountsVisits() {
+    let schedule = qwen4ExpDecodeBenchSchedule(variantCount: 4, roundCount: 5)
+    #expect(schedule.count == 20)
+}
+
+@Test("P11.1 : variantCount ou roundCount non positif donne un calendrier vide")
+func decodeBenchScheduleEmptyWhenNonPositive() {
+    #expect(qwen4ExpDecodeBenchSchedule(variantCount: 0, roundCount: 5).isEmpty)
+    #expect(qwen4ExpDecodeBenchSchedule(variantCount: 5, roundCount: 0).isEmpty)
+}
+
+@Test("P11.4a : les statistiques descriptives sont exactes sur une série connue")
+func decodeBenchStatsComputesKnownSeries() {
+    let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: [10, 20, 30, 40])
+    #expect(stats.count == 4)
+    #expect(stats.medianMs == 25)
+    #expect(stats.meanMs == 25)
+    #expect(stats.minMs == 10)
+    #expect(stats.maxMs == 40)
+    #expect(abs(stats.stddevMs - 11.180339887) < 1e-6)
+}
+
+@Test("P11.4a : les statistiques d'une série constante ont un écart-type nul")
+func decodeBenchStatsZeroStddevOnConstantSeries() {
+    let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: [5, 5, 5])
+    #expect(stats.stddevMs == 0)
+    #expect(stats.medianMs == 5)
+}
+
+@Test("P11.4a : les statistiques d'une série vide signalent count == 0 plutôt que de planter")
+func decodeBenchStatsEmptySeries() {
+    let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: [])
+    #expect(stats.count == 0)
+    #expect(stats.medianMs.isNaN)
+}

@@ -35,6 +35,7 @@ struct Qwen38CLI: AsyncParsableCommand {
             FlashTeacherForcedScore.self,
             FlashMTPProbe.self,
             FlashChatProbe.self,
+            FlashDecodeBench.self,
             Generate.self, MTPProbe.self, MTPParity.self,
             MTPConversationProbe.self,
             ConversationBenchmark.self,
@@ -1500,6 +1501,292 @@ struct FlashChatProbe: AsyncParsableCommand {
             print(profileSession.generateReport())
             if let trace { print("trace profiler: \(trace)") }
         }
+    }
+}
+
+/// P11.2/P11.4a : banc de décodage à séquence forcée sur le checkpoint réel.
+///
+/// P11.2 (`docs/knowledge/log.md`, 2026-09-13) a montré que l'attribution du
+/// coût par sous-bloc par ablation-et-soustraction sur une génération
+/// *libre* est invalide : ablater un sous-bloc change les tokens produits
+/// (jusqu'à dégénérer en un seul token répété), donc les lectures n-gram et
+/// le routage MoE — on ne mesure plus le sous-bloc, on mesure sa
+/// dégénérescence. Ici, chaque pas de décodage impose le jeton suivant
+/// d'une séquence fixée à la place de l'argmax du modèle : toutes les
+/// variantes décodent exactement les mêmes jetons, seule la branche ablatée
+/// diffère. `--tokens-per-step` sert un second besoin (P11.4a) : le coût
+/// marginal d'un forward selon le nombre de jetons qu'il traite, un chiffre
+/// que le TTFT du serveur ne peut pas isoler (~250 ms de coût fixe de
+/// requête, cinq fois le forward lui-même).
+///
+/// `flash-teacher-forced-score` ne convient à aucun des deux besoins : il
+/// fait un seul forward groupé sur toute la séquence (du préfill, pas du
+/// décodage — un mélange d'opérations différent, matmul contre matvec
+/// batch 1).
+///
+/// Défauts de production repris tels quels (aucun n'est exposé en option
+/// ici — ce banc mesure la configuration qui tourne réellement, pas une
+/// variante) : couches résidentes, `residentAsyncEval` actif,
+/// `residentAsyncInterval` 8, lecture F_NOCACHE, niveau de fusion F7 — voir
+/// `Qwen38FlashNextEngine.init`.
+struct FlashDecodeBench: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "flash-decode-bench",
+        abstract:
+            "P11.2/P11.4a : décodage à séquence forcée sur le checkpoint réel — attribution par sous-bloc sans dégénérescence de sortie, et coût marginal d'un forward selon le nombre de tokens"
+    )
+
+    @Argument(help: "Répertoire local du checkpoint qwen4_exp")
+    var modelPath: String
+
+    @Option(name: .long, help: "Prompt utilisateur, préfillé normalement (hors mesure)")
+    var prompt: String
+
+    @Option(
+        name: .long,
+        help:
+            "Identifiants à décoder, imposés à chaque pas à la place de l'argmax (CSV). Absent : un passage greedy (température 0, ablation none) sur le prompt donné produit la séquence, ensuite rejouée forcée pour chaque variante — annoncé dans la sortie."
+    )
+    var forcedIds: String?
+
+    @Option(name: .long, help: "Nombre de pas mesurés par variante")
+    var steps: Int = 128
+
+    @Option(name: .long, help: "Nombre de pas de warm-up non mesurés")
+    var warmup: Int = 16
+
+    @Option(
+        name: .long,
+        help:
+            "P11.4a : nombre de jetons forcés fournis à chaque forward (point (B) : coût marginal d'un forward selon N)"
+    )
+    var tokensPerStep: Int = 1
+
+    @Option(
+        name: .long,
+        help:
+            "P11.2 : court-circuite un sous-bloc (même vocabulaire que flash-chat-probe --ablate), \"none\" pour désactiver — incompatible avec --ablate-sweep"
+    )
+    var ablate: String?
+
+    @Option(
+        name: .long,
+        help:
+            "P11.2 : plusieurs ablations comparées dans un seul process, en alternant à chaque tour (tour 1 : toutes les variantes ; tour 2 : toutes les variantes ; …) via updateAblation, sans recharger le checkpoint — CSV, même vocabulaire que --ablate ; incompatible avec --ablate"
+    )
+    var ablateSweep: String?
+
+    @Option(
+        name: .long,
+        help: "P11.1 : surcharge de la largeur de routage MoE — même contrat que flash-chat-probe")
+    var routedExperts: Int?
+
+    /// Décode `count` jetons en greedy (température 0 ⇒ `ArgMaxSampler`,
+    /// comme `Qwen4ExpStreamingGenerator`) avec l'ablation forcée à `.none`
+    /// — la séquence forcée par défaut doit venir du modèle *non ablaté*,
+    /// jamais d'une variante en cours de mesure : c'est exactement le biais
+    /// que cet instrument existe pour éliminer (P11.2). Laisse le modèle
+    /// dans l'état atteint après le dernier pas ; le caller repart d'un
+    /// `resetConversation()` avant de mesurer quoi que ce soit.
+    private static func greedyForcedIDs(
+        model: Qwen4ExpStreamingTextModel, promptTokenIDs: [Int32], positionIDs: MLXArray?,
+        count: Int
+    ) throws -> [Int32] {
+        model.resetConversation()
+        model.setAblation(.none)
+        let sampler = ArgMaxSampler()
+        let promptArray = MLXArray(promptTokenIDs).reshaped([1, promptTokenIDs.count])
+        let prefill = try model.forward(inputIDs: promptArray, positionIDs: positionIDs)
+        var logits = prefill.logits[0..., -1, 0...]
+        var tokens: [Int32] = []
+        tokens.reserveCapacity(count)
+        for index in 0..<count {
+            let sampled = sampler.sample(logits: logits)
+            let token = Int32(sampled.item(Int32.self))
+            tokens.append(token)
+            if index < count - 1 {
+                let step = try model.forward(inputIDs: MLXArray([token]).reshaped([1, 1]))
+                logits = step.logits[0..., -1, 0...]
+            }
+        }
+        return tokens
+    }
+
+    func run() async throws {
+        guard steps > 0 else { throw ValidationError("--steps doit être positif") }
+        guard warmup >= 0 else { throw ValidationError("--warmup doit être positif ou nul") }
+        guard tokensPerStep > 0 else {
+            throw ValidationError("--tokens-per-step doit être positif")
+        }
+        if let routedExperts, routedExperts < 1 {
+            throw ValidationError("--routed-experts doit être un entier positif")
+        }
+        if ablate != nil && ablateSweep != nil {
+            throw ValidationError(
+                "--ablate et --ablate-sweep sont incompatibles : utiliser l'un ou l'autre")
+        }
+
+        let variants: [Qwen4ExpLayerBenchAblation]
+        if let ablateSweep {
+            variants = try qwen4ExpParseAblationSweep(ablateSweep)
+        } else if let ablate {
+            variants = [try qwen4ExpResolveAblation(rawValue: ablate)]
+        } else {
+            variants = [.none]
+        }
+
+        _ = Device.defaultDevice()
+        let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+        let configuration = try Qwen4ExpConfiguration.load(from: directory)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+
+        // P11 : défauts de production de Qwen38FlashNextEngine.init, non
+        // exposés en option ici (voir le commentaire de ce type).
+        let model = try Qwen4ExpStreamingTextModel(
+            directory: directory,
+            layerLoadingMode: .resident,
+            residentEvaluationInterval: 1,
+            residentAsyncEval: true,
+            residentAsyncInterval: 8,
+            uncachedIO: true,
+            routedExpertCount: routedExperts,
+            ablation: .none)
+        // P11.1 : garde de publication — toujours affiché, même sans
+        // --routed-experts, pour ne jamais mesurer en croyant à tort avoir
+        // changé K.
+        print(
+            "routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)"
+        )
+
+        let built = try Qwen4ExpPromptBuilder.buildFirstTurn(
+            tokenizer: tokenizer, configuration: configuration, directory: directory,
+            prompt: prompt, imageURL: nil, thinking: false)
+        guard !built.tokenIDs.isEmpty else {
+            throw ValidationError("Le prompt ne produit aucun jeton.")
+        }
+
+        let roundCount = warmup + steps
+        let requiredForcedCount = roundCount * tokensPerStep
+
+        let forcedIDs: [Int32]
+        if let forcedIdsOption = forcedIds {
+            let parts = forcedIdsOption.split(separator: ",").map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard !parts.isEmpty, parts.allSatisfy({ Int32($0) != nil }) else {
+                throw ValidationError(
+                    "--forced-ids doit contenir des entiers séparés par des virgules")
+            }
+            forcedIDs = parts.map { Int32($0)! }
+        } else {
+            print(
+                "--forced-ids absent : décodage greedy (température 0, ablation none, K "
+                    + "\(model.routedExpertCount)) sur \(requiredForcedCount) pas pour obtenir "
+                    + "la séquence forcée, rejouée ensuite pour chaque variante.")
+            forcedIDs = try Self.greedyForcedIDs(
+                model: model, promptTokenIDs: built.tokenIDs, positionIDs: built.positionIDs,
+                count: requiredForcedCount)
+        }
+
+        // Lève Qwen4ExpDecodeBenchError.insufficientForcedIDs si --forced-ids
+        // est trop court — jamais une troncature silencieuse de `roundCount`.
+        let forcedSteps = try qwen4ExpSplitForcedDecodeSteps(
+            forcedIDs: forcedIDs, tokensPerStep: tokensPerStep, stepCount: roundCount)
+
+        // Préfixage commun à toutes les variantes : toujours reconstruit
+        // avec l'ablation none (même état de base pour tout le monde), et
+        // hors mesure (P11.2 : « le prompt est préfillé normalement »).
+        model.resetConversation()
+        model.setAblation(.none)
+        let promptArray = MLXArray(built.tokenIDs).reshaped([1, built.tokenIDs.count])
+        _ = try model.forward(inputIDs: promptArray, positionIDs: built.positionIDs)
+
+        var perVariantMs: [[Double]] = Array(repeating: [], count: variants.count)
+
+        if variants.count > 1 {
+            // P11.2 : alternance à chaud entre variantes, méthodologie
+            // P11.1 (écart-type 0,05 tok/s contre plusieurs tok/s en process
+            // neuf par variante). Chaque variante garde son propre état
+            // (cache GDN/QSA/PLE + horloge M-RoPE) via `snapshot`/`restore` —
+            // `restore` recopie les tableaux du snapshot (jamais l'inverse),
+            // donc réutiliser le même `baseSnapshot` pour démarrer chaque
+            // variante est sûr. Interprétation : cette machinerie n'a de
+            // sens qu'à partir de 2 variantes ; à 1 seule variante (défaut,
+            // ou --ablate simple), le chemin ci-dessous ne s'applique pas et
+            // le décodage reste la boucle continue habituelle — voir le
+            // rapport de tâche pour la justification (le restore() vide le
+            // cache allocateur MLX, un coût que la mesure (B), pas la mesure
+            // (A), n'a aucune raison de payer).
+            print(
+                "balayage entrelacé : \(variants.count) variantes × \(roundCount) tours "
+                    + "(\(warmup) warmup + \(steps) mesurés)")
+            let baseSnapshot = model.snapshot()
+            var perVariantSnapshot = Array(repeating: baseSnapshot, count: variants.count)
+            let schedule = qwen4ExpDecodeBenchSchedule(
+                variantCount: variants.count, roundCount: roundCount)
+            for visit in schedule {
+                let variant = variants[visit.variantIndex]
+                let chunk = forcedSteps[visit.round]
+                model.restore(perVariantSnapshot[visit.variantIndex])
+                model.setAblation(variant)
+                let inputArray = MLXArray(chunk).reshaped([1, chunk.count])
+                let start = ContinuousClock.now
+                _ = try model.forward(inputIDs: inputArray)
+                let elapsedMs = durationSeconds(ContinuousClock.now - start) * 1000
+                perVariantSnapshot[visit.variantIndex] = model.snapshot()
+                if visit.round >= warmup {
+                    perVariantMs[visit.variantIndex].append(elapsedMs)
+                }
+            }
+        } else {
+            // Une seule variante : décodage continu, sans snapshot/restore —
+            // le chemin le plus proche de la production, nécessaire pour que
+            // la mesure (B) (coût d'un forward selon --tokens-per-step) ne
+            // porte pas le coût du vidage de cache allocateur que `restore`
+            // fait à chaque pas (P11.2 en a besoin pour comparer des
+            // variantes entre elles ; (B) n'a qu'une seule variante et n'a
+            // rien à en tirer).
+            model.setAblation(variants[0])
+            for round in 0..<roundCount {
+                let chunk = forcedSteps[round]
+                let inputArray = MLXArray(chunk).reshaped([1, chunk.count])
+                let start = ContinuousClock.now
+                _ = try model.forward(inputIDs: inputArray)
+                let elapsedMs = durationSeconds(ContinuousClock.now - start) * 1000
+                if round >= warmup {
+                    perVariantMs[0].append(elapsedMs)
+                }
+            }
+        }
+
+        for (index, variant) in variants.enumerated() {
+            // P11.2 : même garde de publication que flash-chat-probe — à
+            // chaque variante, jamais une seule fois en tête.
+            print("=== variante : \(variant.rawValue) ===")
+            print("ablation active : \(variant.rawValue)")
+            print(
+                "routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)"
+            )
+            let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: perVariantMs[index])
+            if stats.count == 0 {
+                print("aucun pas mesuré (--warmup ≥ --steps + --warmup ?)")
+                continue
+            }
+            print(
+                "ms/pas (\(tokensPerStep) jeton(s)/pas) — pas retenus \(stats.count) · "
+                    + "médiane \(String(format: "%.3f", stats.medianMs)) · "
+                    + "moyenne \(String(format: "%.3f", stats.meanMs)) · "
+                    + "écart-type \(String(format: "%.3f", stats.stddevMs)) · "
+                    + "min \(String(format: "%.3f", stats.minMs)) · "
+                    + "max \(String(format: "%.3f", stats.maxMs))")
+        }
+
+        print(
+            "MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))"
+        )
+        print(
+            "MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))"
+        )
     }
 }
 
