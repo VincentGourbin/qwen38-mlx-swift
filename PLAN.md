@@ -4226,7 +4226,43 @@ et il exclut le cache de pages — la distinction que notre `preflight-resident.
 fait déjà. Sur un Mac mini de 24 Go avec un checkpoint de 23 Go, le cache de
 pages du noyau détient de fait le modèle.
 
-#### Le vrai diagnostic : nous sommes à 28× du toit
+#### ⚠️ Ce diagnostic a été corrigé le 2026-09-13 — lire d'abord ceci
+
+Le tableau ci-dessous (« 28× du toit, 3,6 % de la bande passante ») est **juste
+en agrégat mais trompeur sur la cible**. Il laissait croire qu'il fallait mieux
+lire les poids des experts. La mesure à séquence forcée l'a réfuté :
+
+| K | Mio d'experts lus | ms par pas |
+|---:|---:|---:|
+| 10 | 1 005 | 46,944 |
+| 5 | 503 | 44,608 |
+| 1 | 101 | 42,576 |
+
+Droite ajustée à mieux que 0,08 ms : **pente 4,78 µs par Mio (219 Go/s, 55 %
+du pic) et ordonnée 42,13 ms**. Donc sur un pas de 46,94 ms :
+
+- **4,80 ms (10 %)** pour lire les experts — **et cette part-là fonctionne
+  bien**, à 55 % de la bande passante crête ;
+- **42,13 ms (90 %)** de **coût fixe**, indépendant du volume lu.
+
+**Diviser les octets lus par dix ne rend que 9,3 %.** La cible n'est donc pas
+la lecture des poids mais les **42 ms de travail fixe par jeton**, répartis sur
+48 couches de petites opérations (GDN, QSA, hyper-connexions, normes, routeur,
+expert partagé) — un coût **diffus**, sans bloc dominant.
+
+C'est ce qui explique d'un coup toutes les mesures de §P11 : K plafonne à
++5,9 %, les noyaux Metal F8/F9 ont donné −1 %, ablater n'importe quoi
+« économise » 20-40 % pour une somme de 180 %, et le spéculatif plafonne à
+1,14×.
+
+**Les deux seules directions qui restent** attaquent un coût fixe diffus, pas
+un bloc : compter les ops GPU réelles par jeton (jamais vérifié depuis F7 ;
+42,13 ms sur ~4 800 ops ferait 8,8 µs par op, c'est-à-dire un plancher de
+latence de lancement que rien de ponctuel ne bougera), puis tenter une
+**capture de graphe sur le pas entier** — `MLX.compile` n'a été essayé qu'au
+niveau d'une couche (P2-code) et en P7, où il cassait la parité GDN.
+
+#### Le diagnostic initial, conservé pour mémoire : nous sommes à 28× du toit
 
 Mesures faites sur le checkpoint réel (`switch_mlp`, 3 bits g64, 48 couches,
 512 experts, K=10) :
