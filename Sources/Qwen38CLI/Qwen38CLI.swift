@@ -39,6 +39,7 @@ struct Qwen38CLI: AsyncParsableCommand {
             MTPConversationProbe.self,
             ConversationBenchmark.self,
             ConversationParity.self, Download.self, Serve.self, OpOverheadProbe.self,
+            NgramIOProbe.self,
         ]
     )
 }
@@ -2339,6 +2340,153 @@ struct OpOverheadProbe: AsyncParsableCommand {
             measureF16("SwitchGLU fp16 en entrée, eval/appel", expertIndices)
         }
         print("référence Python MLX 0.31.1 sur la même machine : 4,2 µs/op (addition élémentaire)")
+    }
+}
+
+/// P10.4 (method step, PLAN.md §P10): before touching
+/// `Qwen4ExpLazyNGramStorage`, measure the isolated cost of a single
+/// random-offset, cold-page row read against alternatives — an explicit
+/// `pread`, a `pread` with the double per-row `Array` allocation
+/// `readContiguousRuns` currently does even for a run of length 1, and
+/// concurrent `pread`s exploiting the storage device's queue depth. Reads
+/// from a real, large local shard file (no checkpoint config parsing, no
+/// GPU) so this can run standalone.
+struct NgramIOProbe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "ngram-io-probe",
+        abstract: "P10.4 : coût d'une lecture de ligne isolée vs groupée sur un fichier réel, sans checkpoint")
+
+    @Option(name: .long, help: "Fichier réel à sonder (un shard .safetensors, de préférence local)")
+    var file: String
+
+    @Option(name: .long, help: "Largeur d'une « ligne » en octets") var rowBytes: Int = 1280
+    @Option(name: .long, help: "Nombre de lignes sondées par méthode") var count: Int = 200
+    @Option(name: .long, help: "Largeur de concurrence pour la méthode « pread concurrents »")
+    var concurrency: Int = 16
+
+    func run() async throws {
+        let fileManager = FileManager.default
+        guard let attributes = try? fileManager.attributesOfItem(atPath: file),
+              let size = attributes[.size] as? Int, size > rowBytes * 4 else {
+            throw ValidationError("--file introuvable ou trop petit : \(file)")
+        }
+        let maxRow = size / rowBytes - 1
+        guard maxRow > count else {
+            throw ValidationError("--file trop petit pour \(count) lignes de \(rowBytes) octets")
+        }
+
+        // Four DISJOINT row sets, one per method below, each confined to its
+        // own quarter of the file: reusing the same rows across methods was
+        // tried first and measured a spurious ~150x "win" for whichever
+        // method ran after another had already warmed the OS page cache for
+        // those exact offsets — an artifact of measurement order, not of
+        // any method's real cost. Disjoint offsets mean every method pays
+        // for its own first touch of its rows.
+        var generator = SplitMix64(seed: 20_261_003)
+        let quarter = maxRow / 4
+        func randomRows(in range: Range<Int>) -> [Int] {
+            (0 ..< count).map { _ in range.lowerBound + Int(generator.next() % UInt64(range.count)) }
+        }
+        let rowsA = randomRows(in: 0 ..< quarter)
+        let rowsB = randomRows(in: quarter ..< 2 * quarter)
+        let rowsC = randomRows(in: 2 * quarter ..< 3 * quarter)
+        let rowsD = randomRows(in: 3 * quarter ..< 4 * quarter)
+
+        let fd = open(file, O_RDONLY)
+        guard fd >= 0 else { throw ValidationError("open() a échoué sur \(file)") }
+        defer { close(fd) }
+
+        func measure(_ label: String, _ body: () -> Void) {
+            let start = ContinuousClock.now
+            body()
+            let seconds = durationSeconds(ContinuousClock.now - start)
+            let usPerRow = seconds * 1e6 / Double(count)
+            print(
+                "\(label.padding(toLength: 42, withPad: " ", startingAt: 0)) "
+                    + "\(String(format: "%8.3f", usPerRow)) µs/ligne  (\(String(format: "%.3f", seconds))s total)"
+            )
+        }
+
+        // A: current `readContiguousRuns` shape for an isolated row (run
+        // length 1) — one throwaway `[UInt8]` allocation, then a *second*
+        // `Array` slice copy into the per-row dictionary entry, mirroring
+        // `result[firstRow + offset] = Array(rangeValues[...])`.
+        measure("A: pread + 2 allocations/ligne (actuel)") {
+            for row in rowsA {
+                var buffer = [UInt8](repeating: 0, count: rowBytes)
+                let n = buffer.withUnsafeMutableBytes { dst -> Int in
+                    pread(fd, dst.baseAddress, rowBytes, off_t(row * rowBytes))
+                }
+                precondition(n == rowBytes)
+                let boxed = Array(buffer[0..<rowBytes])
+                precondition(boxed.count == rowBytes)
+            }
+        }
+
+        // B: same pread, straight into one preallocated flat buffer at the
+        // row's destination slot — no intermediate per-row Array/dictionary.
+        let flatBuffer = UnsafeMutableRawPointer.allocate(
+            byteCount: count * rowBytes, alignment: 8)
+        defer { flatBuffer.deallocate() }
+        measure("B: pread direct dans un buffer plat") {
+            for (index, row) in rowsB.enumerated() {
+                let n = pread(fd, flatBuffer + index * rowBytes, rowBytes, off_t(row * rowBytes))
+                precondition(n == rowBytes)
+            }
+        }
+
+        // C: mmap + copyMemory, the actual production path (MAP_PRIVATE,
+        // page faults serviced synchronously one at a time on this thread).
+        let mapped = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)
+        precondition(mapped != MAP_FAILED)
+        defer { munmap(mapped, size) }
+        let raw = UnsafeRawBufferPointer(start: mapped, count: size)
+        measure("C: mmap + copyMemory (chemin actuel)") {
+            for (index, row) in rowsC.enumerated() {
+                let start = row * rowBytes
+                UnsafeMutableRawBufferPointer(
+                    start: flatBuffer + index * rowBytes, count: rowBytes
+                ).copyMemory(from: UnsafeRawBufferPointer(rebasing: raw[start ..< start + rowBytes]))
+            }
+        }
+
+        // D: `count` more random rows (own disjoint quarter), `pread`ed
+        // concurrently across at most `concurrency` threads at once (a
+        // `DispatchSemaphore` gate, not just `concurrentPerform`'s
+        // core-count-bound default) — tests whether the SSD/enclosure's
+        // queue depth, not per-op syscall cost, is what P10's "faute de
+        // page mmap" cost actually comes from (mmap page faults on one
+        // thread are serviced one at a time; concurrent preads let the
+        // device service several in flight).
+        measure("D: pread concurrents (\(concurrency) voies)") {
+            let semaphore = DispatchSemaphore(value: concurrency)
+            let group = DispatchGroup()
+            let queue = DispatchQueue(label: "ngram-io-probe", attributes: .concurrent)
+            for index in 0 ..< count {
+                semaphore.wait()
+                queue.async(group: group) {
+                    let row = rowsD[index]
+                    let n = pread(fd, flatBuffer + index * rowBytes, rowBytes, off_t(row * rowBytes))
+                    precondition(n == rowBytes)
+                    semaphore.signal()
+                }
+            }
+            group.wait()
+        }
+    }
+}
+
+/// Minimal, dependency-free, seeded PRNG — good enough for spreading probe
+/// offsets across a file; not for anything security-sensitive.
+private struct SplitMix64: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
     }
 }
 

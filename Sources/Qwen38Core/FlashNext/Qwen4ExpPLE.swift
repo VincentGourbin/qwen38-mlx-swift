@@ -118,6 +118,28 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         }
     }
 
+    /// P10.4: a plain, persistent, read-only file descriptor per shard file,
+    /// used by the concurrent-`pread` row-read path below (`pread` takes an
+    /// explicit offset and is safe to call concurrently from multiple
+    /// threads on the same fd — unlike `read`+`lseek`, which share a file
+    /// position). Kept open for this object's lifetime, alongside (not
+    /// instead of) `mappedFiles`'s `mmap` mapping — the
+    /// `QWEN38_NGRAM_CONCURRENT_PREAD` environment variable (see
+    /// `useConcurrentPread` below) picks which path a lookup actually takes.
+    private final class OpenFile: @unchecked Sendable {
+        let descriptor: Int32
+        init?(url: URL) {
+            let fileDescriptor = open(url.path, O_RDONLY)
+            guard fileDescriptor >= 0 else { return nil }
+            self.descriptor = fileDescriptor
+        }
+        deinit {
+            close(descriptor)
+        }
+    }
+
+    private let openFiles: [URL: OpenFile]
+
     public struct CacheStats: Sendable, Equatable {
         public let hits: Int
         public let misses: Int
@@ -335,13 +357,18 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
             entries.values.map(\.url)
         })
         var mappings = [URL: MappedFile]()
+        var openedFiles = [URL: OpenFile]()
         for url in mappedURLs {
             // Use POSIX mmap instead of Data(mappedIfSafe): Foundation may
             // copy an ExFAT file when it decides that mapping is unsafe. The
             // explicit MAP_PRIVATE path remains virtual on the USB volume.
             if let mapping = MappedFile(url: url) { mappings[url] = mapping }
+            // P10.4: a second, independent, persistent fd for the
+            // concurrent-`pread` path — see `OpenFile`'s comment.
+            if let opened = OpenFile(url: url) { openedFiles[url] = opened }
         }
         self.mappedFiles = mappings
+        self.openFiles = openedFiles
         var result = [Int: ShardLocation]()
         for shard in 0 ..< shardCount {
             guard let entries = locations[shard],
@@ -518,6 +545,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     }
 
     private func readPackedRowsUncached(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt32]] {
+        if Self.useConcurrentPread, let opened = openFiles[location.url] {
+            return Self.readRowsConcurrently(
+                UInt32.self, descriptor: opened.descriptor, dataStart: location.dataStart,
+                byteWidth: location.rowBytes, rows: rows, url: location.url)
+        }
         if let mapping = mappedFiles[location.url] {
             let raw = UnsafeRawBufferPointer(
                 start: UnsafeRawPointer(mapping.baseAddress), count: mapping.byteCount)
@@ -540,6 +572,75 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
         return Self.readContiguousRunsFromFile(
             UInt32.self, handle: handle, dataStart: location.dataStart, byteWidth: location.rowBytes,
             rows: rows, url: location.url)
+    }
+
+    /// P10.4 (docs/knowledge/log.md "P10.4"): `readContiguousRuns` below
+    /// groups only *numerically adjacent* requested rows into one bulk
+    /// copy — real n-gram lookups come from a hash, so adjacent rows are
+    /// coincidence, not the rule, and in practice this degenerates to one
+    /// `mmap` page fault per row, serviced synchronously and one at a time
+    /// on a single thread. `ngram-io-probe` (disjoint offsets, real shard
+    /// files, no checkpoint) measured, per isolated random row: local SSD
+    /// 113-143 µs (`pread`/`mmap`, single-threaded) vs 11 µs at 16-way
+    /// concurrent `pread`; the Lexar-linked shards: 299-541 µs
+    /// single-threaded vs 55 µs concurrent — roughly a **10×** reduction on
+    /// both media, and `mmap`+`copyMemory` (the path below) was the
+    /// *slowest* single-threaded option on Lexar, not the fastest. The
+    /// win is concurrency (queue depth), not avoiding a small extra `Array`
+    /// allocation (measured negligible once cache-warming from a shared
+    /// row set between methods — an early, discarded version of this probe
+    /// — was removed as a confound). Opt-in via `QWEN38_NGRAM_CONCURRENT_PREAD=1`
+    /// pending real-checkpoint validation (PLAN.md §P10 protocol); `mmap`
+    /// stays the default until then. See `readRowsConcurrently` below.
+    private static let useConcurrentPread =
+        ProcessInfo.processInfo.environment["QWEN38_NGRAM_CONCURRENT_PREAD"] == "1"
+
+    /// Concurrent `pread`-based counterpart to `readContiguousRuns`, same
+    /// `[Int: [Element]]` contract (deduplicated, one entry per requested
+    /// row) so every caller/cache/scatter path around it is unchanged.
+    /// `pread` takes an explicit offset and does not share a file-position
+    /// cursor, so it is safe to call concurrently on the same descriptor
+    /// from multiple threads (POSIX). Bounded to `maxConcurrentReads`
+    /// in-flight reads at once via a semaphore, not
+    /// `DispatchQueue.concurrentPerform`'s core-count-bound default —
+    /// `ngram-io-probe` measured the win from letting the storage device
+    /// service several reads at once (queue depth), which on a USB/exFAT
+    /// device is not the same number as the CPU's core count.
+    private static let maxConcurrentReads = 16
+
+    private static func readRowsConcurrently<Element: FixedWidthInteger & UnsignedInteger>(
+        _ type: Element.Type, descriptor: Int32, dataStart: UInt64, byteWidth: Int, rows: [Int],
+        url: URL
+    ) -> [Int: [Element]] {
+        guard !rows.isEmpty else { return [:] }
+        let elementsPerRow = byteWidth / MemoryLayout<Element>.size
+        let uniqueRows = Array(Set(rows))
+        var results = [Int: [Element]](minimumCapacity: uniqueRows.count)
+        let lock = NSLock()
+        let semaphore = DispatchSemaphore(value: min(maxConcurrentReads, uniqueRows.count))
+        let group = DispatchGroup()
+        let queue = DispatchQueue(
+            label: "qwen4exp-ngram-pread", qos: .userInitiated, attributes: .concurrent)
+        for row in uniqueRows {
+            semaphore.wait()
+            queue.async(group: group) {
+                defer { semaphore.signal() }
+                var buffer = [Element](repeating: 0, count: elementsPerRow)
+                let n = buffer.withUnsafeMutableBytes { destination -> Int in
+                    pread(
+                        descriptor, destination.baseAddress, byteWidth,
+                        off_t(dataStart) + off_t(row * byteWidth))
+                }
+                guard n == byteWidth else {
+                    preconditionFailure("Lecture n-gram incomplète: \(url.path):\(row)")
+                }
+                lock.lock()
+                results[row] = buffer
+                lock.unlock()
+            }
+        }
+        group.wait()
+        return results
     }
 
     /// P5.4: bulk row reads for the n-gram table's mmap-backed shards.
@@ -670,6 +771,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     }
 
     private func readUInt16RowsUncached(_ location: TensorLocation, rows: [Int]) -> [Int: [UInt16]] {
+        if Self.useConcurrentPread, let opened = openFiles[location.url] {
+            return Self.readRowsConcurrently(
+                UInt16.self, descriptor: opened.descriptor, dataStart: location.dataStart,
+                byteWidth: location.rowBytes, rows: rows, url: location.url)
+        }
         if let mapping = mappedFiles[location.url] {
             let raw = UnsafeRawBufferPointer(
                 start: UnsafeRawPointer(mapping.baseAddress), count: mapping.byteCount)

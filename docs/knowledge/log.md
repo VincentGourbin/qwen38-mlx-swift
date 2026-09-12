@@ -4396,3 +4396,77 @@ régression et un léger mieux au p10 — à confirmer sur machine calme et sur
 le checkpoint réel avant toute promotion. `--fusion-level 9` disponible
 pour comparer.
 
+## 2026-09-12 (suite) — P10.4 : le vrai goulot n'est pas le regroupement de lignes contiguës, c'est la profondeur de file — pread concurrent ×10
+
+Protocole PLAN.md §P10, P10.4. Consigne explicite : mesurer une lecture de
+ligne isolée contre une lecture groupée dans un petit programme, **avant**
+de toucher `Qwen4ExpLazyNGramStorage`. Nouvel outil conservé,
+`qwen38 ngram-io-probe --file <shard réel> --row-bytes 1280 --count 300`
+(aucun chargement de checkpoint, aucun GPU) :
+
+**Piège de méthode découvert et corrigé en écrivant le probe** : une
+première version faisait lire les 4 méthodes comparées sur le **même**
+jeu de lignes aléatoires — la méthode B (lue en 2ᵉ) paraissait 155× plus
+rapide que A (lue en 1ʳᵉ), un artefact pur de cache page OS déjà chauffé
+par A, pas une vraie différence de méthode. Corrigé : quatre jeux de
+lignes **disjoints** (un quart de fichier chacun), pour que chaque méthode
+paie son propre premier accès.
+
+**Résultat (lignes disjointes, 300 lignes/méthode, une seule mesure —
+machine avec une autre charge GPU en tâche de fond, sans effet ici : ceci
+est un test CPU/disque, pas GPU)** :
+
+| Méthode | SSD interne (`model-00001`) | Lexar/USB (`model-00010`) |
+|---|---:|---:|
+| A: `pread` + 2 allocations/ligne (chemin actuel isolé) | 113,6 µs/ligne | 301,2 µs/ligne |
+| B: `pread` direct, sans allocation superflue | 111,9 µs/ligne | 298,7 µs/ligne |
+| C: `mmap` + `copyMemory` (chemin de production actuel) | 142,6 µs/ligne | **540,9 µs/ligne** |
+| D: `pread` concurrents (16 voies) | **11,2 µs/ligne** | **55,0 µs/ligne** |
+
+Deux enseignements, contraires à l'hypothèse de départ du plan :
+1. **La double allocation Swift par ligne ne coûte presque rien** (A vs B :
+   1,7 µs sur SSD interne, 2,5 µs sur Lexar) — le "coût de copie hôte" cité
+   par le plan n'est pas là.
+2. **`mmap`+`copyMemory` (le chemin de production) est la méthode la plus
+   lente** en mono-thread sur Lexar (540,9 µs, pire que `pread` nu à
+   301,2 µs) — la faute de page `mmap` a un vrai surcoût propre, pas
+   seulement "un accès disque comme un autre".
+3. **Le vrai levier est la concurrence** : 16 `pread` en vol simultané
+   contre 1 divise le coût par ligne par **~10×**, sur les deux supports.
+   Le regroupement par lignes numériquement adjacentes
+   (`readContiguousRuns`, déjà en place depuis P5.4) ne peut structurellement
+   pas aider ici : les index n-gram viennent d'un hash, l'adjacence
+   numérique est une coïncidence, pas la règle — en pratique chaque ligne
+   est son propre « run » de longueur 1.
+
+**Correctif implémenté** (`Qwen4ExpPLE.swift`) : `readRowsConcurrently`,
+un remplaçant de `readContiguousRuns` à `pread` concurrents (jusqu'à 16 en
+vol, `DispatchSemaphore`), même contrat `[Int: [Element]]` en sortie — donc
+le cache LRU (`RowCache`, gardé intact comme demandé) et l'assemblage de
+`lookupBatch` n'ont pas changé. `pread` est thread-safe par construction
+(offset explicite, pas de curseur de fichier partagé). Un descripteur de
+fichier persistant par shard (`OpenFile`, à côté du `MappedFile` existant,
+pas à sa place) est ouvert une fois à l'initialisation. Chemin d'origine
+(`mmap`) conservé et **par défaut** ; nouveau chemin derrière
+`QWEN38_NGRAM_CONCURRENT_PREAD=1` (variable d'environnement, pas un niveau
+`Qwen4ExpFusionLevel` — cette classe n'en prenait pas et le plan ne
+l'exigeait pas explicitement pour P10.4), en attendant la validation
+checkpoint réel.
+
+**Parité** : `flash-ngram-parity` (comparaison bit-exacte à la référence
+Python eager) rejouée avec `QWEN38_NGRAM_CONCURRENT_PREAD=1`, plusieurs
+shards et lignes (dont doublons et lignes à travers tout l'espace d'un
+shard) : **IDENTIQUE** dans tous les cas, `max |delta| = 0`. 95 tests
+`Scripts/run-tests.sh` toujours verts (aucun test n'est spécifique à ce
+chemin au niveau XCTest — la couverture vient de `flash-ngram-parity`,
+qui exige le checkpoint réel et n'est donc pas dans le harnais Debug).
+
+**Mesure de préfill réel (77,6 → cible ≥120 tok/s)** : en attente — le GPU
+était occupé par une autre charge (inférence diffusion de Vincent) pendant
+cette session ; voir note de fin de section P10. Le résultat isolé
+(×10 sur le coût par ligne, sur les deux supports) rend un gain net sur le
+préfill plausible mais **pas acquis** : la PLE effectue aussi le
+dequantize/assemblage MLX après la lecture, et le passage de `mmap` à
+`pread` change le modèle mémoire (copie explicite au lieu d'un mapping
+virtuel) — seul le chronométrage réel du préfill sur 3 137 tokens tranchera,
+conformément au protocole de cette campagne.
