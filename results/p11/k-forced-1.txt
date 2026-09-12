@@ -1,0 +1,7 @@
+routed experts (K) : 1/512
+=== variante : none ===
+ablation active : none
+routed experts (K) : 1/512
+ms/pas (1 jeton(s)/pas) — pas retenus 96 · médiane 42.576 · moyenne 41.954 · écart-type 1.634 · min 37.695 · max 44.895
+MLX mémoire active: 57,39 GB
+MLX mémoire peak: 57,42 GB

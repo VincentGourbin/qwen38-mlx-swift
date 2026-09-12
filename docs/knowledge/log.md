@@ -5171,3 +5171,73 @@ occupation trop faible à batch 1.
 **Mesurer d'abord, en isolation. Écrire du Metal seulement si la cause désigne
 un correctif précis.** F8 et F9 ont déjà montré ce que donne une réécriture à
 l'aveugle.
+
+---
+
+## 2026-09-13 — LE résultat de la nuit : 90 % du coût ne dépend pas des experts
+
+Mesure faite avec `flash-decode-bench` et une **séquence forcée identique**
+(les 128 mêmes jetons pour toutes les variantes, `--forced-ids`), 16 pas de
+warm-up, 96 mesurés, un process par valeur de K.
+
+| K | Mio d'experts lus par jeton | ms par pas | ajusté par la droite |
+|---:|---:|---:|---:|
+| 10 | 1 005 | 46,944 | 46,933 |
+| 8 | 804 | 45,914 | 45,972 |
+| 5 | 503 | 44,608 | 44,531 |
+| 2 | 201 | 43,094 | 43,090 |
+| 1 | 101 | 42,576 | 42,609 |
+
+La droite ajuste à mieux que 0,08 ms. Elle donne deux nombres :
+
+| | |
+|---|---|
+| **pente** | **4,78 µs par Mio**, soit **219 Go/s** de bande passante marginale = **55 % du pic** |
+| **ordonnée à l'origine** | **42,13 ms** — coût **fixe**, indépendant du nombre d'experts lus |
+
+### Ce que ça veut dire
+
+À K=10, sur les 46,94 ms d'un pas de décodage :
+
+- **4,80 ms (10,2 %)** servent à lire les poids des experts, **et ils tournent
+  à 55 % de la bande passante crête — c'est correct** ;
+- **42,13 ms (89,8 %)** sont un **coût fixe** qui ne dépend pas du tout du
+  volume de poids lu.
+
+Diviser les octets lus par dix ne fait gagner que **9,3 %**.
+
+### Toutes les mesures de la nuit s'expliquent d'un coup
+
+- **P11.1 (réduire K) plafonne à +5,9 %** : on ne peut pas gagner plus que les
+  10 % que pèse la lecture des experts.
+- **F8 et F9 (noyaux Metal) ont donné −1 %** : ils fusionnaient des ops, mais
+  le coût fixe n'est pas concentré là où ils fusionnaient.
+- **Ablater n'importe quel sous-bloc « économise » 20-40 %, somme 180 %** : le
+  coût fixe est **diffus**, réparti sur tous les sous-blocs, et en retirer un
+  laisse les autres mieux s'enchaîner.
+- **Le MTP plafonne à 1,14×** : le coût fixe est justement ce qu'un forward
+  groupé n'amortit qu'à moitié (47,84 ms à 1 jeton, 62,42 à 2).
+
+### Correction d'un cadrage que j'avais écrit
+
+Le tableau « nous sommes à 28× du toit, 3,6 % de la bande passante » de §P11
+est juste en agrégat mais **trompeur sur la cible** : il laissait croire qu'il
+fallait mieux lire les experts. C'est faux — la lecture des experts est la
+partie qui marche. Le problème est les **42 ms de travail fixe par jeton**
+répartis sur 48 couches de petites opérations : GDN, QSA, hyper-connexions,
+normes, routeur, expert partagé.
+
+### Ce qu'il faut mesurer ensuite
+
+Le coût fixe étant diffus, il n'y a pas de cible unique. Deux questions
+ouvertes, dans l'ordre :
+
+1. **Combien d'ops GPU par jeton, réellement ?** L'estimation de ~4 800
+   (≈100/couche, P2-code) n'a jamais été vérifiée post-F7. À 42,13 ms, cela
+   ferait 8,8 µs par op. Si le compte réel est bien celui-là, le plancher est
+   la latence de lancement et **aucune optimisation ponctuelle ne le bougera** :
+   il faudrait moins de couches, ou un graphe capturé.
+2. **`MLX.compile` ou une capture de graphe Metal** sur le forward complet —
+   tentée en P2-code au niveau d'une couche et en P7 (où elle cassait la parité
+   GDN), jamais sur le pas entier. C'est la seule technique qui attaque un coût
+   fixe diffus plutôt qu'un bloc particulier.
