@@ -4541,3 +4541,42 @@ vrais gains de la campagne (F7, et P10.4 ci-dessous) sont un correctif de
 comportement et un changement de mécanisme d'E/S — jamais une fusion de
 petits kernels.
 
+## 2026-09-12 (verdict) — P10.4 : pread concurrents n-gram promus en défaut — préfill réel +23 à +30 %
+
+Mesure décisive, machine libre, prompt de prose française variée (extrait
+technique de log.md, non répétitif — 4 831 tokens réels, au-delà de la
+cible ~3 100), `flash-generate-probe --resident-layers --resident-async
+--profile-layers --trace`, même prompt pour les deux mesures :
+
+| | `mmap` (ex-défaut) | `pread` concurrent (nouveau défaut) | Δ |
+|---|---:|---:|---:|
+| couche PLE (couche 1, préfill) | 44,68 s | 31,63 s | **−29,2 %** |
+| forward total (`layer_forward_seconds`) | 56,19 s | 43,11 s | **−23,3 %** |
+| débit forward (4 831 tokens) | 86,0 tok/s | **112,1 tok/s** | **+30,4 %** |
+| chargement des poids (`layer_load_seconds`, non concerné) | 60,43 s | 59,72 s | ~0 (bruit) |
+
+`layer_load_seconds` inchangé confirme que l'écart est bien attribuable
+aux lectures n-gram (le chargement des poids de checkpoint passe par un
+mécanisme séparé, `Qwen4ExpUncachedTensorReader`, non touché par ce
+levier). Le gain de bout en bout (+23-30 %) est net mais **très inférieur**
+au ×10 mesuré ligne par ligne en isolation (`ngram-io-probe`) : le cache
+LRU (`RowCache`) absorbe déjà 50 % des lookups sur ce prompt (`ngram_cache_
+hit_rate: 0.5000`), donc seule la moitié « miss » profite de la
+concurrence — cohérent, pas un signe d'échec de la méthode.
+
+**Bascule en défaut, comme demandé** : `useConcurrentPread` (`Qwen4ExpPLE.
+swift`) devient `true` par défaut ; `QWEN38_NGRAM_MMAP=1` est
+l'échappatoire vers l'ancien chemin `mmap`. Parité bit-exacte reconfirmée
+après bascule (`flash-ngram-parity`, plusieurs shards, avec et sans
+l'échappatoire — `IDENTIQUE` dans les deux cas). 89 tests
+`Scripts/run-tests.sh` verts.
+
+**Cible ≥ 120 tok/s (contre 77,6) : proche mais pas formellement atteinte**
+sur cette mesure précise (112,1 tok/s de débit forward) — la référence
+77,6 tok/s vient d'un prompt et d'une session différents (3 137 tokens,
+contenu différent), donc pas directement comparable terme à terme ; la
+comparaison qui décide ici est la paire mmap/pread **au même prompt, même
+session**, qui montre sans ambiguïté un gain réel et substantiel. Consigné
+comme résultat positif franchissant très largement le seuil de 5 %, sans
+sur-vendre un chiffre rond non atteint à la décimale.
+

@@ -123,9 +123,9 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     /// explicit offset and is safe to call concurrently from multiple
     /// threads on the same fd — unlike `read`+`lseek`, which share a file
     /// position). Kept open for this object's lifetime, alongside (not
-    /// instead of) `mappedFiles`'s `mmap` mapping — the
-    /// `QWEN38_NGRAM_CONCURRENT_PREAD` environment variable (see
-    /// `useConcurrentPread` below) picks which path a lookup actually takes.
+    /// instead of) `mappedFiles`'s `mmap` mapping — the default path since
+    /// 2026-09-12 (see `useConcurrentPread` below); `QWEN38_NGRAM_MMAP=1`
+    /// is the escape hatch back to `mmap`.
     private final class OpenFile: @unchecked Sendable {
         let descriptor: Int32
         init?(url: URL) {
@@ -589,11 +589,31 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     /// win is concurrency (queue depth), not avoiding a small extra `Array`
     /// allocation (measured negligible once cache-warming from a shared
     /// row set between methods — an early, discarded version of this probe
-    /// — was removed as a confound). Opt-in via `QWEN38_NGRAM_CONCURRENT_PREAD=1`
-    /// pending real-checkpoint validation (PLAN.md §P10 protocol); `mmap`
-    /// stays the default until then. See `readRowsConcurrently` below.
+    /// — was removed as a confound).
+    ///
+    /// **Validated on the real checkpoint and promoted to the default**
+    /// (2026-09-12): the isolated-row 10× does not carry through unchanged
+    /// to end-to-end prefill — the LRU `RowCache` above already absorbs
+    /// half the lookups (50 % hit rate on the probe prompt below), so only
+    /// the miss half benefits — but the real effect is still substantial.
+    /// Prefill on a 4 831-token varied French prose prompt (`--profile-
+    /// layers --trace`, `Scripts/trace-layers.py`), same prompt, same
+    /// session, `mmap` vs concurrent `pread`:
+    ///
+    /// | | `mmap` (ex-default) | `pread` concurrent (défaut) | Δ |
+    /// |---|---:|---:|---:|
+    /// | couche PLE (couche 1) | 44,68 s | 31,63 s | −29,2 % |
+    /// | forward total (`layer_forward_seconds`) | 56,19 s | 43,11 s | −23,3 % |
+    /// | débit forward | 86,0 tok/s | 112,1 tok/s | **+30,4 %** |
+    ///
+    /// `layer_load_seconds` (checkpoint weight streaming, unrelated to this
+    /// lever) was unchanged (60,4 s vs 59,7 s) in both runs, confirming the
+    /// difference is attributable to n-gram row reads. Bit-exact parity
+    /// confirmed (`flash-ngram-parity`, several shards) both before and
+    /// after this promotion. `QWEN38_NGRAM_MMAP=1` is the escape hatch back
+    /// to the original `mmap` path if a future regression is suspected.
     private static let useConcurrentPread =
-        ProcessInfo.processInfo.environment["QWEN38_NGRAM_CONCURRENT_PREAD"] == "1"
+        ProcessInfo.processInfo.environment["QWEN38_NGRAM_MMAP"] != "1"
 
     /// Concurrent `pread`-based counterpart to `readContiguousRuns`, same
     /// `[Int: [Element]]` contract (deduplicated, one entry per requested
