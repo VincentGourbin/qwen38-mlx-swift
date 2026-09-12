@@ -4173,7 +4173,7 @@ arrive à des résultats très spectaculaires (Edge0) […] ça n'a rien à voir
 terme d'inférence ». Cette section établit ce qu'Edge0 fait réellement, ce
 qu'on peut lui prendre, et où sont nos gains restants.
 
-#### P11.0 — Ce que dit Edge0, une fois les chiffres remis côte à côte
+#### Ce que dit Edge0, une fois les chiffres remis côte à côte
 
 Edge0 (Apache-2.0, MLX, Python) publie deux modèles. Le tier haut,
 `edge0-35b`, est un **hybride attention-linéaire de la même famille que le
@@ -4226,7 +4226,7 @@ et il exclut le cache de pages — la distinction que notre `preflight-resident.
 fait déjà. Sur un Mac mini de 24 Go avec un checkpoint de 23 Go, le cache de
 pages du noyau détient de fait le modèle.
 
-#### P11.1 — Le vrai diagnostic : nous sommes à 28× du toit
+#### Le vrai diagnostic : nous sommes à 28× du toit
 
 Mesures faites sur le checkpoint réel (`switch_mlp`, 3 bits g64, 48 couches,
 512 experts, K=10) :
@@ -4275,7 +4275,7 @@ disparaît dès qu'on vise plus de 15 tok/s. Le Lexar, à 0,76 Gio/s, est
 experts. Le déchargement reste donc ce que PM4.4 en disait — un moyen de
 rendre le 4-bit utilisable, **pas** un levier de débit.
 
-#### P11.2 — Tâches
+#### Les tâches
 
 Ordre par rapport valeur/effort. Les trois premières ne demandent pas de
 machinerie nouvelle.
@@ -4308,18 +4308,53 @@ drafter. Piège du balayage : changer K en cours de conversation continuée
 mélange des tours calculés à des largeurs différentes — repartir d'une
 conversation neuve à chaque K.
 
-| ~~P11.1~~ | ~~**Réduire K, la largeur de routage.**~~ **Exécutée le 2026-09-12, critère NON atteint.** Le meilleur point (K=5) donne **+5,9 %** de débit pour **0,141 nat** et fait tomber l'accord argmax de 99,2 % à 83,6 % ; le critère demandait ≥ +15 % pour ≤ 0,2 nat. Retirer **60 % des octets d'experts** par token ne rapporte que **4,7 %** : c'est la confirmation expérimentale du diagnostic P11.1. Le réglage est conservé et bascule vers **P11.5**, où les octets sont la contrainte. Détail et tableaux : `docs/knowledge/log.md`, 2026-09-12 (nuit). | ✅ mesuré, ❌ critère |
-| **P11.1** | **Réduire K, la largeur de routage.** Edge0 divise K par deux sur son tier phare. Rendre `num_experts_per_tok` réglable à l'exécution (drapeau moteur + CLI + GUI + serveur, comme `--fusion-level`), puis balayer K ∈ {10, 8, 6, 5, 4} sur le prompt de référence. Mesurer pour chaque K : débit greedy court et long, Q-B V32, logprob moyenne, et la sortie greedy sur le prompt de référence. | Une courbe débit/qualité exploitable. Succès si un K < 10 donne ≥ +15 % de débit pour ≤ 0,2 nat de logprob perdue. |
+| ~~**P11.1**~~ | **Réduire K, la largeur de routage.** Rendre `num_experts_per_tok` réglable à l'exécution, puis balayer K ∈ {10, 8, 6, 5, 4}. — **Exécutée le 2026-09-12, critère NON atteint.** Le meilleur point, K=5, donne **+5,9 %** de débit pour **0,141 nat** et fait tomber l'accord argmax de 99,2 % à 83,6 % ; le critère demandait ≥ +15 % pour ≤ 0,2 nat. Retirer **60 % des octets d'experts** par token ne rapporte que **4,7 %** : c'est la confirmation expérimentale directe du diagnostic ci-dessus. Le réglage est conservé et bascule vers **P11.5**, où les octets *sont* la contrainte. Tableaux : `docs/knowledge/log.md`, 2026-09-12 (nuit). | ✅ mesurée · ❌ critère |
 | **P11.2** | **Refaire l'attribution du coût par sous-bloc, post-F7.** P7 attribuait 78-88 % au MoE routé — mesuré **avant** la correction de la fuite fp32 (P8), qui a multiplié le débit par 2,74. Cette répartition n'est plus valide et c'est elle qui oriente tout le reste. Instrumenter par sous-bloc (GDN, QSA, MoE routé, expert partagé, hyper-connexions, PLE, normes) avec le profileur 1.5.0, hors profilage par couche. | Un tableau à jour de la part de chaque sous-bloc, et le compte réel d'ops GPU par token (aujourd'hui estimé à ~4 800). |
 | **P11.3** | **Chiffrer les hyper-connexions.** Notre modèle porte 4 flux résiduels et un mélange de rang 320 à chaque couche — Edge0 n'a pas cet étage. C'est un suspect structurel de premier plan pour le compte d'ops, et il n'a jamais été mesuré isolément. Ablation : forcer 1 flux, mesurer débit et parité. | La part exacte des hyper-connexions dans les 74 ms. Si elle dépasse 15 %, ouvrir un chantier de fusion dédié. |
-| **P11.4** | **Rendre le MTP rentable.** Le drafter est aujourd'hui à 0,81-0,86× le greedy : il coûte plus qu'il ne rapporte, avec 34,8 % (4-bit) à 47,6 % (3-bit) d'acceptation. C'est pourtant le seul levier qui **amortit** le coût de lancement sur plusieurs tokens, donc le seul aligné sur le diagnostic P11.1. Étudier : arbre spéculatif à plusieurs branches plutôt que chaîne, budget de brouillon adaptatif, et coût réel du drafter par pas. | MTP > 1,0× le greedy sur le prompt de référence, ou un verdict écrit expliquant pourquoi le seuil est hors d'atteinte. |
+| **P11.4** | **Rendre le MTP rentable — désormais le premier levier de la liste.** Voir l'encadré ci-dessous : c'est la seule technique alignée sur le diagnostic, puisqu'elle amortit le coût de lancement sur plusieurs tokens au lieu d'essayer de le réduire. | MTP > 1,0× le greedy sur le prompt de référence, ou un verdict écrit expliquant pourquoi le seuil est hors d'atteinte. |
 | **P11.5** | **Déchargement disque des experts (ex-P3), révisé.** Reprendre `docs/knowledge/investigations/p3-expert-offload.md` à la lumière des débits mesurés ci-dessus. Périmètre réduit et objectif corrigé : rendre le **4-bit** utilisable, cible « pas plus de 20 % sous le 3-bit résident », SSD interne uniquement, Lexar écarté. Garder de l'étude : le layout par couche (nos `switch_mlp` sont déjà empilés `[512, …]`, donc 9 lectures par couche suffisent). Vérifier d'abord le point bloquant n°1 de l'étude : `MLXArray` peut-il adopter des pages `mmap` sans copie ? | Une réponse tranchée sur le zéro-copie (P3.1), puis soit un prototype, soit un abandon écrit. |
 | **P11.6** | **Recover-LoRA, variante utile pour nous.** Le détail intéressant d'Edge0 n'est pas la distillation mais **sa cible** : leurs adaptateurs ne touchent aucun expert routé, seulement l'attention (`linear_attn`, `self_attn`) et l'expert partagé. Les experts quantifiés restent identiques octet pour octet, donc échangeables sans retoucher les 50 Gio. Transposé chez nous : récupérer les 0,42 nat perdues par le 3-bit sans requantifier. | Une note d'étude chiffrant le besoin (infrastructure d'entraînement, teacher, volume de tokens) et un go/no-go. Pas d'implémentation avant. |
 | **P11.7** | **Prérouteur : verdict écrit, pas d'implémentation.** Documenter dans `docs/knowledge/investigations/` pourquoi la technique ne s'applique pas à un modèle résident, avec les trois points de P11.0. À rouvrir seulement si P11.5 aboutit à un déchargement effectif. | La note existe et clôt le sujet. |
 | **P11.8** | **Quantification 3 bits directe depuis les shards BF16 officiels** (option B, §7). Notre 3-bit est dérivé d'un checkpoint tiers déjà quantifié en 4 bits : double quantification. Une passe directe depuis le BF16 devrait récupérer une partie des 0,42 nat gratuitement. | Q-B V32 du 3-bit direct ≥ celui du 4-bit actuel. |
 | **P11.9** | **Remonter le patch `Vendor/mlx-swift-lm-local.patch` en amont.** Sept fichiers modifiés localement, épinglés sur `1a562aa`. Dette qui grossit à chaque mise à jour de mlx-swift. | PR ouverte, ou patch réduit aux seuls écarts irréductibles. |
 
-#### P11.3 — Ce qui n'est plus au programme
+#### Pourquoi le MTP passe devant, et l'hypothèse à tester d'abord
+
+La tâche P11.1 a établi que le débit ne dépend presque pas des octets lus. Il dépend du
+nombre de forwards. Or un token traité dans un forward groupé coûte
+**5,2 fois moins cher** qu'un token décodé seul :
+
+| | ms par token |
+|---|---:|
+| décodage, forward d'un seul token | 47,35 |
+| préfill, forward de 3 137 tokens | 9,19 |
+
+C'est exactement la ressource qu'exploite le décodage spéculatif : vérifier
+N+1 tokens en un forward au lieu d'en décoder N+1 séparément. Dans un régime
+limité par les lancements de noyaux, vérifier 4 tokens devrait coûter à peine
+plus que d'en vérifier 1.
+
+**Ce qui ne colle pas.** Le MTP mesure 0,85× le greedy avec 47,6 %
+d'acceptation. Si vérifier coûtait 1 unité quel que soit N, un brouillon d'un
+token donnerait 1,48 token par vérification, donc 1,48×. Pour tomber à 0,85×,
+il faut que le brouillon coûte **0,74 forward complet** — pour une seule
+couche d'attention pleine, contre 48 couches côté cible. Soit le drafter porte
+un coût fixe énorme (synchronisations, `eval` supplémentaires, reconstruction
+d'état GDN), soit la vérification coûte bien plus que supposé.
+
+**Première tâche, décisive et bon marché** : mesurer le coût d'un forward en
+fonction du nombre de tokens qu'il traite — N ∈ {1, 2, 4, 8, 16, 32} — sur le
+checkpoint réel, serveur chaud, tours entrelacés. Cette seule courbe donne le
+gain maximal atteignable par spéculation, **avant** d'écrire la moindre ligne
+de drafter. Si le coût est plat de N=1 à N=8, le levier vaut jusqu'à 2× et
+justifie un arbre spéculatif ; s'il croît vite, le MTP est condamné et on
+l'écrit.
+
+À tester ensuite seulement : brouillon par arbre plutôt que par chaîne, budget
+adaptatif, et le brouillon gratuit par recopie du prompt (*prompt lookup*),
+qui ne coûte aucun forward et sert bien les cas de résumé et de réécriture.
+
+#### Ce qui n'est plus au programme
 
 - **La fusion de noyaux au niveau des ops MLX.** Neuf tentatives (F1 à F9),
   zéro gain, deux régressions. Le diagnostic P11.1 explique pourquoi : le
@@ -4328,11 +4363,15 @@ conversation neuve à chaque K.
   exigés. Clos.
 - **Le prérouteur d'Edge0** tant que le modèle est résident (P11.7).
 
-#### P11.4 — Ordre d'exécution et prérequis
+#### Ordre d'exécution et prérequis
 
-P11.1 → P11.2 → P11.3 en série (chacune informe la suivante), puis arbitrage
-entre P11.4 et P11.5 selon ce que P11.2 révèle. P11.6 à P11.9 sont
-indépendantes et peuvent partir en parallèle si une machine se libère.
+**Révisé le 2026-09-12 après P11.1.** P11.1 est close : la réduction de K
+n'est pas un levier de débit. L'ordre devient **P11.2 → P11.3 → P11.4**, et
+P11.4 monte en tête de valeur puisque c'est la seule technique qui amortit le
+coût de lancement au lieu d'essayer de le réduire. Sa première mesure (courbe
+du coût d'un forward selon N) est bon marché et décide de tout le reste du
+chantier : la lancer dès que P11.2 et P11.3 ont rendu leur attribution.
+P11.5 dépend de P11.2. P11.6 à P11.9 sont indépendantes.
 
 Prérequis inchangés pour toute mesure : build Release
 (`Scripts/build-release.sh`), `Scripts/preflight-resident.sh` au vert,
