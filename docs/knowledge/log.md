@@ -4179,3 +4179,42 @@ La génération après image est désormais **plus rapide** que le texte à
 longueur comparable, ce qui est attendu : 950 des 976 tokens de prompt sont
 des marqueurs image identiques, donc très favorables au cache n-gram. 89 tests
 verts, dont les parités vision.
+
+## 2026-09-12 — Audit systématique des dtypes : plus aucune fuite
+
+Après les deux fuites float32 (normes GDN/QSA corrigées par F7, tour vision
+corrigée dans `Qwen4ExpInputMerger`), audit complet plutôt que ponctuel.
+
+**1. Comparaison statique à la référence.** Les points où
+`Scripts/references/vlm_q4_language.py` contrôle explicitement le dtype, et
+notre équivalent :
+
+| Référence | Ce qu'elle fait | Chez nous |
+|---|---|---|
+| `Qwen4ExpRMSNorm` l. 589-597 | calcule en fp32, `return .astype(dtype)` | ✅ F7 |
+| `Qwen4ExpRMSNormGated` l. 609-615 | idem | ✅ F7 |
+| clés poolées de l'indexeur l. 745 | `mean(.astype(float32)).astype(raw_keys.dtype)` | ✅ identique (`Qwen4ExpQSAIndexer.pooledKeys`) |
+| scores de sélection l. 768-770 | fp32 **volontaire** (choix discret des blocs) | ✅ identique, alimente un top-k → indices |
+| `sparse_bias` l. 842/1455 | `.astype(mask.dtype)` sur la branche additive | ✅ sans objet : notre masque QSA est **booléen** (`logicalAnd`), jamais additif |
+
+**2. Contrôle à l'exécution.** Nouveau `Qwen4ExpDtypeAudit`
+(`QWEN38_DTYPE_AUDIT=1`, sans coût quand désactivé) : à la première visite de
+chaque couche, il imprime le dtype de l'état caché en entrée et en sortie,
+plus celui de tous les tenseurs du cache — c'est-à-dire **tout ce qui
+propage**. Résultat sur le checkpoint réel, texte **et** image :
+
+```
+couche  0 GDN · entrée bfloat16 · sortie bfloat16 · cache [bfloat16,float32]
+couche  1 GDN · entrée bfloat16 · sortie bfloat16 · cache [bfloat16,float32,bfloat16,int64]
+couche  3 QSA · entrée bfloat16 · sortie bfloat16 · cache [bfloat16,bfloat16,bfloat16,int32]
+```
+
+48 couches, 0 ligne signalée, dans les deux cas. Les seuls `float32`
+subsistants sont les **états récurrents GDN** (un par couche GDN), voulus par
+conception (piège §6.3-6) et conformes à la référence ; les caches QSA sont
+intégralement en bf16. Le décodage après image tombe à 0,478 s pour 2 tokens.
+
+**Conclusion : il n'y a plus de fuite de dtype.** Les deux qui existaient ont
+été trouvées par la mesure, pas par la lecture ; l'audit les aurait montrées
+en une commande. À lancer après toute modification touchant une frontière de
+couche, un cache ou un encodeur.

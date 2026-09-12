@@ -299,6 +299,19 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             } else if layerLoadingMode == .resident, residentAsyncEval {
                 asyncEval(output)
             }
+            // Audit des dtypes (QWEN38_DTYPE_AUDIT=1) : deux fuites fp32 ont
+            // coûté un facteur 2 chacune (F7 pour les normes GDN/QSA, la tour
+            // vision pour le merge image). Ce contrôle imprime, pour la
+            // première visite de chaque couche, le dtype de l'état caché en
+            // entrée/sortie et celui des tenseurs du cache — tout ce qui
+            // propage. Un `float32` ici est une fuite ; le fp32 interne
+            // (état récurrent GDN, tables RoPE, scores QSA) est voulu.
+            if Qwen4ExpDtypeAudit.isEnabled {
+                Qwen4ExpDtypeAudit.report(
+                    layer: layerIndex,
+                    kind: configuration.layerTypes[layerIndex] == .fullAttention ? "QSA" : "GDN",
+                    input: hidden, output: output, cache: cache)
+            }
             let forwardDuration = ContinuousClock.now - forwardStart
             hidden = output
 
