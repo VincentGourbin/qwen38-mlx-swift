@@ -1,0 +1,8 @@
+routed experts (K) : 10/512
+--forced-ids absent : décodage greedy (température 0, ablation none, K 10) sur 640 pas pour obtenir la séquence forcée, rejouée ensuite pour chaque variante.
+=== variante : none ===
+ablation active : none
+routed experts (K) : 10/512
+ms/pas (8 jeton(s)/pas) — pas retenus 64 · médiane 175.542 · moyenne 184.150 · écart-type 26.264 · min 168.731 · max 352.667
+MLX mémoire active: 57,44 GB
+MLX mémoire peak: 57,48 GB

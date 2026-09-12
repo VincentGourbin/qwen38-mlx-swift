@@ -5009,3 +5009,107 @@ batch 1 contre matmul).
 Tant que cet instrument n'existe pas, **aucun chiffre d'attribution par
 sous-bloc ne doit être inscrit**, et P11.3 (part des hyper-connexions) comme
 P11.10 (cible du noyau Metal) restent sans cible chiffrée.
+
+---
+
+## 2026-09-13 — P11.4a et P11.2a mesurées : le MTP est condamné, le coût est diffus
+
+`flash-decode-bench` (décodage à séquence forcée) livré et vérifié. Toutes les
+mesures ci-dessous rejouent **la même séquence de tokens** pour chaque
+variante, ce qui élimine le biais de dégénérescence qui invalidait P11.2.
+
+### (B) Coût d'un forward selon le nombre de jetons traités
+
+Variante unique, sans `snapshot`/`restore`, 16 pas de warm-up, 64 mesurés :
+
+| jetons par forward | ms par forward | écart-type | marginal du jeton ajouté |
+|---:|---:|---:|---:|
+| 1 | **47,84** | 1,18 | — |
+| 2 | 62,42 | 1,61 | **14,58** |
+| 4 | 94,17 | 2,85 | **15,87** |
+| 8 | 175,54 | 26,26 | **20,34** |
+
+Le forward à un jeton donne 47,84 ms contre 47,6 ms mesurés côté serveur :
+l'instrument recoupe la production, il est bon.
+
+**Le coût marginal est donc le régime pessimiste — 15 à 20 ms — et il croît
+avec N.** L'asymptote de 7,7 ms déduite du préfill (3 137 jetons) ne s'applique
+pas du tout à la plage utile pour la spéculation.
+
+### Le MTP est condamné : le plafond est 1,14× avec un drafter GRATUIT
+
+À 48,4 % d'acceptation (mesuré), en prenant les coûts de forward réels :
+
+| brouillon | jetons par pas | coût du pas | ms/jeton | gain, **drafter gratuit** |
+|---:|---:|---:|---:|---:|
+| 1 (vérifier 2) | 1,484 | 62,4 ms | 42,1 | **1,14×** |
+| 3 (vérifier 4) | 1,832 | 94,2 ms | 51,4 | 0,93× |
+| 7 (vérifier 8) | 1,932 | 175,5 ms | 90,9 | 0,53× |
+
+Un brouillon plus profond est **contre-productif** : le coût du forward croît
+plus vite que les jetons acceptés ne s'accumulent.
+
+Le MTP actuel mesure 0,939×, avec un pas à 75,0 ms ; par soustraction son
+drafter coûte **12,6 ms**. Le seuil de rentabilité est un pas sous 71,0 ms,
+donc un drafter **sous 8,6 ms**. Même atteint, le gain plafonnerait à
+**1,14×**, et un drafter réellement gratuit n'existe pas.
+
+**Verdict : on ferme P11.4.** Le décodage spéculatif ne peut pas rapporter plus
+de 14 % sur cette machine et ce modèle, et il faudrait pour cela diviser le
+drafter par plus de deux. Le rapport gain/effort ne le justifie pas. Le MTP
+reste disponible en option (`mtp: true`), documenté comme perdant.
+
+*La seule voie qui rouvrirait le sujet est une acceptation nettement plus
+haute : à 70 %, le brouillon de 1 donnerait 1,30×. Mais une meilleure
+acceptation demande un drafter plus gros, donc plus cher, et le budget est de
+8,6 ms.*
+
+### (A) Attribution par sous-bloc — le coût est diffus, aucun bloc ne domine
+
+Dix variantes alternées dans un seul process, séquence forcée identique,
+8 pas de warm-up, 48 mesurés. Référence 54,95 ms (le mode entrelacé paie un
+`clearCache` par tour, absent en production — d'où 54,95 contre 47,84 ; le
+classement relatif reste valide, les valeurs absolues sont gonflées d'environ
+15 %).
+
+| sous-bloc ablaté | ms/pas | coût attribué | part |
+|---|---:|---:|---:|
+| `moe-routing` | 33,02 | 21,93 ms | 39,9 % |
+| **`hyper`** | 33,08 | **21,87 ms** | **39,8 %** |
+| `moe` (bloc entier) | 34,51 | 20,44 ms | 37,2 % |
+| `moe-switch-mlp` | 35,69 | 19,26 ms | 35,1 % |
+| `gdn-projections` | 37,52 | 17,43 ms | 31,7 % |
+| `gdn-recurrence` | 41,41 | 13,55 ms | 24,6 % |
+| `norms` | 41,43 | 13,52 ms | 24,6 % |
+| `qsa-attn` | 42,90 | 12,05 ms | 21,9 % |
+| `moe-shared-expert` | 43,04 | 11,91 ms | 21,7 % |
+
+Écarts-types entre 0,36 et 0,65 ms : la mesure est serrée, contrairement à
+celle de P11.2.
+
+**Trois enseignements.**
+
+1. **La somme des blocs disjoints fait 98,9 ms pour un total de 55,0 ms, soit
+   180 %.** La soustraction sur-attribue massivement — et c'est *cohérent* avec
+   le diagnostic : dans un régime limité par les lancements, retirer n'importe
+   quel bloc laisse tout le reste mieux s'enchaîner. **Ces chiffres valent comme
+   classement, pas comme parts.**
+2. **Les hyper-connexions coûtent autant que tout le bloc d'experts** (21,87
+   contre 20,44 ms). C'est la confirmation de l'hypothèse P11.3 : cet étage,
+   que le modèle d'Edge0 n'a pas, est le premier poste ex æquo. Réserve : son
+   ablation substitue un tenseur de poids d'injection **constant**, que MLX
+   pourrait replier ; une part du gain mesuré peut venir de là.
+3. **Aucun bloc ne domine.** Même le plus petit (`moe-shared-expert`, un MLP
+   unique) pèse 11,9 ms. Le coût est **diffus**, réparti sur tous les
+   sous-blocs — signature exacte d'un régime où chaque petit noyau paie sa
+   latence de lancement.
+
+### Conséquence pour P11.10 (noyau Metal)
+
+Le coût étant diffus, fusionner **un** sous-bloc ne rendra qu'une fraction. La
+cible de départ reste néanmoins les **hyper-connexions** : premier poste ex
+æquo, et surtout pure tuyauterie (normes + deux matmuls de rang faible +
+injection élémentaire) sans quantification à réimplémenter — donc le
+prototype le moins risqué pour établir si un gain de dispatch se traduit en
+gain de débit. Si oui, la cible suivante est le bloc MoE complet, qui demande
+d'écrire la déquantification affine 3 bits en Metal.
