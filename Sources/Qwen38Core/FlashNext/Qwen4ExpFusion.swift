@@ -2,41 +2,79 @@ import MLX
 import MLXNN
 
 /// P2-fusion (docs/knowledge/log.md, "P2-fusion : leviers F1-F7") — cumulative
-/// kernel-reduction levers applied to one decoder layer after its checkpoint
-/// weights are loaded. Level `n` enables levers `F1...Fn`; `.none` (the
-/// default everywhere) is the original, already-validated numerical path.
+/// levers applied to one decoder layer, threaded through constructors/
+/// loaders as an ordinary parameter (like `quantization`, not a global
+/// mutable variable — Swift 6 strict concurrency makes a shared mutable
+/// global awkward). Level `n` activates every lever numbered at or below
+/// `n` (`isReached(by:)`); `.none` is the original, pre-P2-fusion path.
 ///
-/// This is threaded through constructors/loaders as an ordinary parameter
-/// (like `quantization`), not a global mutable variable: Swift 6 strict
-/// concurrency makes a shared mutable global awkward, and constructor
-/// injection matches the existing style of this codebase.
+/// **Two different kinds of lever share this one numbering, on purpose**
+/// (P10.6 cleanup, 2026-09-12 — documented here rather than split into two
+/// enums, which would have meant re-threading every call site for a
+/// renaming-only change):
+/// - **Collage fusions** (F1, F2, F4): exact reorderings of existing ops —
+///   concatenate-then-split matmuls, precomputed norm weights, an
+///   imprecise-but-provably-equivalent MoE routing softmax. Individually
+///   measured *neutral* on the real checkpoint (docs/knowledge/log.md "P7",
+///   "P8") — kept because they cost nothing and the default level (F7)
+///   already includes them cumulatively.
+/// - **Correctness fix** (F7): **not an optimization**. It restores the
+///   reference implementation's dtype behavior at a genuine bug (see its
+///   own doc comment below) — this is why F7, not `.none`, is the default
+///   everywhere, and why a reader should not treat it as an optional perf
+///   knob the way F1/F2/F4 are.
+///
+/// `.f3HyperConnections`, `.f5Casts` and `.f6Compile` are reserved slots
+/// from an earlier revision of this plan and were **never implemented** —
+/// no code anywhere checks for them. Left in place (not removed) so old
+/// logs/scripts that refer to "F1-F6" as a contiguous range stay
+/// meaningful, but they do nothing if passed to `--fusion-level`.
+///
+/// F8 (hyper-connection mix/inject kernels, P10.2) and F9 (GDN q/k L2-norm
+/// kernel, P10.3) **do not appear below**: both were built, validated for
+/// correctness, and then measured on the real checkpoint — F8 a small
+/// (~1 %) but consistent regression, F9 within noise of F7 either way,
+/// neither clearing the ≥5 % bar this campaign requires (docs/knowledge/
+/// log.md "P10.2"/"P10.3"). Their code was removed, not just their
+/// default, following the same precedent as the retired P2-fusion
+/// `switch_mlp` kernel. A future lever should not reuse 8/9 without
+/// checking git history first, to avoid confusion with these retired ones.
 public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     case none = 0
-    /// F1: fuse quantized input projections that share the same input and
-    /// quantization spec (GDN `in_proj_{qkv,z,b,a}`, QSA `q/k/v_proj`) into
-    /// one matmul, split after the call.
+    /// F1 (collage): fuse quantized input projections that share the same
+    /// input and quantization spec (GDN `in_proj_{qkv,z,b,a}`, QSA
+    /// `q/k/v_proj`) into one matmul, split after the call.
     case f1InputProjections = 1
-    /// F2: precompute the checkpoint's `1 + weight` RMSNorm convention once
-    /// at load time and route the ungrouped case through `MLXFast.rmsNorm`.
+    /// F2 (collage): precompute the checkpoint's `1 + weight` RMSNorm
+    /// convention once at load time and route the ungrouped case through
+    /// `MLXFast.rmsNorm`.
     case f2PrecomputedNorms = 2
+    /// Reserved, never implemented — see this enum's top-level comment.
     case f3HyperConnections = 3
+    /// F4 (collage): `Qwen4ExpSparseMoE`'s router uses `softmax(precise:
+    /// false)` — a strictly monotonic transform, so the top-k *set* it
+    /// selects does not depend on softmax precision barring a tie flip
+    /// right at the boundary (verified: 0/200 mismatches on synthetic
+    /// logits at the real router's dimensions).
     case f4MoE = 4
+    /// Reserved, never implemented — see this enum's top-level comment.
     case f5Casts = 5
+    /// Reserved, never implemented — see this enum's top-level comment.
     case f6Compile = 6
-    /// F7 (P8.2, 2026-09-11 — unrelated to the retired P7.4 gate/up fusion
-    /// that once held this number): restores the checkpoint's intended
-    /// working dtype (bf16) at two points where it was silently promoted to
-    /// float32 and never rounded back down — `Qwen4ExpGatedDeltaNet`'s
-    /// recurrence output before `Qwen4ExpRMSNormGated` (whose own
-    /// `.asType(inputs.dtype)` rounds to *whatever it is handed*, which was
-    /// the recurrence's raw fp32 output, not the network's bf16), and
-    /// `Qwen4ExpQSAAttention`'s query/key after `Qwen4ExpMRoPE.apply` (whose
-    /// float32 `cos`/`sin` tables promote the RoPE output to fp32 with no
-    /// downcast). Both leaks make every downstream op — including the
-    /// entire MoE branch — run its fp32 path, ~12-27× slower per
-    /// `op-overhead-probe`'s `SwitchGLU` measurements (docs/knowledge/log.md,
-    /// "P8 : ..."). `false` (`.none` through `.f6Compile`) is the original,
-    /// leaking behavior.
+    /// F7 (**correctness fix**, not a collage fusion — P8.2, 2026-09-11;
+    /// unrelated to the retired P7.4 gate/up fusion that once held this
+    /// number): restores the checkpoint's intended working dtype (bf16) at
+    /// two points where it was silently promoted to float32 and never
+    /// rounded back down — `Qwen4ExpGatedDeltaNet`'s recurrence output
+    /// before `Qwen4ExpRMSNormGated` (whose own `.asType(inputs.dtype)`
+    /// rounds to *whatever it is handed*, which was the recurrence's raw
+    /// fp32 output, not the network's bf16), and `Qwen4ExpQSAAttention`'s
+    /// query/key after `Qwen4ExpMRoPE.apply` (whose float32 `cos`/`sin`
+    /// tables promote the RoPE output to fp32 with no downcast). Both leaks
+    /// make every downstream op — including the entire MoE branch — run
+    /// its fp32 path, ~12-27× slower per `op-overhead-probe`'s `SwitchGLU`
+    /// measurements (docs/knowledge/log.md, "P8 : ..."). `false` (`.none`
+    /// through `.f6Compile`) is the original, leaking behavior.
     /// Défaut de production depuis le 2026-09-11. Ce n'est pas une
     /// optimisation mais une **mise en conformité avec la référence** :
     /// `Scripts/references/vlm_q4_language.py` termine `Qwen4ExpRMSNorm`
@@ -48,38 +86,6 @@ public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     /// checkpoint 3-bit réel : 5,91 → 12,92 tok/s, IDs bit-identiques,
     /// +0,8 Go de pic. Repasser à `.none` pour comparer.
     case f7GatedBranchDtype = 7
-    /// F8 (P10.2, 2026-09-12): fuses the hyper-connection "mix" reduction
-    /// (`sigmoid(upOut).reshaped(...) * normed.reshaped(...)).mean(axis: -2)`,
-    /// 5 ops) and `Qwen4ExpDecoderLayer.inject`'s broadcast-multiply-add
-    /// (`expandedDimensions` ×2, multiply, reshape, add — also 5 ops) into
-    /// two `MLXFast.metalKernel` calls, called twice per layer
-    /// (`attn_hyper_connection`, `mlp_hyper_connection`) plus once per token
-    /// at the final reduction before `lm_head`. Pure glue around the
-    /// existing (quantized) matmuls, which are untouched.
-    ///
-    /// **Deliberately given a number above `.f7GatedBranchDtype`, not reusing
-    /// the long-unused `.f3HyperConnections` slot**: `Qwen4ExpFusionLevel`'s
-    /// `>=` comparisons are cumulative (a level activates every lever at or
-    /// below its own number), and production has defaulted to F7 since
-    /// 2026-09-11. Wiring new behavior into a number below 7 would have
-    /// silently activated it in production the moment it was wired in,
-    /// skipping the bench-then-checkpoint validation gate every other lever
-    /// in this campaign went through. `.f3HyperConnections` (and `.f4MoE`'s
-    /// original P2-fusion sense — MoE softmax precision is a separate,
-    /// already-cumulative concern) stay as-is; see P10.6 for the promised
-    /// cleanup of this numbering.
-    case f8HyperConnectionKernel = 8
-    /// F9 (P10.3, 2026-09-12): fuses GDN's q/k L2-normalization
-    /// (`x * rsqrt((x*x).sum(axis:-1,keepDims:true) + eps) * scale`, 4-5 ops
-    /// each) into one `MLXFast.metalKernel` call per tensor. Explicitly
-    /// **outside** `gatedDeltaUpdate` (Vendor/mlx-swift-lm, not patched —
-    /// see PLAN.md §1.1): the gating transforms named in PLAN.md's P10.3 row
-    /// (`-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`) already live inside
-    /// that vendored function's own body
-    /// (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift`), so
-    /// this only touches `Qwen4ExpGatedDeltaNet`'s own q/k-normalization
-    /// glue.
-    case f9GdnL2NormKernel = 9
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 

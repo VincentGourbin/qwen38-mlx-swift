@@ -4470,3 +4470,74 @@ dequantize/assemblage MLX après la lecture, et le passage de `mmap` à
 `pread` change le modèle mémoire (copie explicite au lieu d'un mapping
 virtuel) — seul le chronométrage réel du préfill sur 3 137 tokens tranchera,
 conformément au protocole de cette campagne.
+
+## 2026-09-12 (verdict) — P10.2 et P10.3 : retirées, le checkpoint réel ne confirme aucun gain — F8/F9 supprimées
+
+Mesure décisive (protocole PLAN.md §P10 : « ≥ 5 % sur le checkpoint réel
+sinon retiré », précédent `switch_mlp`/compile-par-couche/-pas). Machine
+libre (GPU 4-12 %, préflight OK), `flash-chat-probe` alterné F7/F8 puis
+F7/F9, 32 tokens greedy, `--resident-layers --resident-async`, IDs
+vérifiés à chaque run :
+
+**F8 (hyper-connexions)** — 3 paires F7/F8 consécutives, même prompt :
+
+| Run | F7 (s) | F8 (s) |
+|---|---:|---:|
+| 1 | 2,383 | 2,412 |
+| 2 | 2,374 | 2,383 |
+| 3 | 2,376 | 2,395 |
+| 4 | 2,354 | 2,379 |
+
+F7 moyenne 2,372 s · F8 moyenne 2,392 s → **F8 systématiquement ~0,8-1 %
+plus lent**, dans les 4 paires sans exception. Ni régression ≥ 5 % (comme
+redouté par le bench synthétique QSA +12-19 %), ni le moindre gain — un
+verdict net d'échec au seuil, pas un verdict ambigu. Sur une génération de
+200 tokens (arrêt naturel sur EOS), les IDs F7 et F8 **divergent au
+72ᵉ token** (F8 n'est pas bit-exact au-delà d'une poignée de tokens,
+cohérent avec son recalcul en float32 puis recast) — sortie toujours
+cohérente en français, mais confirme que F8 n'est pas candidate à un
+« gardé en option car bit-exact ».
+
+**F9 (L2-norm GDN)** — 3 paires F7/F9 :
+
+| Run | F7 (s) | F9 (s) |
+|---|---:|---:|
+| 1 | 2,315 | 2,388 |
+| 2 | 2,392 | 2,394 |
+| 3 | 2,404 | 2,401 |
+
+F7 moyenne 2,370 s · F9 moyenne 2,394 s → même verdict : ~1 % plus lent,
+pas de gain, malgré un bench synthétique qui suggérait un léger mieux
+(0 à −5 %, dans son propre bruit). IDs identiques à 32 tokens.
+
+**Décision, appliquée** : F8 et F9 retirées — code supprimé (pas seulement
+leur défaut, qui était de toute façon `.none`/opt-in), suivant le même sort
+que le kernel `switch_mlp` et les tentatives `MLX.compile` par
+couche/par pas de la campagne P7. `Qwen4ExpHyperConnection.swift` et
+`Qwen4ExpDecoderLayer.swift` (F8), `Qwen4ExpGatedDeltaNet.swift` (F9)
+reviennent au chemin d'origine inconditionnel ; `Qwen4ExpFusionLevel` perd
+les cas `f8HyperConnectionKernel`/`f9GdnL2NormKernel` ; les 4 tests dédiés
+sont supprimés (89 tests verts, retour au compte d'avant P10.2/P10.3) ;
+`--fusion-level` redevient 0-7 dans le CLI.
+
+**P10.6 (nettoyage) fait dans la foulée** : `Qwen4ExpFusionLevel` documente
+désormais explicitement deux catégories — les « fusions collage » (F1, F2,
+F4 : réordonnancements exacts, neutres en production, gardés parce que
+gratuits) et le « correctif de dtype » (F7, pas une optimisation, défaut de
+production, ne pas le traiter comme un réglage perf optionnel). Les cases
+`f3HyperConnections`/`f5Casts`/`f6Compile` restent (jamais implémentées,
+retirer casserait la continuité « F1-F6 » des logs passés) mais sont
+explicitement annotées « réservé, jamais implémenté » pour qu'un lecteur ne
+les croie pas actives. F8/F9 ne réapparaissent pas dans l'énumération — un
+futur niveau ne devrait pas réutiliser ces deux numéros sans consulter
+l'historique git.
+
+**Le vrai enseignement, pour la suite** : deux tentatives de plus qui
+confirment le motif déjà observé trois fois cette campagne — un kernel
+maison, même correct et même bien conçu, n'a pas automatiquement moins de
+surcoût qu'un enchaînement d'ops MLX déjà optimisées à cette échelle de
+tenseur (quelques centaines à quelques milliers d'éléments). Les deux
+vrais gains de la campagne (F7, et P10.4 ci-dessous) sont un correctif de
+comportement et un changement de mécanisme d'E/S — jamais une fusion de
+petits kernels.
+

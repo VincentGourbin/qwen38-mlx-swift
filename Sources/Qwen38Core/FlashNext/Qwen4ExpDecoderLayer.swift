@@ -12,9 +12,6 @@ public final class Qwen4ExpDecoderLayer: Module {
     public let layerIndex: Int
     public let isLinear: Bool
     public private(set) var captureParity = false
-    /// P10.2 (F8): threaded to `inject` (hyper-connections already receive
-    /// it via their own constructor parameter below).
-    private let fusionLevel: Qwen4ExpFusionLevel
 
     @ModuleInfo(key: "self_attn") public var selfAttn: Qwen4ExpQSAAttention?
     @ModuleInfo(key: "linear_attn") public var linearAttn: Qwen4ExpGatedDeltaNet?
@@ -47,7 +44,6 @@ public final class Qwen4ExpDecoderLayer: Module {
         precondition(configuration.layerTypes.indices.contains(layerIndex))
         self.layerIndex = layerIndex
         self.isLinear = configuration.layerTypes[layerIndex] == .linearAttention
-        self.fusionLevel = fusionLevel
 
         if isLinear {
             _linearAttn.wrappedValue = Qwen4ExpGatedDeltaNet(
@@ -65,12 +61,10 @@ public final class Qwen4ExpDecoderLayer: Module {
             ablation: ablation, moeStageProfiler: moeStageProfiler)
         _attnHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
-            quantization: quantization, parityPrefix: "attn_", ablation: ablation,
-            fusionLevel: fusionLevel)
+            quantization: quantization, parityPrefix: "attn_", ablation: ablation)
         _mlpHyperConnection.wrappedValue = Qwen4ExpGatedResidual(
             configuration: configuration, rmsNormEps: rmsNormEps,
-            quantization: quantization, parityPrefix: "mlp_", ablation: ablation,
-            fusionLevel: fusionLevel)
+            quantization: quantization, parityPrefix: "mlp_", ablation: ablation)
         if let pleLayerIndex {
             _ple.wrappedValue = Qwen4ExpPLELayer(
                 configuration: configuration,
@@ -127,14 +121,14 @@ public final class Qwen4ExpDecoderLayer: Module {
                 positionIDs: positionIDs,
                 mask: mask)
         }
-        state = inject(
+        state = Self.inject(
             branch: attentionBranch,
             hyperInput: attentionMix.originalInput,
             weights: attentionMix.injectionWeights)
 
         let mlpMix = mlpHyperConnection(state)
         let mlpBranch = mlp(mlpMix.mixedInput)
-        return inject(
+        return Self.inject(
             branch: mlpBranch,
             hyperInput: mlpMix.originalInput,
             weights: mlpMix.injectionWeights)
@@ -163,20 +157,18 @@ public final class Qwen4ExpDecoderLayer: Module {
         ple?.resetNgramLookupStats()
     }
 
-    private func inject(
+    // P10.2 (F8, 2026-09-12) — RETIRED: a fused-kernel variant of `inject`
+    // used to live behind `fusionLevel >= .f8HyperConnectionKernel` here.
+    // Measured on the real checkpoint (back-to-back alternating with the F7
+    // baseline): a small, consistent ~1 % regression, not the required
+    // ≥5 % gain — removed. See docs/knowledge/log.md "P10.2" and
+    // Qwen4ExpHyperConnection.swift's file-level comment.
+    private static func inject(
         branch: MLXArray,
         hyperInput: MLXArray,
         weights: MLXArray
     ) -> MLXArray {
         precondition(branch.ndim == 3 && hyperInput.ndim == 3 && weights.ndim == 3)
-        // P10.2 (F8): fuses `expandedDimensions` ×2 + multiply + reshape +
-        // add (5 ops) into one kernel call. See Qwen4ExpHyperConnection.swift.
-        if fusionLevel >= .f8HyperConnectionKernel {
-            return qwen4ExpHyperInjectFused(
-                branch: branch, hyperInput: hyperInput, weights: weights,
-                hiddenSize: attnHyperConnection.hiddenSize,
-                streamCount: attnHyperConnection.streamCount)
-        }
         let injection = branch.expandedDimensions(axis: -2) * weights.expandedDimensions(axis: -1)
         return hyperInput + injection.reshaped(hyperInput.shape)
     }
