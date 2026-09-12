@@ -4150,3 +4150,16 @@ numérotés au-dessus de F7 (pas dans les anciens slots F3-F6 vacants)
 pendant leur développement, puis retirés entièrement une fois le
 checkpoint réel jugé leur absence de gain — la précaution a permis de les
 mesurer proprement sans jamais risquer la production.
+
+### ⛔ GATE G-8 — close le 2026-09-12 (décisions Vincent)
+
+Les quatre questions de la fiche de démo, et les réponses :
+
+| Question | Décision |
+|---|---|
+| (a) H validé ? G-1 et G-3 actées rétroactivement ? | **Oui.** H6 est passée 8/8 sur le 3-bit ; la GUI sert texte, image, thinking et multi-tour ; le serveur a été testé **depuis un autre ordinateur du LAN** (client OpenCode distant), ce qui était le dernier critère manquant de G-3. G-1 et G-3 sont actées. |
+| (b) Checkpoint de référence | **Le 3-bit** (`local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`, n-gram sur SSD interne) sur cette machine. Le 4-bit reste la référence de qualité pour les comparaisons, inutilisable en pratique sans déchargement disque. |
+| (c) Ordre des chantiers | Voir §P11 : la campagne P0-P10 a épuisé les gains au niveau des ops MLX ; la suite est **architecturale**. |
+| (d) Veille du Mac | À corriger (profil secteur). Ce réglage a faussé trois jours de mesures. |
+
+Jalons 1, 2 et 3 livrés. Fin de la rév. 4 du plan pour la partie portage.
