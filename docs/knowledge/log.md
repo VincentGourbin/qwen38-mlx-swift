@@ -4142,3 +4142,40 @@ n'était pas mappé dans `status(for:)` (seul `Qwen38ServerError` l'était) : il
 rend désormais un `400` avec le message. La limitation elle-même (« Flash-Next
 n'accepte une image qu'au premier tour ») reste, elle est connue et voulue ;
 la GUI, qui utilise le chemin conversationnel, n'est pas concernée.
+
+## 2026-09-12 (suite) — La pénalité image était la même fuite de dtype, côté vision : corrigée, 6,9 → 17,8 tok/s
+
+Profil par couche de 20 pas de décodage, après un prompt image (973 tokens) et
+après un prompt texte (901 tokens) :
+
+| | couche QSA | couche GDN | total/token |
+|---|---|---|---|
+| après image | 3,44 ms | 3,15 ms | 167,5 ms |
+| après texte | 1,99 ms | 1,69 ms | 102,6 ms |
+
+**L'écart est uniforme sur les deux types de couche** — or une couche GDN est
+récurrente : son coût par token ne dépend **ni de la longueur ni du contenu du
+contexte**. Cela élimine l'attention, l'indexeur QSA et les positions M-RoPE,
+qui étaient la piste privilégiée, et désigne une propriété partagée par toutes
+les couches : le **dtype de l'état caché**.
+
+Cause : `Qwen4ExpVisionEncoder` remonte du float32 (interpolation des
+positions, l. 241-242) ; `Qwen4ExpInputMerger.merge` fusionnait ces embeddings
+tels quels avec les embeddings texte bf16, l'état caché devenait fp32 et
+contaminait **les caches remplis au préfill** — d'où un surcoût permanent sur
+tous les tours suivants. C'est exactement la fuite corrigée par F7, mais
+entrée par la tour vision.
+
+Correctif (`Qwen4ExpInputMerger`) : les embeddings vision sont castés au dtype
+des embeddings texte avant fusion, et seulement s'ils diffèrent.
+
+| Test contrôlé (serveur, 200 tokens générés) | avant | après |
+|---|---|---|
+| Texte + image, prompt ~975 tok | 6,88 tok/s | **17,77 tok/s** |
+| Texte seul, prompt 906 tok | 16,41 tok/s | 14,66 tok/s (inchangé, bruit) |
+| Sortie image | « Emmanuel Macron … » | **identique** |
+
+La génération après image est désormais **plus rapide** que le texte à
+longueur comparable, ce qui est attendu : 950 des 976 tokens de prompt sont
+des marqueurs image identiques, donc très favorables au cache n-gram. 89 tests
+verts, dont les parités vision.

@@ -4063,7 +4063,17 @@ F1-F6, par prudence — bascule recommandée mais non actée, décision à
 Vincent. Détail complet : `docs/knowledge/log.md` « 2026-09-11 — P8 : le
 MoE ne coûtait pas 25× ».
 
-### P9 — Pénalité image sur le décodage — plan du 2026-09-12
+### P9 — Pénalité image sur le décodage — RÉSOLU le 2026-09-12
+
+**Résolu avant exécution du plan ci-dessous** : le profil par couche a montré
+un surcoût *uniforme* (GDN comme QSA), ce qui excluait l'attention et l'indexeur
+(la piste privilégiée de P9.2/P9.3) et désignait le dtype de l'état caché. La
+tour vision remontait du float32 et `Qwen4ExpInputMerger` le fusionnait tel quel,
+contaminant les caches du préfill. Cast ajouté : **6,88 → 17,77 tok/s**, sortie
+identique. Voir `log.md` « La pénalité image était la même fuite de dtype ».
+P9.1 a donc servi ; P9.2 à P9.4 sont sans objet.
+
+### P9 (plan initial, conservé pour mémoire)
 
 **Le fait** (`log.md` « Une image dans le contexte coûte 2,4× ») : à longueur
 de prompt et de génération égales, 6,88 tok/s avec une image dans le contexte

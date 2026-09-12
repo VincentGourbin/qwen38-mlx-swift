@@ -47,8 +47,17 @@ public enum Qwen4ExpInputMerger {
                 expected: expected, actual: actual)
         }
 
+        // 2026-09-12 : la tour vision remonte du float32 (interpolation des
+        // positions, l. 241-242 de Qwen4ExpVisionEncoder). Sans ce cast, l'état
+        // caché fusionné devient fp32 et contamine les caches remplis au
+        // préfill : toutes les couches — y compris les GDN, dont le coût ne
+        // dépend pourtant pas du contexte — décodent ensuite ~1,8× plus
+        // lentement. Même nature que la fuite corrigée par F7.
+        let vision = visionEmbeddings.dtype == textEmbeddings.dtype
+            ? visionEmbeddings
+            : visionEmbeddings.asType(textEmbeddings.dtype)
         let positions = MLX.cumsum(markerMask, axis: 0) - 1
-        let aligned = visionEmbeddings.reshaped([-1, visionEmbeddings.dim(-1)])[positions]
+        let aligned = vision.reshaped([-1, vision.dim(-1)])[positions]
         let mask = markerMask.asType(.bool).expandedDimensions(axis: -1)
         return MLX.where(
             mask,
