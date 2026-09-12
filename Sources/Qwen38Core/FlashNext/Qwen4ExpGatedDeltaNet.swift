@@ -59,8 +59,10 @@ public final class Qwen4ExpGatedDeltaNet: Module {
 
     /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
     /// `flash-layer-bench --ablate`. `.none` everywhere in production —
-    /// see `Qwen4ExpLayerBenchAblation`.
-    public let ablation: Qwen4ExpLayerBenchAblation
+    /// see `Qwen4ExpLayerBenchAblation`. P11.2 : mutable — voir
+    /// `Qwen4ExpSparseMoE.ablation`'s doc comment pour pourquoi ce n'est pas
+    /// un problème sur une instance résidente.
+    public private(set) var ablation: Qwen4ExpLayerBenchAblation
 
     /// P8.2 (F7): whether the recurrence output is rounded to the network's
     /// working dtype before `Qwen4ExpRMSNormGated` — see
@@ -303,6 +305,12 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         if !enabled {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// P11.2 : change `ablation` sur une instance déjà construite, sans
+    /// recharger aucun poids — voir `Qwen4ExpSparseMoE.setAblation`.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        ablation = new
     }
 
     /// F1 (P2-fusion): build the fused `in_proj_qkv/z/b/a` matmul once, after

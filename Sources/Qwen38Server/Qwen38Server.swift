@@ -47,8 +47,14 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     /// `/healthz` : ne pas croire à tort avoir mesuré un K qu'on n'a pas
     /// réellement appliqué (PLAN.md P11.1).
     public var routedExpertCount: Int?
-    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, cacheRestored: Bool = false, cacheReplayed: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil, routedExpertCount: Int? = nil) {
-        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.cacheRestored = cacheRestored; self.cacheReplayed = cacheReplayed; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error; self.routedExpertCount = routedExpertCount
+    /// P11.2 : ablation effectivement utilisée par ce tour
+    /// (`Qwen38RunMetrics.ablation`) — `nil` tant que le tour n'a pas
+    /// terminé. Publié pour la même raison que `routedExpertCount` et que
+    /// `/healthz` : ne jamais laisser croire à tort qu'une mesure a été
+    /// prise avec (ou sans) ablation active (PLAN.md P11.2).
+    public var ablation: String?
+    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, cacheRestored: Bool = false, cacheReplayed: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil, routedExpertCount: Int? = nil, ablation: String? = nil) {
+        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.cacheRestored = cacheRestored; self.cacheReplayed = cacheReplayed; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error; self.routedExpertCount = routedExpertCount; self.ablation = ablation
     }
 }
 
@@ -128,8 +134,8 @@ public enum Qwen38ModelCatalog {
 }
 
 private struct ChatCompletionRequest: Codable, Sendable {
-    let model: String?; let messages: [ChatCompletionMessage]; let stream: Bool?; let maxTokens: Int?; let maxCompletionTokens: Int?; let temperature: Float?; let topP: Float?; let presencePenalty: Float?; let frequencyPenalty: Float?; let reasoningEffort: String?; let reasoning: ChatCompletionReasoning?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let routedExperts: Int?; let extra: ChatCompletionExtra?
-    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", routedExperts = "routed_experts", extra }
+    let model: String?; let messages: [ChatCompletionMessage]; let stream: Bool?; let maxTokens: Int?; let maxCompletionTokens: Int?; let temperature: Float?; let topP: Float?; let presencePenalty: Float?; let frequencyPenalty: Float?; let reasoningEffort: String?; let reasoning: ChatCompletionReasoning?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let routedExperts: Int?; let ablation: String?; let extra: ChatCompletionExtra?
+    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", routedExperts = "routed_experts", ablation, extra }
 
     var effectiveMaxTokens: Int? { maxCompletionTokens ?? maxTokens }
     var effectiveReasoningEffort: String? { reasoningEffort ?? reasoning?.effort ?? extra?.reasoningEffort }
@@ -156,9 +162,17 @@ private struct ChatCompletionRequest: Codable, Sendable {
     /// uniquement. Absent des deux : ne touche pas au réglage en vigueur
     /// (voir `Qwen38GenerationOptions.routedExpertCount`).
     var effectiveRoutedExperts: Int? { routedExperts ?? extra?.routedExperts }
+    /// P11.2 : `ablation` au premier niveau ou dans `extra` (même convention
+    /// double que `routed_experts`/`mtp`) — chaîne (`rawValue` de
+    /// `Qwen4ExpLayerBenchAblation`, `"none"` pour désactiver). Absent des
+    /// deux : ne touche pas au réglage en vigueur. Présent alors que le
+    /// serveur n'a pas démarré avec `--allow-ablation` : requête refusée en
+    /// HTTP 400 avant même la résolution de la chaîne — voir
+    /// `chatCompletionsResponse`.
+    var effectiveAblation: String? { ablation ?? extra?.ablation }
 }
 private struct ChatCompletionReasoning: Codable, Sendable { let effort: String? }
-private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; let penaltyContextTokens: Int?; let routedExperts: Int?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty", penaltyContextTokens = "penalty_context_tokens", routedExperts = "routed_experts" } }
+private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; let penaltyContextTokens: Int?; let routedExperts: Int?; let ablation: String?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty", penaltyContextTokens = "penalty_context_tokens", routedExperts = "routed_experts", ablation } }
 private struct ChatCompletionMessage: Codable, Sendable { let role: String; let content: ChatCompletionContent? }
 private enum ChatCompletionContent: Codable, Sendable {
     case text(String); case parts([ChatCompletionPart])
@@ -183,7 +197,7 @@ private struct ChatCompletionDelta: Codable, Sendable {
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
-private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count" } }
+private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
 
@@ -267,6 +281,12 @@ public actor Qwen38InferenceServer {
     /// pas seulement le tout premier chargement. `nil` (le défaut) laisse
     /// le comportement inchangé.
     private var startupRoutedExpertCount: Int?
+    /// P11.2 : option de démarrage (`serve --allow-ablation`, défaut
+    /// `false`). Tant que c'est `false`, un champ de requête `ablation` est
+    /// refusé en HTTP 400 avant d'atteindre le moteur — l'ablation produit
+    /// des sorties numériquement fausses par construction et ne doit
+    /// jamais être déclenchable par un client ordinaire (PLAN.md P11.2).
+    private var allowAblation = false
     // P6.4: the per-conversation LRU (id/prefix matching, restore/export,
     // budget, prefix hit/miss counters) moved to `Qwen38Runtime` so the GUI
     // shares it too (`Qwen38Runtime.generate`'s Flash-Next branch) instead
@@ -276,7 +296,7 @@ public actor Qwen38InferenceServer {
     // call sites and tests are unaffected.
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil) async throws {
+    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false) async throws {
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
         // P11.1 : mémorisé pour tout (re)chargement ultérieur — voir
         // `startupRoutedExpertCount`'s doc comment. Ne touche pas le modèle
@@ -285,6 +305,9 @@ public actor Qwen38InferenceServer {
         // avec un K différent reste tel quel jusqu'à sa prochaine
         // (re)sélection ou une surcharge par requête.
         startupRoutedExpertCount = routedExpertCount
+        // P11.2 : mémorisé pour toute la durée de vie du serveur — voir
+        // `allowAblation`'s doc comment.
+        self.allowAblation = allowAblation
         await runtime.configureConversationCacheBudget(gb: conversationCacheGB)
         let currentDirectory = await runtime.loadedDirectory
         let root = modelsDirectory ?? currentDirectory?.deletingLastPathComponent()
@@ -333,7 +356,10 @@ public actor Qwen38InferenceServer {
     // en cas de surcharge) pour qu'on ne puisse jamais croire à tort avoir
     // changé K sans le vérifier ici — voir PLAN.md P11.1, "métriques et
     // /healthz". `nil` seulement quand aucun engin Flash-Next n'est chargé.
-    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount)) }
+    // P11.2 : `ablation` publié systématiquement, `"none"` quand il n'y en a
+    // pas (aucun engin Flash-Next chargé, ou aucune ablation demandée) —
+    // même garde de publication que `routed_expert_count`, PLAN.md P11.2.
+    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none")) }
     private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
     private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
 
@@ -358,7 +384,23 @@ public actor Qwen38InferenceServer {
             // greedy requests (temperature 0) never get this default since
             // the generator ignores penalties there regardless.
             let presencePenalty = input.explicitPresencePenalty ?? (temperature > 0 ? 1.5 : 0)
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts)
+            // P11.2 : un champ `ablation` n'est même résolu que si le
+            // serveur a démarré avec `--allow-ablation` — sinon la requête
+            // est refusée en HTTP 400 avant d'atteindre le moteur.
+            // L'ablation produit des sorties numériquement fausses par
+            // construction ; elle ne doit jamais pouvoir être déclenchée par
+            // un client ordinaire (PLAN.md P11.2).
+            let requestedAblation: Qwen4ExpLayerBenchAblation?
+            if let rawAblation = input.effectiveAblation {
+                guard allowAblation else {
+                    throw Qwen38ServerError.invalidRequest(
+                        "Le champ ablation est refusé : redémarrez le serveur avec --allow-ablation pour l'autoriser. L'ablation produit des sorties numériquement fausses par construction.")
+                }
+                requestedAblation = try qwen4ExpResolveAblation(rawValue: rawAblation)
+            } else {
+                requestedAblation = nil
+            }
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation)
             let conversationID = input.effectiveConversationID
             let (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
                 id: conversationID,
@@ -578,7 +620,7 @@ public actor Qwen38InferenceServer {
     private func authorize(_ request: Request) throws { guard let apiKey, !apiKey.isEmpty else { return }; guard request.headers[.authorization] == "Bearer \(apiKey)" else { throw Qwen38ServerError.unauthorized } }
     private func updateSession(_ id: UUID, _ body: (inout Qwen38ServerSession) -> Void) { guard var session = sessions[id] else { return }; body(&session); sessions[id] = session }
     private func updateSessionAsync(_ id: UUID, chunk: String) { updateSession(id) { $0.generatedTokens += 1; $0.lastToken = String(chunk.suffix(48)) } }
-    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) { updateSession(id) { $0.status = .completed; $0.finishedAt = Date(); $0.promptTokens = metrics.metrics.promptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate; $0.routedExpertCount = metrics.routedExpertCount } }
+    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) { updateSession(id) { $0.status = .completed; $0.finishedAt = Date(); $0.promptTokens = metrics.metrics.promptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate; $0.routedExpertCount = metrics.routedExpertCount; $0.ablation = metrics.ablation } }
     private func completeSessionAsync(_ id: UUID, metrics: Qwen38RunMetrics) { completeSession(id, metrics: metrics) }
     private func failSessionAsync(_ id: UUID, error: String) { updateSession(id) { $0.status = .failed; $0.error = error; $0.finishedAt = Date() } }
     private func trimSessions() { while sessionOrder.count > 32 { sessions.removeValue(forKey: sessionOrder.removeFirst()) } }
@@ -600,6 +642,10 @@ public actor Qwen38InferenceServer {
         // erreurs de requête, pas des pannes : sans cela elles sortaient en
         // 500 sans corps (constaté le 2026-09-12 sur un tour 2 après image).
         if error is Qwen38FlashNextEngineError { return .badRequest }
+        // P11.2 : une chaîne `ablation` invalide (ni un cas de
+        // `Qwen4ExpLayerBenchAblation` ni "none") est une erreur de requête,
+        // pas une panne serveur.
+        if error is Qwen4ExpAblationResolutionError { return .badRequest }
         guard let serverError = error as? Qwen38ServerError else { return .internalServerError }
         switch serverError {
         case .modelNotFound: return .notFound

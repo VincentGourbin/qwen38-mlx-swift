@@ -44,6 +44,18 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     /// largeurs différentes — repartir d'une conversation neuve pour
     /// chaque K du balayage P11.1.
     public var routedExpertCount: Int?
+    /// P11.2 : surcharge ponctuelle de l'ablation (`Qwen4ExpLayerBenchAblation`)
+    /// pour Flash-Next, appliquée à l'engin résident *avant* ce tour — même
+    /// contrat que `routedExpertCount` : `nil` (le défaut) laisse en
+    /// vigueur le réglage en cours (démarrage ou dernier réglage explicite),
+    /// jamais un retour silencieux à `.none`. Non consulté par le chemin
+    /// 27B. Comme pour `routedExpertCount`, changer l'ablation en cours de
+    /// conversation continuée mélange des tours calculés différemment —
+    /// repartir d'une conversation neuve. Le serveur ne peuple ce champ que
+    /// lorsque `--allow-ablation` a été passé au démarrage ; sinon un champ
+    /// de requête `ablation` est refusé en HTTP 400 avant d'atteindre ce
+    /// point (voir `Qwen38InferenceServer`).
+    public var ablation: Qwen4ExpLayerBenchAblation?
 
     public init(
         maxTokens: Int = 256,
@@ -57,7 +69,8 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         presencePenalty: Float = 0,
         repetitionPenalty: Float = 1.0,
         penaltyContextTokens: Int = 2048,
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        ablation: Qwen4ExpLayerBenchAblation? = nil
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -71,6 +84,7 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.penaltyContextTokens = penaltyContextTokens
         self.routedExpertCount = routedExpertCount
+        self.ablation = ablation
     }
 
     public var parameters: GenerateParameters {
@@ -112,6 +126,13 @@ public struct Qwen38RunMetrics: Sendable {
     /// pour qu'un run ne puisse pas être attribué au mauvais K — voir
     /// PLAN.md P11.1. `nil` sur la famille 27B, qui n'a pas ce réglage.
     public let routedExpertCount: Int?
+    /// P11.2 : ablation effectivement utilisée par ce tour
+    /// (`Qwen4ExpLayerBenchAblation.rawValue`) — toujours publiée, `"none"`
+    /// quand il n'y en a pas (y compris sur la famille 27B, qui n'a pas ce
+    /// concept), pour la même raison que `routedExpertCount` : ne jamais
+    /// laisser croire à tort qu'une mesure a été prise avec (ou sans)
+    /// ablation.
+    public let ablation: String
 
     public init(
         metrics: LLMMetrics,
@@ -127,7 +148,8 @@ public struct Qwen38RunMetrics: Sendable {
         conversationReplayed: Bool = false,
         inputDescription: String = "Texte",
         mtpStatus: Qwen38MTPRunStatus = .init(availability: .unavailable),
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        ablation: String = "none"
     ) {
         self.metrics = metrics
         self.stopReason = stopReason
@@ -143,6 +165,7 @@ public struct Qwen38RunMetrics: Sendable {
         self.inputDescription = inputDescription
         self.mtpStatus = mtpStatus
         self.routedExpertCount = routedExpertCount
+        self.ablation = ablation
     }
 }
 
@@ -302,7 +325,12 @@ public actor Qwen38Runtime {
         /// pour tout l'engin Flash-Next résident (cible et drafter MTP).
         /// `nil` (le défaut) laisse le comportement inchangé. Sans effet
         /// sur la famille 27B.
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        /// P11.2 : option de démarrage — quel sous-bloc, le cas échéant,
+        /// court-circuiter dans tout l'engin Flash-Next résident. `.none`
+        /// (le défaut) laisse le comportement inchangé. Sans effet sur la
+        /// famille 27B.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) async throws {
         let info = try Qwen38ModelValidator.validate(directory)
         guard let family = info.family else {
@@ -333,7 +361,7 @@ public actor Qwen38Runtime {
             // to revisit once P (débit) profiles the resident path.
             Memory.cacheLimit = 8 * 1024 * 1024 * 1024
             flashEngine = try await flashNextEngineFactory.makeEngine(
-                directory: directory, routedExpertCount: routedExpertCount)
+                directory: directory, routedExpertCount: routedExpertCount, ablation: ablation)
             // PM4.3 (branchement, 2026-09-09): `mtpState` now delegates to
             // the loaded engine's own dynamic availability (predictor loads
             // lazily on the first MTP-enabled turn) instead of a fixed
@@ -418,6 +446,19 @@ public actor Qwen38Runtime {
     @discardableResult
     public func setFlashRoutedExpertCount(_ override: Int?) throws -> Int? {
         try flashEngine?.setRoutedExpertCount(override)
+    }
+
+    /// P11.2 : ablation actuellement effective sur l'engin Flash-Next
+    /// résident, pour `/healthz`. `nil` quand aucun engin Flash-Next n'est
+    /// chargé (y compris famille 27B) — le serveur publie alors `"none"`
+    /// directement, sans distinguer "pas de Flash-Next" de "pas
+    /// d'ablation" (voir `Qwen38InferenceServer.healthResponse`).
+    public var flashAblation: Qwen4ExpLayerBenchAblation? { flashEngine?.ablation }
+
+    /// P11.2 : change l'ablation de l'engin résident sans recharger le
+    /// checkpoint — no-op si aucun engin Flash-Next n'est chargé.
+    public func setFlashAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        flashEngine?.setAblation(new)
     }
 
     /// H4.2: whether the resident model currently loaded is Flash-Next —
@@ -1192,6 +1233,10 @@ public actor Qwen38Runtime {
             if let requestedRoutedExpertCount = options.routedExpertCount {
                 try flashEngine.setRoutedExpertCount(requestedRoutedExpertCount)
             }
+            // P11.2 : même contrat, voir `Qwen38GenerationOptions.ablation`.
+            if let requestedAblation = options.ablation {
+                flashEngine.setAblation(requestedAblation)
+            }
             // Flash-Next has no per-client persistent cache (contrat
             // §5.1.1, "Stateless v1"): the whole history is rendered as one
             // turn instead of replaying it through the in-process
@@ -1262,6 +1307,10 @@ public actor Qwen38Runtime {
             // commentaire de `Qwen38GenerationOptions.routedExpertCount`.
             if let requestedRoutedExpertCount = options.routedExpertCount {
                 try flashEngine.setRoutedExpertCount(requestedRoutedExpertCount)
+            }
+            // P11.2 : même contrat, voir `Qwen38GenerationOptions.ablation`.
+            if let requestedAblation = options.ablation {
+                flashEngine.setAblation(requestedAblation)
             }
             // The resident engine is shared with the LAN server (single model,
             // §5.1.1): after a server request — or a P5 LRU restore — it holds

@@ -47,7 +47,11 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         /// P11.1 : surcharge de `num_experts_per_tok`, threadée jusqu'au
         /// décodeur — voir `Qwen4ExpStreamingDecoder`'s doc comment. `nil`
         /// (le défaut) laisse le comportement inchangé.
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        /// P11.2 : quel sous-bloc, le cas échéant, court-circuiter — voir
+        /// `Qwen4ExpStreamingDecoder`'s doc comment. `.none` (le défaut)
+        /// laisse le comportement inchangé.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) throws {
         let loadedGlobal = try Qwen4ExpGlobalCheckpointLoader.load(
             from: directory, materialize: materializeGlobal, uncachedIO: uncachedIO)
@@ -62,7 +66,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             residentAsyncInterval: residentAsyncInterval,
             uncachedIO: uncachedIO,
             fusionLevel: fusionLevel,
-            routedExpertCount: routedExpertCount)
+            routedExpertCount: routedExpertCount,
+            ablation: ablation)
         self.configuration = decoder.configuration
     }
 
@@ -75,6 +80,16 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
     @discardableResult
     public func updateRoutedExpertCount(_ override: Int?) throws -> Int {
         try decoder.updateRoutedExpertCount(override)
+    }
+
+    /// P11.2 : ablation actuellement effective — voir
+    /// `Qwen4ExpStreamingDecoder.ablation`.
+    public var ablation: Qwen4ExpLayerBenchAblation { decoder.ablation }
+
+    /// P11.2 : change l'ablation sans recharger le checkpoint — voir
+    /// `Qwen4ExpStreamingDecoder.updateAblation`.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        decoder.updateAblation(new)
     }
 
     public func forward(

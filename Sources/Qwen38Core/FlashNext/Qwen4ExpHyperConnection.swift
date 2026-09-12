@@ -33,8 +33,9 @@ public final class Qwen4ExpGatedResidual: Module {
 
     /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
     /// `flash-layer-bench --ablate`. `.none` everywhere in production —
-    /// see `Qwen4ExpLayerBenchAblation`.
-    public let ablation: Qwen4ExpLayerBenchAblation
+    /// see `Qwen4ExpLayerBenchAblation`. P11.2 : mutable — voir
+    /// `Qwen4ExpSparseMoE.ablation`'s doc comment.
+    public private(set) var ablation: Qwen4ExpLayerBenchAblation
 
     public init(
         configuration: Qwen4ExpTextConfiguration,
@@ -113,6 +114,12 @@ public final class Qwen4ExpGatedResidual: Module {
         if !enabled {
             lastParityCapture.removeAll(keepingCapacity: true)
         }
+    }
+
+    /// P11.2 : change `ablation` sur une instance déjà construite, sans
+    /// recharger aucun poids — voir `Qwen4ExpSparseMoE.setAblation`.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        ablation = new
     }
 
     /// Final four-stream reduction used immediately before the language head.

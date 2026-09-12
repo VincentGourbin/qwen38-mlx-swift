@@ -1314,6 +1314,13 @@ struct FlashChatProbe: AsyncParsableCommand {
     )
     var routedExperts: Int?
 
+    @Option(
+        name: .long,
+        help:
+            "P11.2 : court-circuite un sous-bloc de chaque couche sur le checkpoint réel (moe, gdn-recurrence, gdn-projections, qsa-attn, hyper, norms, plus les sous-sondes moe-routing/moe-switch-mlp/moe-shared-expert), \"none\" pour désactiver — même liste que flash-layer-bench --ablate, instrument de mesure, jamais numériquement correct"
+    )
+    var ablate: String?
+
     func run() async throws {
         guard maxNewTokens > 0 else {
             throw ValidationError("--max-new-tokens doit être positif")
@@ -1330,6 +1337,7 @@ struct FlashChatProbe: AsyncParsableCommand {
         if let routedExperts, routedExperts < 1 {
             throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
         }
+        let resolvedAblation = try ablate.map(qwen4ExpResolveAblation(rawValue:)) ?? .none
         let samplingPreset: Qwen4ExpSamplingPreset
         if temperature != nil || topP != nil || topK != nil {
             samplingPreset = .custom(
@@ -1386,12 +1394,16 @@ struct FlashChatProbe: AsyncParsableCommand {
             residentAsyncInterval: residentAsyncInterval,
             uncachedIO: !cachedIO,
             fusionLevel: resolvedFusionLevel,
-            routedExpertCount: routedExperts)
+            routedExpertCount: routedExperts,
+            ablation: resolvedAblation)
         profiler.end("Flash globals")
         // P11.1 : toujours affiché (pas seulement en cas de surcharge), pour
         // ne jamais mesurer en croyant à tort avoir changé K — PLAN.md P11.1.
         print("routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)")
         profileSession?.metadata["routed_expert_count"] = String(model.routedExpertCount)
+        // P11.2 : même garde de publication, pour l'ablation.
+        print("ablation active : \(model.ablation.rawValue)")
+        profileSession?.metadata["ablation"] = model.ablation.rawValue
         let generator = Qwen4ExpStreamingGenerator(model: model)
 
         func runTurn(label: String, promptText: String, imageURL: URL?, continueConversation: Bool)
@@ -2574,6 +2586,13 @@ struct Serve: AsyncParsableCommand {
     )
     var routedExperts: Int?
 
+    @Flag(
+        name: .long,
+        help:
+            "P11.2 : autorise le champ de requête `ablation` (\"none\" ou l'un des cas de Qwen4ExpLayerBenchAblation). Refusé par défaut : sans ce drapeau, une requête portant ce champ est rejetée en HTTP 400 — l'ablation produit des sorties numériquement fausses par construction et ne doit jamais être déclenchable par un client ordinaire"
+    )
+    var allowAblation = false
+
     func run() async throws {
         if let routedExperts, routedExperts < 1 {
             throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
@@ -2623,7 +2642,8 @@ struct Serve: AsyncParsableCommand {
             modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
                 .deletingLastPathComponent(),
             conversationCacheGB: conversationCacheGb,
-            routedExpertCount: routedExperts)
+            routedExpertCount: routedExperts,
+            allowAblation: allowAblation)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
 

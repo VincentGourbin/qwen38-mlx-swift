@@ -881,6 +881,8 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     /// P11.1 : imite `Qwen4ExpStreamingTextModel.routedExpertCount` — un
     /// entier concret même sans surcharge (10, la valeur du checkpoint réel).
     var routedExpertCount = 10
+    /// P11.2 : imite `Qwen4ExpStreamingTextModel.ablation`.
+    var ablation: Qwen4ExpLayerBenchAblation = .none
 
     init(directory: URL) { self.directory = directory }
 
@@ -888,6 +890,10 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func setRoutedExpertCount(_ override: Int?) throws -> Int {
         routedExpertCount = override ?? 10
         return routedExpertCount
+    }
+
+    func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        ablation = new
     }
 
     func resetConversation() { resetConversationCount += 1 }
@@ -978,10 +984,12 @@ private final class MockFlashNextEngineFactory: Qwen38FlashNextEngineFactory, @u
     private(set) var lastEngine: MockFlashNextEngine?
 
     func makeEngine(
-        directory: URL, routedExpertCount: Int? = nil
+        directory: URL, routedExpertCount: Int? = nil,
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) async throws -> any Qwen38FlashNextEngineProtocol {
         let engine = MockFlashNextEngine(directory: directory)
         if let routedExpertCount { engine.routedExpertCount = routedExpertCount }
+        engine.ablation = ablation
         lastEngine = engine
         return engine
     }
@@ -2845,4 +2853,185 @@ func qwen4ExpRoutedExpertCountErrorDescriptionIsClear() {
     let description = error.errorDescription ?? ""
     #expect(description.contains("0"))
     #expect(description.contains("512"))
+}
+
+// MARK: - P11.2 : ablation réglable à l'exécution sur le checkpoint réel
+
+@Test("P11.2 : chaque rawValue de Qwen4ExpLayerBenchAblation (y compris \"none\") se résout vers lui-même")
+func qwen4ExpResolveAblationAcceptsEveryKnownRawValue() throws {
+    for ablation in Qwen4ExpLayerBenchAblation.allCases {
+        #expect(try qwen4ExpResolveAblation(rawValue: ablation.rawValue) == ablation)
+    }
+}
+
+@Test("P11.2 : \"none\" explicite résout vers .none, exactement comme l'absence du champ")
+func qwen4ExpResolveAblationNoneRawValueResolvesToNoneCase() throws {
+    #expect(try qwen4ExpResolveAblation(rawValue: "none") == .none)
+}
+
+@Test("P11.2 : une chaîne inconnue est rejetée avec un message nommant la valeur et les choix")
+func qwen4ExpResolveAblationRejectsUnknownValue() {
+    #expect(throws: Qwen4ExpAblationResolutionError.self) {
+        try qwen4ExpResolveAblation(rawValue: "does-not-exist")
+    }
+    do {
+        _ = try qwen4ExpResolveAblation(rawValue: "does-not-exist")
+        Issue.record("qwen4ExpResolveAblation aurait dû lever une erreur")
+    } catch let error as Qwen4ExpAblationResolutionError {
+        let description = error.errorDescription ?? ""
+        #expect(description.contains("does-not-exist"))
+        #expect(description.contains("moe"))
+        #expect(description.contains("none"))
+    } catch {
+        Issue.record("Type d'erreur inattendu : \(error)")
+    }
+}
+
+@Test("P11.2 : une chaîne vide est rejetée, pas silencieusement traitée comme \"none\"")
+func qwen4ExpResolveAblationRejectsEmptyString() {
+    #expect(throws: Qwen4ExpAblationResolutionError.self) {
+        try qwen4ExpResolveAblation(rawValue: "")
+    }
+}
+
+@Test("P11.2 : sans --allow-ablation, une requête portant le champ ablation est refusée en HTTP 400")
+func serverRejectsAblationFieldWithoutAllowAblationFlag() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-ablation-refused-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    // P11.2 : `allowAblation` absent ⇒ `false`, le défaut — aucun drapeau de
+    // démarrage ne l'autorise ici.
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshotBefore = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshotBefore.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "messages": [["role": "user", "content": "salut"]],
+        "ablation": "moe",
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 400)
+    let body = String(data: data, encoding: .utf8) ?? ""
+    #expect(body.contains("allow-ablation"))
+    // La requête n'a jamais dû atteindre le moteur : l'ablation reste au
+    // défaut de construction du mock.
+    #expect(mock.ablation == .none)
+}
+
+@Test("P11.2 : avec --allow-ablation, le champ ablation atteint le moteur résolu")
+func serverAppliesAblationFieldWhenAllowAblationFlagIsSet() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-ablation-allowed-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, allowAblation: true)
+    defer { Task { await server.stop() } }
+
+    let snapshotBefore = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshotBefore.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "messages": [["role": "user", "content": "salut"]],
+        "ablation": "qsa-attn",
+    ])
+    let (_, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    #expect(mock.ablation == .qsaAttn)
+}
+
+@Test("P11.2 : avec --allow-ablation, une valeur d'ablation inconnue est refusée en HTTP 400")
+func serverRejectsUnknownAblationValueEvenWhenAllowed() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-ablation-invalid-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    _ = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, allowAblation: true)
+    defer { Task { await server.stop() } }
+
+    let snapshotBefore = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshotBefore.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "messages": [["role": "user", "content": "salut"]],
+        "ablation": "does-not-exist",
+    ])
+    let (_, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 400)
+}
+
+@Test("P11.2 : /healthz publie toujours l'ablation active, \"none\" par défaut")
+func healthzAlwaysPublishesAblation() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-ablation-healthz-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    _ = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    let (data, response) = try await URLSession.shared.data(
+        from: URL(string: "http://127.0.0.1:\(snapshot.port)/healthz")!)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    let decoded = try #require(
+        try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    #expect(decoded["ablation"] as? String == "none")
 }

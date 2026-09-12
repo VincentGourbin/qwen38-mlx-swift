@@ -158,6 +158,18 @@ public final class Qwen4ExpDecoderLayer: Module {
         try mlp.setRoutedExpertCount(count)
     }
 
+    /// P11.2 : répercute un changement d'ablation sur chaque sous-module de
+    /// la couche déjà construite (résidente ou non) — attention (QSA ou
+    /// GDN, selon `isLinear`), MoE, et les deux hyper-connexions. Ne touche
+    /// à aucun poids ni au graphe MLX, comme `setRoutedExpertCount`.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        selfAttn?.setAblation(new)
+        linearAttn?.setAblation(new)
+        mlp.setAblation(new)
+        attnHyperConnection.setAblation(new)
+        mlpHyperConnection.setAblation(new)
+    }
+
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats? {
         ple?.ngramCacheStats()
     }

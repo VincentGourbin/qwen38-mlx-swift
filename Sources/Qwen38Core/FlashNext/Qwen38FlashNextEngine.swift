@@ -65,6 +65,16 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     /// `Qwen4ExpMTPPredictor.setRoutedExpertCount`).
     @discardableResult
     func setRoutedExpertCount(_ override: Int?) throws -> Int
+    /// P11.2 : quel sous-bloc, le cas échéant, l'engin résident court-
+    /// circuite (`Qwen4ExpLayerBenchAblation`) — publiée par `/healthz` et
+    /// dans les métriques de chaque tour pour la même raison que
+    /// `routedExpertCount` : ne jamais mesurer en croyant à tort avoir (ou
+    /// ne pas avoir) une ablation active.
+    var ablation: Qwen4ExpLayerBenchAblation { get }
+    /// P11.2 : change l'ablation de l'engin résident sans recharger le
+    /// checkpoint. Contrairement à `setRoutedExpertCount`, aucune erreur
+    /// possible : toute valeur de `Qwen4ExpLayerBenchAblation` est valide.
+    func setAblation(_ new: Qwen4ExpLayerBenchAblation)
     func resetConversation()
     func unload()
     func decode(tokenIDs: [Int32]) -> String
@@ -114,7 +124,7 @@ public protocol Qwen38FlashNextEngineFactory: Sendable {
     /// travers un type protocole/existentiel — seul le type concret en
     /// bénéficie (voir `Qwen38DefaultFlashNextEngineFactory`).
     func makeEngine(
-        directory: URL, routedExpertCount: Int?
+        directory: URL, routedExpertCount: Int?, ablation: Qwen4ExpLayerBenchAblation
     ) async throws -> any Qwen38FlashNextEngineProtocol
 }
 
@@ -122,9 +132,11 @@ public struct Qwen38DefaultFlashNextEngineFactory: Qwen38FlashNextEngineFactory 
     public init() {}
 
     public func makeEngine(
-        directory: URL, routedExpertCount: Int? = nil
+        directory: URL, routedExpertCount: Int? = nil,
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) async throws -> any Qwen38FlashNextEngineProtocol {
-        try await Qwen38FlashNextEngine(directory: directory, routedExpertCount: routedExpertCount)
+        try await Qwen38FlashNextEngine(
+            directory: directory, routedExpertCount: routedExpertCount, ablation: ablation)
     }
 }
 
@@ -224,7 +236,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         /// P11.1 : surcharge de `num_experts_per_tok` pour le modèle
         /// résident — voir `Qwen4ExpStreamingTextModel`'s doc comment.
         /// `nil` (le défaut) laisse le comportement inchangé.
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        /// P11.2 : quel sous-bloc, le cas échéant, court-circuiter dans le
+        /// modèle résident. `.none` (le défaut) laisse le comportement
+        /// inchangé.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) async throws {
         self.sleepActivity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
@@ -240,7 +256,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             directory: directory, layerLoadingMode: .resident, residentEvaluationInterval: 1,
             profileLayers: profileLayers, residentAsyncEval: residentAsyncEval,
             residentAsyncInterval: residentAsyncInterval,
-            uncachedIO: uncachedIO, routedExpertCount: routedExpertCount)
+            uncachedIO: uncachedIO, routedExpertCount: routedExpertCount, ablation: ablation)
         self.generator = Qwen4ExpStreamingGenerator(model: model)
         self.stopTokenIDs = [
             configuration.textConfiguration.eosTokenID, Int32(248044), Int32(248046),
@@ -276,6 +292,18 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             try mtpPredictor.setRoutedExpertCount(resolved)
         }
         return resolved
+    }
+
+    /// P11.2 : ablation effective du modèle résident.
+    public var ablation: Qwen4ExpLayerBenchAblation { model.ablation }
+
+    /// P11.2 : change l'ablation de l'engin résident sans recharger le
+    /// checkpoint. Non répercutée sur le drafter MTP, qui n'a pas été câblé
+    /// pour cette tâche (hors périmètre — voir le rapport P11.2) : un tour
+    /// MTP-activé continue de brouillonner sans aucune ablation même quand
+    /// la cible en a une.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        model.setAblation(new)
     }
 
     public func resetConversation() {
@@ -590,7 +618,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                         conversationReplayed: false,
                                         inputDescription: inputDescription,
                                         mtpStatus: mtpStatus,
-                                        routedExpertCount: self.model.routedExpertCount)))
+                                        routedExpertCount: self.model.routedExpertCount,
+                                        ablation: self.model.ablation.rawValue)))
                         }
                     }
                     continuation.finish()
@@ -712,7 +741,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 conversationReplayed: false,
                                 inputDescription: inputDescription,
                                 mtpStatus: mtpStatus,
-                                routedExpertCount: self.model.routedExpertCount)))
+                                routedExpertCount: self.model.routedExpertCount,
+                                ablation: self.model.ablation.rawValue)))
                     continuation.finish()
                     Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
                 } catch {

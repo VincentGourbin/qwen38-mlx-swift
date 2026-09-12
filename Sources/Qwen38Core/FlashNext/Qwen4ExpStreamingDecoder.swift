@@ -113,6 +113,12 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
     /// demandée, pour que ce champ soit directement publiable dans
     /// `/healthz`/les métriques sans distinguer "réglé" de "défaut".
     public private(set) var routedExpertCount: Int
+    /// P11.2 : quel sous-bloc, le cas échéant, chaque couche court-circuite
+    /// (`--ablate` de `flash-chat-probe`, jamais réglé côté serveur sans
+    /// `--allow-ablation`). `.none` reproduit exactement le comportement
+    /// précédent partout ailleurs. Toujours une valeur concrète — jamais
+    /// `nil` — pour la même raison de publication que `routedExpertCount`.
+    public private(set) var ablation: Qwen4ExpLayerBenchAblation
 
     private let checkpointIndex: Qwen4ExpCheckpointLayerIndex
     private var caches: [Int: any KVCache] = [:]
@@ -141,7 +147,11 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         /// Validée ici (contre `numExperts` du checkpoint tout juste
         /// chargé) via `qwen4ExpResolveRoutedExpertCount`, qui lève une
         /// erreur claire plutôt qu'un crash pour une valeur hors bornes.
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        /// P11.2 : quel sous-bloc, le cas échéant, court-circuiter dans
+        /// chaque couche — `.none` (le défaut) laisse le comportement
+        /// inchangé.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) throws {
         precondition(residentEvaluationInterval > 0)
         precondition(residentAsyncInterval > 0)
@@ -160,6 +170,7 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
             override: routedExpertCount,
             checkpointDefault: self.configuration.numExpertsPerToken,
             numExperts: self.configuration.numExperts)
+        self.ablation = ablation
         self.checkpointIndex = try Qwen4ExpCheckpointLayerIndex(directory: directory)
     }
 
@@ -224,7 +235,8 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                     materialize: materializeLayers,
                     uncachedIO: uncachedIO,
                     fusionLevel: fusionLevel,
-                    routedExpertCount: routedExpertCount)
+                    routedExpertCount: routedExpertCount,
+                    ablation: ablation)
                 loadDuration = ContinuousClock.now - start
                 if layerLoadingMode == .resident {
                     residentLayers[layerIndex] = loaded
@@ -380,6 +392,21 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         }
         routedExpertCount = resolved
         return resolved
+    }
+
+    /// P11.2 : change l'ablation effective sans recharger le checkpoint —
+    /// même mécanisme que `updateRoutedExpertCount`. En mode streamé, seul
+    /// `ablation` change (le prochain `Qwen4ExpCheckpointLayerLoader.load`
+    /// en tiendra compte) ; en mode résident, chaque couche déjà chargée
+    /// est aussi mise à jour directement via `Qwen4ExpDecoderLayer.
+    /// setAblation`, qui ne touche à aucun poids ni au graphe MLX.
+    /// Contrairement à `updateRoutedExpertCount`, aucune borne à valider :
+    /// toute valeur de `Qwen4ExpLayerBenchAblation` est acceptable.
+    public func updateAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        for loaded in residentLayers.values {
+            loaded.layer.setAblation(new)
+        }
+        ablation = new
     }
 
     public func ngramCacheStats() -> Qwen4ExpNGramCacheStats {

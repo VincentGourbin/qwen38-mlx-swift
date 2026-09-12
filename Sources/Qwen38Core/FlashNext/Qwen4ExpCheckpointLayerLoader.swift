@@ -82,7 +82,12 @@ public enum Qwen4ExpCheckpointLayerLoader {
         /// P11.1 : surcharge de la largeur de routage MoE, threadée jusqu'à
         /// `Qwen4ExpDecoderLayer`/`Qwen4ExpSparseMoE`. `nil` (le défaut)
         /// reproduit exactement le comportement précédent.
-        routedExpertCount: Int? = nil
+        routedExpertCount: Int? = nil,
+        /// P11.2 : quel sous-bloc, le cas échéant, court-circuiter dans la
+        /// couche construite — threadée jusqu'à `Qwen4ExpDecoderLayer`.
+        /// `.none` (le défaut) reproduit exactement le comportement
+        /// précédent.
+        ablation: Qwen4ExpLayerBenchAblation = .none
     ) throws -> Qwen4ExpLoadedDecoderLayer {
         let configuration = try Qwen4ExpConfiguration.load(from: directory)
         guard configuration.textConfiguration.layerTypes.indices.contains(layerIndex) else {
@@ -194,6 +199,7 @@ public enum Qwen4ExpCheckpointLayerLoader {
             expertsQuantization: useCheckpointQuantization ? checkpointExpertsQuantization : nil,
             lazyNGramStorage: useCheckpointQuantization ? lazyNGramStorage : nil,
             fusionLevel: fusionLevel,
+            ablation: ablation,
             routedExpertCount: routedExpertCount)
         try layer.update(
             parameters: ModuleParameters.unflattened(weights), verify: [.all])
