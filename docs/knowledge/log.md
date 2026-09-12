@@ -5113,3 +5113,61 @@ injection élémentaire) sans quantification à réimplémenter — donc le
 prototype le moins risqué pour établir si un gain de dispatch se traduit en
 gain de débit. Si oui, la cible suivante est le bloc MoE complet, qui demande
 d'écrire la déquantification affine 3 bits en Metal.
+
+---
+
+## 2026-09-13 — Correction : le noyau Metal a déjà été essayé deux fois
+
+En lisant `Qwen4ExpHyperConnection.swift` pour rédiger le prototype P11.10, j'ai
+trouvé ceci en tête de fichier :
+
+> P10.2 (F8, 2026-09-12) — RETIRED: a `MLXFast.metalKernel` pair used to live
+> here, fusing the hyper-connection "mix" reduction and
+> `Qwen4ExpDecoderLayer.inject`'s broadcast-multiply-add (5 ops each) into one
+> kernel call. […] F7 mean 2.372 s, F8 mean 2.392 s — a small, consistent
+> ~1 % **regression**.
+
+Et le même motif dans `Qwen4ExpGatedDeltaNet.swift` pour F9 (P10.3).
+
+**J'avais écrit dans §P11.10 que le noyau Metal personnalisé était « la seule
+voie jamais essayée ». C'est faux.** F8 et F9 étaient des `MLXFast.metalKernel`,
+sur deux des trois cibles que je proposais, et tous deux ont été retirés pour
+une régression.
+
+### Ce que ce fait nous apprend vraiment
+
+Supprimer 10 ops par couche sur ~100 — ce que faisait F8 — aurait dû rendre
+environ 10 % si le coût était bien le nombre de lancements. On a mesuré −1 %.
+**Nous ne sommes donc pas limités par le nombre de dispatches.**
+
+Le chiffre qui compte est ailleurs. Le bloc d'experts lit **1 005 Mio par
+jeton** et coûte, selon l'attribution, 10 à 20 ms :
+
+| coût supposé du bloc | bande passante atteinte | part du pic (~400 Go/s) |
+|---:|---:|---:|
+| 20,4 ms | 51,6 Go/s | 12,9 % |
+| 15,0 ms | 70,3 Go/s | 17,6 % |
+| 10,0 ms | 105,4 Go/s | 26,3 % |
+
+Le toit serait 2,63 ms. **Les noyaux tournent donc à 13-26 % de la bande
+passante disponible** : le temps part dans des noyaux individuellement
+inefficaces, pas dans leur nombre.
+
+C'est une bien meilleure cible, et elle explique d'un coup toutes les mesures
+de la nuit : pourquoi réduire K ne rend que 4,7 % (moins d'octets, même
+inefficacité), pourquoi fusionner des ops ne rend rien (le nombre n'est pas le
+problème), et pourquoi ablater n'importe quel bloc « économise » 20-40 % (tout
+est également lent).
+
+### Recadrage de P11.10
+
+Ne plus chercher à réduire le nombre de noyaux. Chercher **pourquoi
+`gatherQMM` / `SwitchGLU` n'atteint que 13-26 % de la bande passante aux
+formes réelles** (10 experts choisis parmi 512, poids 3 bits g64). Pistes à
+départager par la mesure, pas par l'écriture : accès non coalescés sur des
+experts dispersés, déquantification par groupes de 64 mal vectorisée,
+occupation trop faible à batch 1.
+
+**Mesurer d'abord, en isolation. Écrire du Metal seulement si la cause désigne
+un correctif précis.** F8 et F9 ont déjà montré ce que donne une réécriture à
+l'aveugle.

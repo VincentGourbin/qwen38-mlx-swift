@@ -4318,7 +4318,7 @@ conversation neuve à chaque K.
 | **P11.7** | **Prérouteur : verdict écrit, pas d'implémentation.** Documenter dans `docs/knowledge/investigations/` pourquoi la technique ne s'applique pas à un modèle résident, avec les trois points de P11.0. À rouvrir seulement si P11.5 aboutit à un déchargement effectif. | La note existe et clôt le sujet. |
 | **P11.8** | **Quantification 3 bits directe depuis les shards BF16 officiels** (option B, §7). Notre 3-bit est dérivé d'un checkpoint tiers déjà quantifié en 4 bits : double quantification. Une passe directe depuis le BF16 devrait récupérer une partie des 0,42 nat gratuitement. | Q-B V32 du 3-bit direct ≥ celui du 4-bit actuel. |
 | **P11.9** | **Remonter le patch `Vendor/mlx-swift-lm-local.patch` en amont.** Sept fichiers modifiés localement, épinglés sur `1a562aa`. Dette qui grossit à chaque mise à jour de mlx-swift. | PR ouverte, ou patch réduit aux seuls écarts irréductibles. |
-| **P11.10** | **Noyau Metal personnalisé — la seule voie qui attaque le goulot de front, et la seule jamais essayée.** Les neuf fusions F1-F9 ont échoué parce qu'elles recomposaient des **ops MLX** : on ne peut pas descendre sous le nombre de dispatches que MLX émet. `MLXFast.metalKernel` (vérifié présent dans mlx-swift 0.31.6, `Source/MLXFast/MLXFastKernel.swift:46`) compile un noyau Metal à la volée depuis une source, avec grille et groupe de threads explicites : **N dispatches deviennent 1**. **Cible désignée par P11.3 : (a) le mélange des hyper-connexions** — premier poste ex æquo (21,87 ms sur 54,95), 4 flux, rang 320, beaucoup de très petits tenseurs, et surtout **pure tuyauterie** (normes + deux matmuls de rang faible + injection élémentaire) sans quantification à réimplémenter, donc le prototype le moins risqué ; (b) le collage autour de la récurrence GDN (projections, normes, casts ; la récurrence elle-même est déjà un noyau) ; (c) le bloc MoE complet en batch 1 — softmax du routeur, `argPartition`, *gather*, trois matvec quantifiés 3 bits g64 et le SwiGLU en un seul noyau. (c) est le gros lot, 48 couches × plusieurs ops, mais demande d'écrire la déquantification affine 3 bits en Metal. | D'abord un prototype sur (a) : parité bit-à-bit contre le chemin actuel sur poids réels, puis débit mesuré au protocole P11.1. Poursuivre sur (b) et (c) seulement si (a) prouve que le gain de dispatch se traduit en gain de débit. |
+| **P11.10** | **Rendre le noyau de gather quantifié efficace — ce n'est PAS un problème de nombre de lancements.** *Correction du 2026-09-13 : la première rédaction de cette tâche affirmait à tort que le noyau Metal personnalisé n'avait jamais été essayé. Il l'a été **deux fois** : F8 (hyper-connexions, P10.2) et F9 (GDN, P10.3) étaient bel et bien des `MLXFast.metalKernel`, fusionnant 5 ops en 1 chacun, et tous deux ont été retirés pour une **régression de ~1 %**.* Ce fait recadre tout le diagnostic. Supprimer 10 ops par couche sur ~100 aurait dû rendre ~10 % si nous étions limités par les lancements ; on a mesuré −1 %. Le vrai chiffre est ailleurs : le bloc d'experts lit **1 005 Mio par jeton** et coûte 10 à 20 ms, soit **50 à 105 Go/s atteints sur ~400 disponibles — 13 à 26 % du pic**, quand le toit serait 2,63 ms. **Le temps part donc dans des noyaux individuellement inefficaces, pas dans leur nombre.** Cible : le *gather* quantifié 3 bits g64 en batch 1 (`gatherQMM` / `SwitchGLU`), dont il faut d'abord mesurer la bande passante atteinte en isolation, puis comprendre pourquoi elle est si basse (accès non coalescés sur les 10 experts dispersés parmi 512 ? déquantification par groupe de 64 mal vectorisée ? occupation trop faible à batch 1 ?). | Une mesure isolée de la bande passante atteinte par `gatherQMM` aux formes réelles, et une cause identifiée. Un noyau de remplacement seulement si la cause désigne un correctif précis — pas de réécriture à l'aveugle, F8 et F9 ont déjà montré ce que ça donne. |
 
 #### Pourquoi le MTP passe devant, et l'hypothèse à tester d'abord
 
@@ -4386,8 +4386,8 @@ qui ne coûte aucun forward et sert bien les cas de résumé et de réécriture.
 deux le sont négativement : réduire K plafonne à +5,9 %, le spéculatif à
 1,14×. L'attribution montre que **le coût est diffus** — la somme des blocs
 disjoints fait 180 % du total, aucun ne domine, et même le plus petit pèse
-12 ms. Il ne reste donc qu'une direction : **P11.10**, le noyau Metal, avec
-les hyper-connexions comme premier prototype. Puis P11.5 (déchargement, pour
+12 ms. Il ne reste donc qu'une direction : **P11.10**, mais recadrée — le
+goulot n'est pas le nombre de noyaux, c'est leur rendement. Puis P11.5 (déchargement, pour
 le 4-bit), P11.8 (quantification directe, pour la qualité) et P11.6/P11.9.
 
 **Historique, révisé le 2026-09-12 après P11.1.** P11.1 est close : la réduction de K
@@ -4398,13 +4398,11 @@ du coût d'un forward selon N) est bon marché et décide de tout le reste du
 chantier : la lancer dès que P11.2 et P11.3 ont rendu leur attribution.
 P11.5 dépend de P11.2. P11.6 à P11.9 sont indépendantes.
 
-**P11.10 (noyau Metal) est le seul levier identifié dont le plafond ne soit
-pas déjà connu comme faible.** P11.1 plafonne à +5,9 %, P11.4 à +30 % dans
-la meilleure hypothèse et peut-être +11 % dans l'autre. P11.10 attaque
-directement ce que le diagnostic désigne — le nombre de dispatches — et rien
-dans les mesures ne borne son gain a priori. Il est aussi le plus risqué :
-écrire du Metal, et prouver la parité sur des poids réels. Le lancer dès que
-P11.2 et P11.3 ont dit **où** viser.
+**P11.10 est le seul levier restant, mais sa nature a changé le 2026-09-13.** P11.1 plafonne à +5,9 %, P11.4 à +30 % dans
+la meilleure hypothèse et peut-être +11 % dans l'autre. Il ne s'agit plus de réduire le nombre de
+dispatches — F8 et F9, deux vrais noyaux Metal, ont donné −1 % — mais de
+comprendre pourquoi le gather quantifié n'atteint que 13 à 26 % de la bande
+passante. Mesurer d'abord, écrire du Metal seulement si la cause le désigne.
 
 Prérequis inchangés pour toute mesure : build Release
 (`Scripts/build-release.sh`), `Scripts/preflight-resident.sh` au vert,
