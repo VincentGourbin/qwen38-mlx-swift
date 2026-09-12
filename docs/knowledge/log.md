@@ -4103,3 +4103,42 @@ Correctif : les fragments sont accumulés et publiés par lots d'au plus 80 ms
 (≈ 12 rafraîchissements par seconde, rendu toujours fluide), le reliquat
 étant publié à la fin du tour. Le parseur thinking continue de traiter chaque
 fragment immédiatement, seule la publication est regroupée.
+
+## 2026-09-12 — Une image dans le contexte coûte 2,4× sur toute la génération qui suit
+
+Vincent a relancé le protocole de bench M1 (image au tour 1, puis deux tours
+texte) et mesuré 3,8 / 1,8 / 2,5 tok/s là où le moteur venait d'être mesuré à
+15 tok/s. Enquête, chaque hypothèse écartée par mesure :
+
+| Hypothèse | Test | Verdict |
+|---|---|---|
+| La GUI n'a pas F7 | lecture du câblage complet jusqu'à `prepareFusion` | correct |
+| Rendu SwiftUI (corrigé le matin) | lots de 80 ms déjà en place | n'explique pas |
+| Longueur de génération | serveur, 600 tokens générés | 13,95 tok/s |
+| Contexte long | serveur, prompt 3 767 + 600 générés (contexte 4 367, au-delà du seuil QSA de 2 048) | 9,82 tok/s — le seuil coûte ~30 %, pas un facteur 4 |
+| Pression mémoire | sampler pendant le run : compresseur 9,7 Go, 4 685 décompressions | hors de cause |
+| **Image dans le contexte** | **test contrôlé, même longueur de prompt et même nombre de tokens générés** | **décisif** |
+
+| Entrée | prompt | générés | TTFT | débit |
+|---|---|---|---|---|
+| Texte + image | 973 tok (dont ~950 de vision) | 200 | 4,24 s | **6,88 tok/s** |
+| Texte seul | 906 tok | 200 | 6,13 s | **16,41 tok/s** |
+
+**2,4× de pénalité permanente sur le décodage dès qu'une image est dans le
+contexte**, à longueur égale. Le prefill n'est pas en cause (TTFT plus court
+avec l'image). La boucle de décodage est pourtant structurellement identique :
+`Qwen4ExpStreamingGenerator` n'appelle `model.forward(inputIDs:)` qu'avec le
+token courant, sans `visionEmbeddings` ni `positionIDs`. La différence est
+donc dans le **contenu** des caches — piste principale : les positions M-RoPE
+3 axes stockées par `Qwen4ExpQSAKVCache.updateIndexer(keys:positions:)` et
+leur usage à chaque pas dans l'indexeur QSA. Non diagnostiqué à ce stade.
+
+Cela explique entièrement les chiffres de Vincent : son tour 1 contenait une
+image, et les tours suivants en héritaient par le cache de conversation.
+
+**Second défaut, corrigé** : une continuation de conversation après une image
+sort en `HTTP 500` sans corps sur le serveur. `Qwen38FlashNextEngineError`
+n'était pas mappé dans `status(for:)` (seul `Qwen38ServerError` l'était) : il
+rend désormais un `400` avec le message. La limitation elle-même (« Flash-Next
+n'accepte une image qu'au premier tour ») reste, elle est connue et voulue ;
+la GUI, qui utilise le chemin conversationnel, n'est pas concernée.

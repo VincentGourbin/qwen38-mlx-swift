@@ -4062,3 +4062,19 @@ meilleure). Défaut de production laissé à `.none` (F7 opt-in), comme
 F1-F6, par prudence — bascule recommandée mais non actée, décision à
 Vincent. Détail complet : `docs/knowledge/log.md` « 2026-09-11 — P8 : le
 MoE ne coûtait pas 25× ».
+
+### P9 — Pénalité image sur le décodage — plan du 2026-09-12
+
+**Le fait** (`log.md` « Une image dans le contexte coûte 2,4× ») : à longueur
+de prompt et de génération égales, 6,88 tok/s avec une image dans le contexte
+contre 16,41 tok/s sans. Permanent : tous les tours suivants en héritent. Ni
+le prefill, ni la mémoire, ni le rendu, ni le seuil QSA ne l'expliquent. La
+boucle de décodage est identique dans les deux cas ; seule diffère la
+**garniture des caches**.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P9.1 | **Localiser** : profil par couche (`--profile-layers`) de 20 pas de décodage, une fois après un prompt image de 973 tokens, une fois après un prompt texte de 906 tokens. Comparer couche par couche : si l'écart se concentre sur les 12 couches `full_attention` (QSA), la piste indexeur/M-RoPE est confirmée ; s'il est uniforme, chercher ailleurs (n-gram : les 950 `<|image_pad|>` identiques changent la distribution des hachages). | tableau ms/couche image vs texte, écart attribué |
+| P9.2 | **Isoler dans QSA** : chronométrer séparément, sur un pas de décodage, l'indexeur (projection, M-RoPE, `makeMask`), l'attention principale, et la mise à jour du cache. Vérifier en particulier si `Qwen4ExpQSAKVCache.updateIndexer` ou `makeMask` fait un travail proportionnel au contexte **et** dépendant du contenu des positions (positions 3 axes de l'image contre horloge texte). | étage dominant identifié, chiffré |
+| P9.3 | **Corriger** ce que P9.1/P9.2 désignent. Hypothèse à vérifier en premier : les positions multimodales stockées empêchent un chemin rapide (par exemple un test de contiguïté, un `min`/`max` recalculé, ou une conversion de dtype par pas). | décodage après image ≥ 80 % du débit texte à contexte égal |
+| P9.4 | **Valider** : rejouer le protocole de bench M1 (image au tour 1, deux tours texte) via le serveur avec `conversation_id`, comparer au tableau ci-dessus ; IDs inchangés sur un prompt texte de référence ; `BENCHMARKS.md`. | 3 tours ≥ 12 tok/s |

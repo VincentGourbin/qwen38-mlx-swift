@@ -565,6 +565,11 @@ public actor Qwen38InferenceServer {
     /// to surface as an empty HTTP 500. Map it to an OpenAI-style JSON error
     /// with a meaningful status instead.
     private static func status(for error: any Error) -> HTTPResponse.Status {
+        // Les refus explicites du moteur Flash-Next (image sur une
+        // continuation, images multiples, image en mode stateless) sont des
+        // erreurs de requête, pas des pannes : sans cela elles sortaient en
+        // 500 sans corps (constaté le 2026-09-12 sur un tour 2 après image).
+        if error is Qwen38FlashNextEngineError { return .badRequest }
         guard let serverError = error as? Qwen38ServerError else { return .internalServerError }
         switch serverError {
         case .modelNotFound: return .notFound
