@@ -1,0 +1,44 @@
+=== level 2 run 1 ===
+--- couche gdn ---
+mémoire couche: 1,63 GB
+ms/pas — médiane 4.54  p10 4.51  p90 4.57  min 4.46  max 5.69
+CPU moyen: 25.0 %   GPU moyen: 46.0 %
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.45  p10 4.37  p90 4.52  min 4.34  max 4.60
+CPU moyen: 38.7 %   GPU moyen: 45.3 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 2,94 GB
+=== level 2 run 2 ===
+--- couche gdn ---
+mémoire couche: 1,63 GB
+ms/pas — médiane 4.55  p10 4.53  p90 4.60  min 4.46  max 5.14
+CPU moyen: 25.4 %   GPU moyen: 46.0 %
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.43  p10 4.36  p90 4.48  min 4.34  max 4.60
+CPU moyen: 38.0 %   GPU moyen: 45.5 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 2,94 GB
+=== level 4 run 1 ===
+--- couche gdn ---
+mémoire couche: 1,63 GB
+ms/pas — médiane 4.54  p10 4.52  p90 4.58  min 4.44  max 5.50
+CPU moyen: 24.7 %   GPU moyen: 46.0 %
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.45  p10 4.37  p90 4.50  min 4.36  max 4.60
+CPU moyen: 38.1 %   GPU moyen: 45.2 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 2,94 GB
+=== level 4 run 2 ===
+--- couche gdn ---
+mémoire couche: 1,63 GB
+ms/pas — médiane 4.54  p10 4.51  p90 4.56  min 4.48  max 5.50
+CPU moyen: 24.9 %   GPU moyen: 46.0 %
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.45  p10 4.40  p90 4.49  min 4.37  max 4.56
+CPU moyen: 38.0 %   GPU moyen: 45.3 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 2,94 GB

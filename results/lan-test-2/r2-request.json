@@ -1,0 +1,11 @@
+{
+  "model": "inexistant",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Test"
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 10
+}

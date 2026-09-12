@@ -1,0 +1,341 @@
+================================================================================
+RAPPORT DE TEST - Serveur d'inférence Qwen3.8-Flash-Next-MLX-e3bit-MTP
+Adresse: http://192.168.1.183:8848
+Date: 2026-09-09
+================================================================================
+
+1. VÉRIFICATIONS PRÉALABLES
+==========================
+
+GET /healthz
+- Code HTTP: 200
+- Statut: running
+- Modèle chargé: true
+- Queue: 0
+- Verdict: ✓ OK
+
+GET /v1/models
+- Code HTTP: 200
+- Modèle trouvé: Qwen3.8-Flash-Next-MLX-e3bit-MTP
+- loaded: true
+- family: qwen4_exp
+- Verdict: ✓ OK
+
+================================================================================
+
+2. TABLEAU SYNTHÉTIQUE DES TESTS
+===============================
+
+| ID Req | Code HTTP | Durée (s) | Tokens In | Tokens Out | Verdict | Détail |
+|--------|-----------|-----------|-----------|------------|---------|--------|
+| R1     | 200       | 13.90     | 57        | 96         | ANOMALIE| content vide |
+| R2     | 404       | 0.02      | 0         | 0          | ✓ OK    | Erreur propre |
+| R3     | 200       | 9.40      | 29        | 64         | ✓ OK    | Streaming MTP |
+| R4     | 200       | 9.10      | 29        | 64         | ✓ OK    | Non-stream |
+| R5.1   | 200       | 7.92      | 22        | 48         | ✓ OK    | Conv. tour 1 |
+| R5.2   | 200       | 8.00      | 19        | 48         | ✓ OK    | Conv. tour 2 |
+| R6     | 200       | 17.04     | 976       | 48         | ✓ OK    | Image |
+
+================================================================================
+
+3. DÉTAILS PAR TEST
+==================
+
+R1 - Défauts serveur (requête minimale sans enable_thinking, sans mtp)
+=====================================================================
+Prompt: "Explique en français qui est le président de la Chine et quel est son rôle."
+HTTP: 200
+Durée: 13.90 secondes
+Temperature: 0
+Max tokens: 96
+Finish reason: length
+
+Métrics:
+- ID: 604BE47F-B097-435F-B6B8-0453C1C622E8
+- Tokens entrée: 57
+- Tokens sortie: 96
+- TTFT: 0.726 secondes
+- Tokens/sec: 8.24
+- MTP: actif (proposé: 59, accepté: 37, taux: 62.7%)
+- Cache réutilisé: false
+
+Reasoning content (100 premiers caractères):
+"The user is asking for information about the President of China and their role.
+The current President of the People"
+
+Content (100 premiers caractères):
+*** VIDE *** ⚠️ ANOMALIE
+
+Verdict: ✗ ANOMALIE CRITIQUE
+Le modèle a produit du reasoning_content mais le content final est vide.
+C'est un "défaut serveur" : le reasoning est là, la réponse ne l'est pas.
+
+---
+
+R2 - Erreur propre (modèle inexistant)
+======================================
+Prompt: "Test" (modèle "inexistant")
+HTTP: 404
+Durée: 0.018 secondes
+
+Réponse JSON:
+{
+  "error": {
+    "type": "invalid_request_error",
+    "message": "Modèle indisponible dans le catalogue local : inexistant."
+  }
+}
+
+Métriques:
+- ID: 451FBD3B-6D31-4320-8665-261CE116C10E
+- Status: failed
+- Message d'erreur bien formé en français
+
+Verdict: ✓ OK
+Gestion d'erreur propre et conforme.
+
+---
+
+R3 - Streaming MTP (stream: true, mtp: true, temperature: 0)
+============================================================
+Prompt: "Explique en français qui est le président de la Chine et quel est son rôle."
+Paramètres: stream: true, mtp: true, enable_thinking: false, temp: 0, max: 64
+HTTP: 200
+Durée: 9.40 secondes
+
+Streaming:
+- Nombre de chunks (data:): 66
+- [DONE]: présent
+- TTFT: 0.902 secondes
+
+Métrics:
+- ID: 9E21FA45-965E-468A-BBB2-67CE560D2EE5
+- Tokens entrée: 29
+- Tokens sortie: 64
+- Tokens/sec: 7.60
+- MTP proposé: 45, accepté: 19, taux: 42.2%
+- Cache réutilisé: false
+
+Texte reconstitué (100 premiers caractères):
+"Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Part"
+
+Verdict: ✓ OK
+Streaming fonctionnel, texte cohérent commence bien par la phrase attendue.
+
+---
+
+R4 - Non-stream sans MTP (stream: false, enable_thinking: false)
+==============================================================
+Prompt: "Explique en français qui est le président de la Chine et quel est son rôle."
+Paramètres: stream: false, enable_thinking: false, temp: 0, max: 64
+HTTP: 200
+Durée: 9.10 secondes
+
+Métrics:
+- ID: 00524BBB-1388-4F41-A491-A8CC73906890
+- Tokens entrée: 29
+- Tokens sortie: 64
+- TTFT: 1.307 secondes
+- Tokens/sec: 8.30
+- MTP proposé: 45, accepté: 19, taux: 42.2%
+- Cache réutilisé: false
+
+Texte (100 premiers caractères):
+"Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Part"
+
+Verdict: ✓ OK
+Texte identique à R3 (streaming), cohérence entre les deux modes confirmée.
+
+---
+
+R5 - Deux tours (conversation_id: "lan-test-2")
+==============================================
+
+Tour 1 - "Quelle est la capitale de l'Australie ?"
+---
+HTTP: 200
+Durée: 7.92 secondes
+Température: 0, Max: 48
+
+Métrics:
+- ID: 31C0889F-9EF6-4B48-BB1C-168542B0772F
+- Tokens entrée: 22
+- Tokens sortie: 48
+- TTFT: 1.205 secondes
+- Tokens/sec: 7.23
+- MTP proposé: 31, accepté: 17, taux: 54.8%
+- Cache réutilisé: false
+
+Texte (150 premiers caractères):
+"La capitale de l'Australie est **Canberra**. Bien que Sydney et Melbourne soient les villes les plus connues et les plus peuplées, Canberra a été choisie comme"
+
+Verdict: ✓ OK - Réponse correcte (Canberra)
+
+Tour 2 - "Et sa population approximative ?"
+---
+HTTP: 200
+Durée: 8.00 secondes
+Température: 0, Max: 48
+
+Métrics:
+- ID: A032BD54-BF15-47A4-A508-83B08060A10C
+- Tokens entrée: 19
+- Tokens sortie: 48
+- TTFT: 1.390 secondes
+- Tokens/sec: 7.29
+- MTP proposé: 30, accepté: 17, taux: 56.7%
+- Cache réutilisé: TRUE ✓ (réutilisation du contexte)
+
+Texte (150 premiers caractères):
+"La population de Canberra est d'environ **400 000 à 450 000 habitants** (selon les estimations récentes, notamment celles de l'ABS - Australian Bureau of"
+
+Verdict: ✓ OK
+Cohérence confirmée : modèle comprend que "sa" = Canberra.
+Cache réutilisé (cacheReused: true), optimisation confirmée.
+
+---
+
+R6 - Image (enable_thinking: false, mtp: false)
+==============================================
+Image: /Users/vincent/Downloads/licensed-image-2.jpeg (249 KB)
+Prompt: "Qui est sur cette image et quel est son rôle ?"
+Paramètres: stream: false, enable_thinking: false, mtp: false, temp: 0, max: 48
+HTTP: 200
+Durée: 17.04 secondes
+
+Métrics:
+- ID: 792976CB-00C8-4FD9-B547-FF12D9D8112A
+- Tokens entrée: 976 (image encodée)
+- Tokens sortie: 48
+- TTFT: 6.826 secondes (plus long dû au traitement image)
+- Tokens/sec: 6.34
+- MTP: indisponible (mtp: false)
+- Cache réutilisé: false
+
+Texte (150 premiers caractères):
+"Sur cette image, on voit **Emmanuel Macron**, le président de la République française. ### Rôle : Il est **le chef de l'État français**, élu au suffrage"
+
+Verdict: ✓ OK
+Identification correcte : Emmanuel Macron, président de la République.
+
+================================================================================
+
+4. ANOMALIES IDENTIFIÉES
+========================
+
+CRITIQUE - R1: Content vide avec reasoning_content non-vide
+-----------------------------------------------------------
+Type: Défaut serveur
+Sévérité: CRITIQUE
+
+Description:
+La requête R1 (minimale, sans enable_thinking, sans mtp) produit :
+- reasoning_content : Non-vide (~200 caractères) ✓
+- content : VIDE ✗
+
+Le modèle a produit du reasoning mais aucun contenu de réponse final.
+
+Cause probable: 
+Selon le contexte du scénario, ce défaut est attendu après les correctifs (R1 vérifie
+les "défauts serveur"). Le problème semble être la non-génération du contenu principal
+après le reasoning avec enable_thinking implicite ou par défaut.
+
+Comparaison:
+- R1 (problématique): content vide
+- R4 (sans enable_thinking explicite): content non-vide ✓
+
+Attente du scénario:
+"Attendu après correctif : reasoning_content court (effort low) ET content non-vide
+commençant par une phrase sur Xi Jinping"
+
+Status: NON ATTEINT - content est vide
+
+Recommandation:
+Vérifier si le serveur applique enable_thinking par défaut en mode chat
+et si les deux flux (reasoning + content) sont tous deux générés.
+
+================================================================================
+
+5. SYNTHÈSE DES CAPACITÉS
+=========================
+
+✓ FONCTIONNALITÉS CONFIRMÉES
+----------------------------
+1. Chat completions standard ✓
+2. Streaming (SSE) ✓
+3. Gestion d'erreurs (404 avec JSON) ✓
+4. MTP (Multi-Token Prediction) ✓
+   - Acceptation: 37-57% selon conditions
+5. Vision/Images ✓
+   - Identification d'objets/personnes
+   - Intégration base64
+6. Conversations multi-tours ✓
+   - conversation_id fonctionnel
+   - Contexte maintenu entre tours
+7. Cache de contexte ✓
+   - cacheReused: true en T2
+8. Métriques détaillées ✓
+   - TTFT, tokens/sec, MTP stats, finishedAt
+
+⚠ PROBLÈMES À INVESTIGUER
+--------------------------
+1. R1 - Content vide quand reasoning_content est généré
+   Impact: CRITIQUE pour inférence utile
+   État: À investiguer avec enable_thinking par défaut
+
+================================================================================
+
+6. PERFORMANCE RÉSUMÉE
+======================
+
+Latences (par catégorie):
+- Requêtes simples (R1, R3, R4): 9-14 secondes
+- Requêtes conversationnelles (R5): 8 secondes
+- Requête image (R6): 17 secondes (+ traitement image)
+
+Débit tokens:
+- Typique: 7-8 tokens/sec
+- Range: 6.3 (image) à 8.3 tokens/sec
+
+TTFT (Time To First Token):
+- R1: 0.726 secondes ✓
+- R3: 0.902 secondes ✓
+- Avec image (R6): 6.826 secondes (normal)
+
+MTP (Multi-Token Prediction):
+- Taux d'acceptation: 42-67%
+- Efficacité: Réduit tokens générés vs proposés
+
+Cache:
+- Réutilisation confirmée (R5.2: cacheReused=true)
+- Optimisation du contexte en conversation
+
+================================================================================
+
+CONCLUSION
+==========
+
+État global du serveur: FONCTIONNEL AVEC ANOMALIE CRITIQUE
+
+Résultats des 6 tests:
+- 5 réussis (R2-R6)
+- 1 critique (R1)
+
+Le serveur fonctionne correctement pour :
+✓ Chat standard et streaming
+✓ Vision (images)
+✓ Gestion d'erreurs
+✓ Conversations multi-tours
+✓ MTP et cache
+✓ Métriques détaillées
+
+Mais présente une anomalie critique :
+✗ R1: content vide quand reasoning est activé par défaut
+
+Le comportement R1 indique possiblement que le serveur active implicitement
+enable_thinking=true, génère le reasoning, mais ne génère pas le content final.
+
+Recommandation: Vérifier la valeur par défaut de enable_thinking et l'ordre
+d'exécution des étapes (reasoning vs content generation).
+
+================================================================================

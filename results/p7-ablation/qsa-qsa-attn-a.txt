@@ -1,0 +1,7 @@
+ablation P7.1 : qsa-attn
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.44  p10 4.41  p90 4.48  min 4.40  max 5.36
+CPU moyen: 27.1 %   GPU moyen: 48.9 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 2,9 GB

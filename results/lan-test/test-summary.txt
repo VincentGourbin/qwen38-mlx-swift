@@ -1,0 +1,77 @@
+================================================================================
+TEST SERVEUR D'INFÉRENCE - RÉSUMÉ EXÉCUTIF
+Qwen3.8-Flash-Next-MLX-e3bit-MTP | 9 septembre 2026
+================================================================================
+
+CONFIGURATION
+Serveur: http://192.168.1.183:8848
+Modèle: Qwen3.8-Flash-Next-MLX-e3bit-MTP
+Famille: qwen4_exp
+État: running
+
+RÉSULTATS GLOBAUX
+Requêtes testées: 8 (T1-T8)
+Réussies: 6 (T1, T2, T5, T6, T7 + T0)
+Anomalies: 3 (T3, T4, T8)
+Code HTTP attendu: 8/8 (100% pour succès, 500 pour T8 au lieu de 4xx)
+
+ANOMALIES PRINCIPALES
+
+1. ANOMALIE CRITIQUE - Thinking implicite (T3, T4)
+   - Requêtes avec enable_thinking:false retournent reasoning_content vide
+   - content field est vide ou non présent
+   - Impact: Réponses non-utilisables
+   - Cause possible: Configuration serveur ou side-effect MTP
+
+2. ANOMALIE MAJEURE - Gestion d'erreur (T8)
+   - HTTP 500 au lieu de 400/422
+   - Response body vide (pas de message d'erreur)
+   - Message d'erreur présent seulement dans /metrics
+
+PERFORMANCES (tokpe/s, TTFT)
+T1: 6.07 tok/s, TTFT=1.52s (OK)
+T2: 7.41 tok/s, TTFT=1.34s (cached, OK)
+T3: 7.07 tok/s, TTFT=2.77s (anomalie content)
+T4: 7.21 tok/s, TTFT=1.39s (anomalie content)
+T5: 6.13 tok/s, TTFT=2.05s (OK, thinking)
+T6: 5.56 tok/s, TTFT=7.31s (image, OK)
+T7: 6.36 tok/s, TTFT=2.01s (sampling, OK)
+
+FONCTIONNALITÉS TESTÉES
+✓ Requêtes simples
+✓ Conversations persistantes (conversation_id)
+✗ Streaming avec MTP (anomalie)
+✗ MTP sans thinking explicite (anomalie)
+✓ Mode thinking (enable_thinking:true)
+✓ Vision (image base64)
+✓ Sampling (temperature, top_p)
+✗ Gestion d'erreur (HTTP 500 empty)
+
+COHERENCE SEMANTIQUE
+Réponses non-anomaliques: cohérentes
+T1: Présentation correcte en 2 phrases
+T2: Résumé pertinent (cohérence conversationnelle)
+T5: Explications historiques exactes (Canberra vs Sydney)
+T6: Reconnaissance d'image correcte (Macron)
+T7: Débute énumération attendue
+
+FICHIERS GÉNÉRÉS
+t0-healthz.json, t0-models.json - Health check
+t1-request.json, t1-response.json - Présentation simple
+t2-request.json, t2-response.json - Conversation
+t3-request.json, t3-response.sse - Streaming MTP
+t4-request.json, t4-response.json - Non-stream MTP:false
+t5-request.json, t5-response.json - Thinking
+t6-request.json, t6-response.json - Image
+t7-request.json, t7-response.json - Sampling
+t8-request.json, t8-response.json - Erreur
+t10-metrics.json - Métriques finales
+
+VERDICT FINAL
+Serveur opérationnel pour cas d'usage standards (T1, T2, T5-T7).
+Anomalies critiques: T3 & T4 (thinking implicite rend streaming/mtp unusable).
+Gestion d'erreur non-standard (T8).
+Cohérence sémantique: Bonne (réponses pertinentes).
+Recommandation: Investiguer cause du thinking implicite avant usage production MTP.
+
+================================================================================

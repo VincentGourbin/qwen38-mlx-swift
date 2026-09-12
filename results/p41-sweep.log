@@ -1,0 +1,128 @@
+=== N=1 run=warmup 22:11:45 ===
+mémoire anonyme        : 10.4 Go
+compresseur (stocké)   : 8.8 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.7 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 2 %
+process qwen38/python  : 4
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 1
+OK : marge mémoire suffisante
+=== done N=1 run=warmup 22:13:02 ===
+=== N=1 run=a 22:13:02 ===
+mémoire anonyme        : 10.1 Go
+compresseur (stocké)   : 8.8 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.4 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 82 %
+process qwen38/python  : 8
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 1
+OK : marge mémoire suffisante
+=== done N=1 run=a 22:14:14 ===
+=== N=1 run=b 22:14:14 ===
+mémoire anonyme        : 10.4 Go
+compresseur (stocké)   : 8.8 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.7 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 85 %
+process qwen38/python  : 8
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 1
+OK : marge mémoire suffisante
+=== done N=1 run=b 22:15:26 ===
+=== N=2 run=a 22:15:26 ===
+mémoire anonyme        : 10.1 Go
+compresseur (stocké)   : 9.1 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.7 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 87 %
+process qwen38/python  : 8
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 1
+OK : marge mémoire suffisante
+=== done N=2 run=a 22:16:37 ===
+=== N=2 run=b 22:16:37 ===
+mémoire anonyme        : 9.6 Go
+compresseur (stocké)   : 9.5 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.6 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 91 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 1
+OK : marge mémoire suffisante
+=== done N=2 run=b 22:17:47 ===
+=== N=4 run=a 22:17:47 ===
+mémoire anonyme        : 9.6 Go
+compresseur (stocké)   : 9.5 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.6 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 92 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=4 run=a 22:18:57 ===
+=== N=4 run=b 22:18:57 ===
+mémoire anonyme        : 9.3 Go
+compresseur (stocké)   : 9.4 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.2 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 95 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=4 run=b 22:20:07 ===
+=== N=8 run=a 22:20:07 ===
+mémoire anonyme        : 9.1 Go
+compresseur (stocké)   : 9.4 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.0 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 94 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=8 run=a 22:21:16 ===
+=== N=8 run=b 22:21:16 ===
+mémoire anonyme        : 9.7 Go
+compresseur (stocké)   : 9.4 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.6 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 95 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=8 run=b 22:22:26 ===
+=== N=12 run=a 22:22:26 ===
+mémoire anonyme        : 9.1 Go
+compresseur (stocké)   : 9.4 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.0 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 0 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=12 run=a 22:23:35 ===
+=== N=12 run=b 22:23:35 ===
+mémoire anonyme        : 9.7 Go
+compresseur (stocké)   : 9.4 Go
+swap utilisé           : 0.5 Go
+total à évincer        : 19.6 Go  (seuil 35 Go)
+iogpu.wired_limit_mb   : 0  (0 = défaut ≈ 72 Go de working set)
+GPU utilisation        : 97 %
+process qwen38/python  : 12
+alimentation           : AC Power · veille système après 1 min · assertions anti-veille : 0
+AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)
+OK : marge mémoire suffisante
+=== done N=12 run=b 22:24:44 ===
+SWEEP COMPLETE 22:24:44

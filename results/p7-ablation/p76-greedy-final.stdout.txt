@@ -1,0 +1,10 @@
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501, 4372, 41196, 67763, 85041, 3717, 181876, 8358, 3717, 179342, 47561, 68, 215309, 11, 501, 183435, 401, 1147, 9364, 198070, 175030]
+decoded: "Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire centrale"
+TTFT: 38.488s
+prefill: 38.487s
+decode: 4.864s
+couches: 1536 visites · load cumulé 36.352s · forward cumulé 6.875s
+MLX mémoire active: 56,18 GB
+P6.2 PLE lookup : 32 appels · 96 MLXArray construits · 32 dequantize · lecture hôte cumulée 0.4305s
+MLX mémoire peak: 56,99 GB

@@ -1,0 +1,7 @@
+experts (switch_mlp): bits=3 group_size=64
+--- couche gdn ---
+mémoire couche: 1,15 GB
+ms/pas — médiane 2.72  p10 2.66  p90 2.81  min 2.62  max 3.08
+CPU moyen: 41.3 %   GPU moyen: 48.6 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 1,83 GB

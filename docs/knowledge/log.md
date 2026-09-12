@@ -4656,3 +4656,38 @@ Qualité et débit conformes ; le trou de validation de P10.5 est comblé.
 **Les scripts qui référencent `~/Downloads/licensed-image-2.jpeg`
 (`Scripts/h6-qualification.sh`) doivent basculer sur
 `results/assets/ref-image.jpeg`.**
+
+---
+
+## 2026-09-12 — ménage du dépôt (avant le plan révisé §P11)
+
+Le dossier de travail avait accumulé 48 Go, dont l'essentiel n'était ni du
+code ni de la preuve.
+
+| Poste | Avant | Après | Geste |
+|---|---:|---:|---|
+| `.xcodebuild-*` obsolètes (14 répertoires) | 29,3 Go | 0 | supprimés |
+| `.xcodebuild` + `.xcodebuild-tests` (utilisés par `Scripts/*.sh`) | 8,3 Go | 8,3 Go | conservés |
+| Traces Chrome du profileur, non citées par la doc (95 fichiers) | 129 Mo | 0 | supprimées |
+| Traces Chrome citées par `log.md` / `PLAN.md` (10 fichiers) | 86 Mo | 86 Mo | conservées |
+| Bundles Metal System Trace `p4-mst-*.trace` | 225 Mo | 225 Mo | conservés (seule preuve MST de P4) |
+| Racine : `default.profraw`, 12 `*.trace.json`, `.xcodebuild-tests.log` | 18 Mo | 0 | supprimés |
+| Preuves textuelles non versionnées (`.tsv`, `.jsonl`, `.stdout.txt`) | 3,6 Mo | 3,6 Mo | **commitées** (200 fichiers) |
+
+Total du dossier projet : **48 Go → 15 Go**. `git status` est propre.
+
+`.gitignore` gagne trois règles pour que les sorties de profilage cessent de
+s'accumuler dans `results/` — elles sont régénérables, et les conclusions
+qu'on en tire vivent ici :
+
+```
+results/**/*.trace.json
+results/**/*.trace/
+results/**/*.xctrace.log
+```
+
+Deux points restent à la charge de la machine, pas du dépôt : les 29 Go
+libérés ne sont pas encore rendus par APFS (instantanés locaux Time Machine),
+et la mise en veille sur secteur n'est toujours pas corrigée dans le profil
+d'alimentation (cf. P1, tous les runs restent enveloppés dans
+`caffeinate -dimsu`).

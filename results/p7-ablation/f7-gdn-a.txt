@@ -1,0 +1,6 @@
+--- couche gdn ---
+mémoire couche: 1,63 GB
+ms/pas — médiane 4.49  p10 4.47  p90 4.54  min 4.37  max 5.45
+CPU moyen: 21.6 %   GPU moyen: 49.3 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 4,22 GB

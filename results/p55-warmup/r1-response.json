@@ -1,0 +1,1 @@
+{"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","created":1789025950,"id":"chatcmpl-06DD50C0-F81E-478A-8240-730E0B02B512","choices":[{"index":0,"message":{"content":"Bonjour !","role":"assistant"},"finish_reason":"stop"}],"object":"chat.completion"}

@@ -1,0 +1,1 @@
+{"created":1788949942,"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","choices":[{"index":0,"message":{"role":"assistant","content":"Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois"},"finish_reason":"length"}],"id":"chatcmpl-AD3769A2-2143-432E-B6B0-F241B5C9A537","object":"chat.completion"}

@@ -1,0 +1,267 @@
+2026-09-10T10:26:42+0200 info Qwen38Inference: [HummingbirdCore] Server started and listening on 0.0.0.0:8850
+2026-09-10T10:48:05+0200 error Qwen38Inference: [HummingbirdCore] Waiting on child channel: CancellationError()
+Profilage de session actif (Release) → results/p56/serve.trace.json
+Chargement du modèle…
+Warm-up Flash-Next (couches résidentes)…
+Qwen3.8 écoute sur http://0.0.0.0:8850
+POST /v1/chat/completions · GET /v1/models · GET /metrics
+Arrêt du serveur…
+
+╭──────────────────────────────────────────────────────────────────╮
+│  QWEN3.8 SERVE                                                   │
+├──────────────────────────────────────────────────────────────────┤
+  model: Qwen3.8-Flash-Next-MLX-e3bit-MTP  port: 8850
+  Device: applegpu_g15s  RAM: 96GB  Build: Release  Power: AC Power
+  Sampler: 16 ms, ioReportResidency, 61022 samples
+  pmset: disksleep=10 displaysleep=20 powernap=1 sleep=1 standby=1  (idle sleep held off)
+
+  PHASE TIMINGS                                GPU%   p50   CPU%
+  ──────────────────────────────────────────────────────────────────
+  Prefill                  923.4ms    0.0%          79%  100%  94.6%
+  Prefill                   2.81s     0.1%          50%   12%  87.2%
+  Prefill                   2.07s     0.1%          49%   22%  94.1%
+  Prefill                   2.19s     0.1%          55%   57%  88.1%
+  Prefill                   2.33s     0.1%          52%   56%  96.7%
+  Prefill                   2.31s     0.1%          52%   47%  97.0%
+  Prefill                   2.25s     0.1%          68%   72%  99.6%
+  Prefill                   2.18s     0.1%          50%   18%  99.2%
+  Prefill                   2.13s     0.1%          46%   10%  93.7%
+  Prefill                   1.59s     0.1%          50%   21%  81.5%
+  Prefill                   2.45s     0.1%          51%   18%  99.1%
+  Prefill                   2.05s     0.1%          43%   10%  94.2%
+  Prefill                   2.36s     0.1%          50%   11% 100.9%
+  Prefill                   2.73s     0.1%          56%   97%  89.4%
+  Prefill                   2.67s     0.1%          57%  100%  78.0%
+  Prefill                   2.57s     0.1%          56%   96%  83.9%
+  Prefill                   2.75s     0.1%          57%  100%  77.2%
+  Prefill                   2.26s     0.1%          51%   41%  80.1%
+  Prefill                   2.53s     0.1%          73%  100%  99.5%
+  Prefill                   2.41s     0.1%          56%  100%  83.4%
+  Prefill                   2.54s     0.1%          55%  100%  76.9%
+  Prefill                   2.32s     0.1%          53%   85%  76.8%
+  Prefill                   2.15s     0.1%          54%   86%  90.4%
+  Prefill                   2.12s     0.1%          53%   48%  80.8%
+  Prefill                   2.34s     0.1%          55%   88%  84.7%
+  Prefill                   2.30s     0.1%          56%   86%  91.8%
+  Prefill                   2.51s     0.1%          55%   99%  89.1%
+  Prefill                   2.24s     0.1%          53%   59%  82.7%
+  Prefill                   2.34s     0.1%          54%   59%  88.5%
+  Prefill                   2.35s     0.1%          56%   84%  90.1%
+  Prefill                   2.42s     0.1%          58%   97%  91.8%
+  Prefill                   2.07s     0.1%          53%   59%  92.1%
+  Prefill                   2.21s     0.1%          55%   81%  94.4%
+  Prefill                   2.08s     0.1%          57%   90%  93.4%
+  Prefill                   2.11s     0.1%          58%   88%  94.7%
+  Prefill                   1.72s     0.1%          54%   74%  89.2%
+  Prefill                   1.48s     0.1%          55%   71%  80.3%
+  Prefill                   2.26s     0.1%          58%   90%  88.4%
+  Prefill                   2.16s     0.1%          57%   88%  91.9%
+  Prefill                   2.27s     0.1%          58%   92%  87.4%
+  Prefill                   2.53s     0.1%          58%   91%  89.5%
+  Prefill                   1.87s     0.1%          57%   91%  92.9%
+  Prefill                   1.05s     0.0%          51%   39%  62.0%
+  Prefill                   2.12s     0.1%          56%   88%  90.7%
+  Prefill                   1.88s     0.1%          53%   87%  91.9%
+  Prefill                   2.55s     0.1%          59%   96%  88.7%
+  Prefill                   2.22s     0.1%          55%   68%  93.5%
+  Prefill                   1.77s     0.1%          51%   35%  87.3%
+  Prefill                   1.38s     0.1%          50%   24%  72.6%
+  Prefill                   1.23s     0.0%          49%   16%  70.6%
+  Prefill                   2.20s     0.1%          54%   71%  96.2%
+  Prefill                   2.16s     0.1%          53%   67%  96.8%
+  Prefill                   2.15s     0.1%          55%   85%  97.9%
+  Prefill                   2.26s     0.1%          54%   71%  89.1%
+  Prefill                   1.74s     0.1%          52%   36%  85.9%
+  Prefill                   2.10s     0.1%          56%   86%  96.2%
+  Prefill                   2.57s     0.1%          59%   84%  85.5%
+  Prefill                   2.09s     0.1%          53%   80%  79.3%
+  Prefill                   2.46s     0.1%          57%   78%  88.0%
+  Prefill                   2.00s     0.1%          54%   60%  82.7%
+  Prefill                   2.63s     0.1%          58%   86%  87.2%
+  Prefill                   1.96s     0.1%          57%   74%  89.9%
+  Prefill                   1.68s     0.1%          54%   86%  85.2%
+  Prefill                   1.18s     0.0%          51%   44%  65.2%
+  Prefill                   1.99s     0.1%          51%   33%  95.5%
+  Prefill                   1.10s     0.0%          52%   21%  61.7%
+  Prefill                   1.39s     0.1%          55%   88%  70.8%
+  Prefill                  988.3ms    0.0%          54%   73%  61.0%
+  Prefill                  837.7ms    0.0%          59%  100%  58.8%
+  Prefill                   2.01s     0.1%          58%   91%  94.7%
+  Prefill                  817.3ms    0.0%          59%  100%  59.7%
+  Prefill                  758.3ms    0.0%          62%  100%  60.5%
+  Prefill                  831.1ms    0.0%          59%  100%  57.7%
+  Prefill                  782.0ms    0.0%          59%  100%  59.6%
+  Prefill                   1.81s     0.1%          53%   55%  92.1%
+  Prefill                   2.65s     0.1%          61%   98%  86.3%
+  Generation               17.97s     0.7%          84%  100%  42.9%
+  Generation               15.07s     0.6%          88%  100%  46.6%
+  Generation               19.18s     0.8%          84%  100%  43.4%
+  Generation               19.38s     0.8%          86%  100%  43.8%
+  Generation               18.90s     0.8%          87%  100%  44.1%
+  Generation               16.29s     0.7%          89%  100%  44.4%
+  Generation               16.85s     0.7%          87%  100%  43.5%
+  Generation               16.97s     0.7%          89%  100%  44.3%
+  Generation                8.10s     0.3%          88%  100%  44.5%
+  Generation               15.67s     0.6%          89%  100%  44.5%
+  Generation               14.47s     0.6%          88%  100%  44.1%
+  Generation               16.88s     0.7%          88%  100%  43.9%
+  Generation               18.87s     0.8%          90%  100%  44.5%
+  Generation               19.74s     0.8%          89%  100%  43.5%
+  Generation               21.12s     0.9%          90%  100%  41.2%
+  Generation               23.12s     0.9%          89%  100%  41.1%
+  Generation               20.03s     0.8%          90%  100%  41.2%
+  Generation               19.68s     0.8%          89%  100%  48.2%
+  Generation               18.72s     0.8%          87%  100%  55.0%
+  Generation               20.32s     0.8%          88%  100%  52.9%
+  Generation               18.58s     0.8%          88%  100%  53.9%
+  Generation               14.59s     0.6%          87%  100%  53.7%
+  Generation               14.38s     0.6%          89%  100%  53.1%
+  Generation               17.09s     0.7%          89%  100%  52.5%
+  Generation               14.22s     0.6%          88%  100%  53.8%
+  Generation               19.11s     0.8%          90%  100%  53.1%
+  Generation               17.24s     0.7%          90%  100%  53.8%
+  Generation               17.92s     0.7%          89%  100%  56.2%
+  Generation               13.50s     0.5%          89%  100%  53.5%
+  Generation               14.86s     0.6%          89%  100%  53.5%
+  Generation               12.58s     0.5%          90%  100%  54.5%
+  Generation               12.90s     0.5%          88%  100%  53.7%
+  Generation               10.51s     0.4%          89%  100%  54.5%
+  Generation               10.98s     0.4%          88%  100%  54.8%
+  Generation                9.90s     0.4%          90%  100%  55.7%
+  Generation                8.81s     0.4%          90%  100%  56.3%
+  Generation               12.61s     0.5%          89%  100%  54.5%
+  Generation               11.38s     0.5%          92%  100%  55.6%
+  Generation               11.90s     0.5%          88%  100%  54.4%
+  Generation               14.96s     0.6%          91%  100%  55.5%
+  Generation               10.23s     0.4%          89%  100%  55.2%
+  Generation                6.94s     0.3%          90%  100%  54.9%
+  Generation               11.98s     0.5%          88%  100%  54.8%
+  Generation               11.56s     0.5%          89%  100%  54.1%
+  Generation               16.23s     0.7%          88%  100%  55.5%
+  Generation               12.33s     0.5%          90%  100%  55.9%
+  Generation               11.28s     0.5%          89%  100%  54.1%
+  Generation                8.96s     0.4%          91%  100%  56.7%
+  Generation                8.48s     0.3%          91%  100%  55.9%
+  Generation               12.84s     0.5%          89%  100%  55.6%
+  Generation               15.19s     0.6%          90%  100%  54.6%
+  Generation               13.71s     0.6%          89%  100%  54.2%
+  Generation               16.28s     0.7%          90%  100%  54.0%
+  Generation               12.42s     0.5%          89%  100%  53.4%
+  Generation               13.00s     0.5%          90%  100%  53.6%
+  Generation               17.81s     0.7%          91%  100%  52.5%
+  Generation               15.71s     0.6%          91%  100%  55.9%
+  Generation               15.66s     0.6%          90%  100%  51.2%
+  Generation               13.66s     0.6%          90%  100%  52.1%
+  Generation               18.77s     0.8%          92%  100%  53.7%
+  Generation               12.85s     0.5%          91%  100%  57.1%
+  Generation               11.93s     0.5%          89%  100%  53.7%
+  Generation                8.35s     0.3%          93%  100%  56.8%
+  Generation               13.52s     0.5%          93%  100%  56.1%
+  Generation                7.89s     0.3%          92%  100%  56.7%
+  Generation                9.41s     0.4%          94%  100%  55.6%
+  Generation                6.53s     0.3%          92%  100%  56.8%
+  Generation                4.72s     0.2%          94%  100%  58.3%
+  Generation               11.38s     0.5%          89%  100%  55.1%
+  Generation                4.60s     0.2%          95%  100%  56.2%
+  Generation                4.23s     0.2%          96%  100%  62.9%
+  Generation                4.50s     0.2%          93%  100%  55.6%
+  Generation                4.19s     0.2%          94%  100%  55.7%
+  Generation               12.26s     0.5%          87%  100%  59.5%
+  Generation               15.80s     0.6%          89%  100%  55.9%
+  Generation               15.72s     0.6%          92%  100%  59.3%
+  Chargement                1.31s     0.1%           7%    9%  58.4%
+  Warm-up                1m 08.3s    2.8%          10%   11%  20.8%
+  Requête 1                18.89s     0.8%          84%  100%  45.5%
+  Requête 2                17.88s     0.7%          82%  100%  53.0%
+  Requête 3                21.25s     0.9%          81%  100%  48.3%
+  Requête 4                21.56s     0.9%          82%  100%  48.3%
+  Requête 5                21.23s     0.9%          83%  100%  49.9%
+  Requête 6                18.61s     0.8%          84%  100%  51.0%
+  Requête 7                19.10s     0.8%          84%  100%  50.2%
+  Requête 8                19.15s     0.8%          84%  100%  50.6%
+  Requête 9                10.24s     0.4%          79%  100%  54.8%
+  Requête 10               17.26s     0.7%          85%  100%  47.9%
+  Requête 11               16.92s     0.7%          83%  100%  52.0%
+  Requête 12               18.93s     0.8%          83%  100%  49.3%
+  Requête 13               21.23s     0.9%          86%  100%  50.8%
+  Requête 14               22.47s     0.9%          85%  100%  49.1%
+  Requête 15               23.80s     1.0%          86%  100%  45.4%
+  Requête 16               25.70s     1.0%          86%  100%  45.4%
+  Requête 17               22.79s     0.9%          86%  100%  45.6%
+  Requête 18               21.95s     0.9%          85%  100%  51.5%
+  Requête 19               21.25s     0.9%          85%  100%  60.3%
+  Requête 20               22.77s     0.9%          85%  100%  56.1%
+  Requête 21               21.15s     0.9%          84%  100%  56.7%
+  Requête 22               16.91s     0.7%          83%  100%  56.9%
+  Requête 23               16.53s     0.7%          84%  100%  57.9%
+  Requête 24               19.22s     0.8%          85%  100%  55.6%
+  Requête 25               16.56s     0.7%          83%  100%  58.1%
+  Requête 26               21.42s     0.9%          86%  100%  57.3%
+  Requête 27               19.75s     0.8%          86%  100%  58.3%
+  Requête 28               20.17s     0.8%          85%  100%  59.2%
+  Requête 29               15.85s     0.6%          84%  100%  58.7%
+  Requête 30               17.22s     0.7%          84%  100%  58.5%
+  Requête 31               15.00s     0.6%          85%  100%  60.5%
+  Requête 32               14.97s     0.6%          83%  100%  59.0%
+  Requête 33               12.72s     0.5%          83%  100%  61.4%
+  Requête 34               13.06s     0.5%          83%  100%  60.9%
+  Requête 35               12.02s     0.5%          85%  100%  62.6%
+  Requête 36               10.53s     0.4%          84%  100%  61.6%
+  Requête 37               14.09s     0.6%          86%  100%  57.3%
+  Requête 38               13.65s     0.6%          86%  100%  61.0%
+  Requête 39               14.06s     0.6%          83%  100%  60.1%
+  Requête 40               17.24s     0.7%          87%  100%  59.7%
+  Requête 41               12.76s     0.5%          83%  100%  62.0%
+  Requête 42                8.82s     0.4%          83%  100%  63.0%
+  Requête 43               13.03s     0.5%          85%  100%  55.3%
+  Requête 44               13.69s     0.6%          84%  100%  59.7%
+  Requête 45               18.11s     0.7%          85%  100%  59.2%
+  Requête 46               14.88s     0.6%          85%  100%  61.5%
+  Requête 47               13.50s     0.5%          84%  100%  60.6%
+  Requête 48               10.74s     0.4%          85%  100%  61.7%
+  Requête 49                9.86s     0.4%          85%  100%  58.2%
+  Requête 50               14.07s     0.6%          86%  100%  56.9%
+  Requête 51               17.39s     0.7%          85%  100%  59.9%
+  Requête 52               15.87s     0.6%          84%  100%  60.0%
+  Requête 53               18.44s     0.7%          86%  100%  59.1%
+  Requête 54               14.69s     0.6%          84%  100%  58.9%
+  Requête 55               14.74s     0.6%          85%  100%  57.4%
+  Requête 56               19.91s     0.8%          87%  100%  57.1%
+  Requête 57               18.28s     0.7%          86%  100%  60.0%
+  Requête 58               17.76s     0.7%          85%  100%  54.5%
+  Requête 59               16.12s     0.7%          85%  100%  57.6%
+  Requête 60               20.77s     0.8%          88%  100%  56.5%
+  Requête 61               15.48s     0.6%          86%  100%  62.2%
+  Requête 62               13.89s     0.6%          85%  100%  58.8%
+  Requête 63               10.03s     0.4%          87%  100%  61.5%
+  Requête 64               14.70s     0.6%          89%  100%  56.8%
+  Requête 65                9.88s     0.4%          84%  100%  64.6%
+  Requête 66               10.51s     0.4%          90%  100%  56.3%
+  Requête 67                7.92s     0.3%          86%  100%  59.3%
+  Requête 68                5.71s     0.2%          87%  100%  58.8%
+  Requête 69               12.22s     0.5%          87%  100%  55.3%
+  Requête 70                6.62s     0.3%          84%  100%  67.9%
+  Requête 71                5.05s     0.2%          90%  100%  62.3%
+  Requête 72                5.26s     0.2%          89%  100%  56.3%
+  Requête 73                5.02s     0.2%          88%  100%  56.0%
+  Requête 74               13.05s     0.5%          85%  100%  59.5%
+  Requête 75               17.61s     0.7%          85%  100%  59.6%
+  Requête 76               18.37s     0.7%          88%  100%  63.2%
+  ──────────────────────────────────────────────────────────────────
+  TOTAL                  41m 09.0s  100.0%
+
+  MEMORY
+  ──────────────────────────────────────────────────────────────────
+  Peak MLX Active: 55269.1 MB  at 21:14.122
+  Peak Process: 57579.4 MB  at 07:18.474
+
+  System-wide (peaks):
+    Anonymous:    71162.1 MB    Wired:  60780.2 MB
+    File-backed:  41418.7 MB    Speculative: 24135.8 MB
+    Compressor:     813.5 MB occupied, holding 6668.3 MB (8.20x)
+    Swap used:     2627.1 MB
+    Lowest kern.memorystatus_level: 36
+
+╰──────────────────────────────────────────────────────────────────╯
+
+trace : results/p56/serve.trace.json

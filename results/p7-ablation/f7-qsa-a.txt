@@ -1,0 +1,6 @@
+--- couche qsa ---
+mémoire couche: 1,62 GB
+ms/pas — médiane 4.35  p10 4.31  p90 4.45  min 4.29  max 5.55
+CPU moyen: 38.3 %   GPU moyen: 48.8 %
+MLX mémoire active: 16 bytes
+MLX mémoire peak: 3,98 GB

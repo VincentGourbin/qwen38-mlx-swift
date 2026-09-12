@@ -1,0 +1,20 @@
+=== tour 1 ===
+Le président de la
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147]
+TTFT: 63.301s
+prefill: 63.300s
+decode: 0.741s
+couches: 192 visites · load cumulé 63.060s
+P4.2 fin de token (cumulé) : lm_head 0.0095s · sampler.sample 0.0000s · .item() 0.0013s
+=== tour 2 ===
+Le président de la
+prompt tokens: 20
+generated ids: [2229, 85648, 401, 1147]
+TTFT: 0.602s
+prefill: 0.602s
+decode: 0.409s
+couches: 192 visites · load cumulé 0.000s
+P4.2 fin de token (cumulé) : lm_head 0.0087s · sampler.sample 0.0000s · .item() 0.0011s
+MLX mémoire active: 56,18 GB
+MLX mémoire peak: 56,99 GB

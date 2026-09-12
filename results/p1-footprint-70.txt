@@ -1,0 +1,42 @@
+======================================================================
+qwen38 [2248]: 64-bit    Footprint: 71 GB (16384 bytes per page)
+======================================================================
+
+  Dirty      Clean  Reclaimable    Regions    Category
+    ---        ---          ---        ---    ---
+  71 GB        0 B      2352 KB       2566    IOAccelerator (graphics)
+ 120 MB        0 B          0 B         15    Owned physical footprint (unmapped) (graphics)
+  65 MB        0 B          0 B          5    MALLOC_LARGE
+  55 MB        0 B        19 MB         27    MALLOC_SMALL
+  45 MB        0 B          0 B          1    page table
+1482 KB     736 KB          0 B        946    __DATA
+ 912 KB        0 B          0 B         10    MALLOC metadata
+ 825 KB        0 B          0 B        854    __DATA_DIRTY
+ 640 KB        0 B          0 B         14    IOAccelerator
+ 432 KB        0 B          0 B         28    stack
+ 272 KB        0 B          0 B          1    MALLOC_TINY
+ 208 KB        0 B          0 B         15    untagged (VM_ALLOCATE)
+ 191 KB        0 B          0 B       2479    unused dyld shared cache area
+ 160 KB     784 KB          0 B       1003    __DATA_CONST
+ 112 KB        0 B          0 B        996    __AUTH_CONST
+ 112 KB        0 B          0 B          2    __TPRO_CONST
+  94 KB        0 B          0 B        614    __AUTH
+  64 KB        0 B          0 B          4    IOKit
+  32 KB        0 B          0 B          1    Activity Tracing
+  32 KB        0 B          0 B          1    tag 22
+  16 KB        0 B          0 B          1    os_alloc_once
+  16 KB        0 B          0 B          1    MALLOC_NANO
+    0 B      29 MB          0 B         15    mapped file
+    0 B      17 MB          0 B          4    __LINKEDIT
+    0 B    9968 KB          0 B       1027    __TEXT
+    0 B        0 B          0 B          1    __CTF
+    0 B        0 B          0 B          1    __LLVM_COV
+    0 B        0 B          0 B          1    __FONT_DATA
+    0 B        0 B          0 B          1    IOSurface
+    ---        ---          ---        ---    ---
+  71 GB      57 MB        21 MB      10636    TOTAL
+
+Auxiliary data:
+    phys_footprint: 71 GB
+    phys_footprint_peak: 71 GB
+

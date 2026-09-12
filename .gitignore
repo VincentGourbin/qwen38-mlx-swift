@@ -11,6 +11,10 @@ DerivedData/
 Vendor/mlx-swift-lm/
 *.trace.json
 results/*.trace.json
+# Sorties de profilage régénérables (P0-P9) — les conclusions sont dans docs/knowledge/log.md
+results/**/*.trace.json
+results/**/*.trace/
+results/**/*.xctrace.log
 
 Scripts/hf-cache/
 venv617/

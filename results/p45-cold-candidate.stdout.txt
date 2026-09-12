@@ -1,0 +1,12 @@
+=== tour 1 ===
+Le cassoulet toulousain est bien plus qu'un simple plat de cuisine ; il est une institution culturelle, un monument gastronomique et, pour les
+prompt tokens: 46
+generated ids: [2229, 42754, 282, 1112, 259, 10644, 757, 456, 1725, 13958, 5346, 893, 21372, 4145, 43488, 401, 33847, 2502, 3687, 1725, 5992, 14467, 219223, 11, 632, 35674, 183887, 2295, 1778, 11, 4755, 3424]
+TTFT: 64.507s
+prefill: 64.506s
+decode: 5.256s
+couches: 1536 visites · load cumulé 63.127s
+P4.2 fin de token (cumulé) : lm_head 0.0923s · sampler.sample 0.0001s · .item() 0.0086s
+MLX mémoire active: 56,18 GB
+MLX mémoire peak: 57,03 GB
+P4.5 n-gram : 3696 hits · 3432 misses · miss cumulé 0.0000s · moyenne/miss 0.00000s

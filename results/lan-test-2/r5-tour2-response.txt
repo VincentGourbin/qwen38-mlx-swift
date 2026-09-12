@@ -1,0 +1,2 @@
+{"object":"chat.completion","created":1788990462,"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","id":"chatcmpl-A032BD54-BF15-47A4-A508-83B08060A10C","choices":[{"message":{"role":"assistant","content":"La population de Canberra est d'environ **400 000 à 450 000 habitants** (selon les estimations récentes, notamment celles de l'ABS - Australian Bureau of Statistics)."},"index":0,"finish_reason":"length"}]}
+HTTP_CODE: 200
