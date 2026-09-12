@@ -146,8 +146,12 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
 
     /// P7.1: which sub-block, if any, `callAsFunction` short-circuits for
     /// `flash-layer-bench --ablate`. `.none` everywhere in production —
-    /// see `Qwen4ExpLayerBenchAblation`.
-    public let ablation: Qwen4ExpLayerBenchAblation
+    /// see `Qwen4ExpLayerBenchAblation`. P11.2 : mutable — comme `topK`,
+    /// c'est un drapeau qui ne dimensionne aucun tenseur (chaque branche
+    /// ablatée construit son placeholder à la forme de `x` au moment de
+    /// l'appel), donc le changer sur une instance déjà résidente ne touche
+    /// à aucun poids — voir `setAblation`.
+    public private(set) var ablation: Qwen4ExpLayerBenchAblation
 
     /// P8.1: non-nil only under `flash-layer-bench --moe-stages` — see
     /// `Qwen4ExpMoEStageProfiler`.
@@ -347,5 +351,12 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
             throw Qwen4ExpRoutedExpertCountError.outOfBounds(requested: count, numExperts: numExperts)
         }
         topK = count
+    }
+
+    /// P11.2 : change `ablation` sur une instance déjà construite (couche
+    /// résidente ou non), sans recharger aucun poids — voir la doc de la
+    /// propriété.
+    public func setAblation(_ new: Qwen4ExpLayerBenchAblation) {
+        ablation = new
     }
 }

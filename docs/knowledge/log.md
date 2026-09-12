@@ -4852,3 +4852,79 @@ ininterprétable sous contention : la mémoire anonyme y oscille de 60 Go en
 réglage est conservé, mais son usage bascule vers P11.5 : sous déchargement
 disque, où les octets *sont* la contrainte, K=5 divise par deux les entrées-
 sorties pour 0,141 nat. C'est là qu'il faudra le ressortir.
+
+---
+
+## 2026-09-12 (nuit) — P11.4 : le plafond du décodage spéculatif, et le chiffre qui manque
+
+Mesures faites dans la foulée de P11.1, même protocole (serveur chaud, tours
+entrelacés, prompt de référence, greedy, 96 tokens).
+
+### MTP contre greedy, remesuré proprement
+
+| | tok/s | ms/token |
+|---|---:|---:|
+| greedy | 21,01 | 47,61 |
+| MTP | 19,72 | 50,72 |
+
+**MTP = 0,939× le greedy**, acceptation **48,4 %** (31 acceptés sur 64
+proposés, relevé dans `/metrics`). Plus serré que les 0,81-0,86× historiques,
+même conclusion : le MTP coûte plus qu'il ne rapporte.
+
+96 tokens en 65 pas ⇒ **75,0 ms par pas de vérification**.
+
+### Coût d'un forward selon le nombre de tokens qu'il traite
+
+Mesuré par le TTFT du serveur sur des prompts uniques (jamais de cache de
+préfixe), 4 tours :
+
+| tokens de prompt | TTFT médian | ms/token | marginal sur le point précédent |
+|---:|---:|---:|---:|
+| 25 | 720 ms | 28,80 | (point froid, écarté) |
+| 30 | 484 ms | 16,13 | — |
+| 45 | 747 ms | 16,59 | 17,5 |
+| 81 | 1 309 ms | 16,15 | 15,6 |
+| 152 | 2 096 ms | 13,79 | 11,1 |
+| 342 | 3 218 ms | 9,41 | 5,9 |
+| 700 | 6 143 ms | 8,78 | 8,2 |
+| 1 492 | 11 797 ms | 7,91 | 7,1 |
+
+**Le coût marginal d'un token supplémentaire dans un forward groupé n'est pas
+constant** : ~16 ms par token à N petit, ~7,7 ms à N grand. À comparer aux
+**47,6 ms** d'un token décodé seul. Grouper vaut donc entre 3× et 6× selon le
+régime — pas 50×.
+
+### Ce que ça donne comme plafond, et pourquoi c'est indécidable en l'état
+
+Avec un **drafter gratuit** et 48,4 % d'acceptation :
+
+| brouillon | plafond si marginal = 7,74 ms | plafond si marginal = 16 ms |
+|---:|---:|---:|
+| 1 token | **1,28×** | **1,11×** |
+| 2 tokens | **1,30×** | 1,03× |
+| 3 tokens | 1,23× | 0,91× |
+| 4 tokens | 1,14× | 0,80× |
+
+Et le drafter actuel coûte, par soustraction sur les 75,0 ms du pas :
+**19,6 ms** (41 % d'un forward complet) dans la première hypothèse, **11,4 ms**
+(24 %) dans la seconde. Pour une seule couche d'attention pleine contre 48
+couches côté cible : c'est du coût fixe, pas du calcul.
+
+**Le sort de P11.4 tient donc à un seul nombre que l'instrumentation actuelle
+ne sait pas isoler** : le coût d'un forward sur N ∈ {1, 2, 4, 8} tokens.
+Le TTFT ne convient pas — il porte ~250 ms de coût fixe de requête (HTTP,
+rendu du gabarit, mise en place des caches), soit cinq fois le forward
+lui-même. Il faut une sonde qui chronomètre le forward seul.
+
+- Si le marginal à petit N vaut ~8 ms, le plafond est 1,30× et il faut
+  ramener le drafter sous ~5 ms pour en récupérer l'essentiel. Ça vaut le
+  chantier.
+- S'il vaut ~16 ms, le plafond est 1,11× même avec un drafter gratuit, et
+  **le MTP est condamné** : on l'écrit et on ferme.
+
+### Tâche qui en découle
+
+**P11.4a — sonde de coût de forward.** Chronométrer le forward du modèle
+réel sur N ∈ {1, 2, 4, 8, 16, 32} tokens, hors serveur, hors tokenisation,
+hors échantillonnage : `eval()` bloquant, médiane sur 50 pas après warm-up.
+Bon marché, et décide à elle seule de tout le chantier MTP.

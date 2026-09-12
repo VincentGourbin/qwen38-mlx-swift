@@ -76,3 +76,38 @@ public enum Qwen4ExpLayerBenchAblation: String, Sendable, CaseIterable {
     /// débit de génération" for the exact boundary this case covers.
     case norms
 }
+
+/// P11.2 : erreur de résolution pour `qwen4ExpResolveAblation` — une chaîne
+/// reçue en CLI (`--ablate`) ou dans le champ de requête serveur `ablation`
+/// qui ne correspond à aucun cas de `Qwen4ExpLayerBenchAblation`.
+public enum Qwen4ExpAblationResolutionError: LocalizedError, Equatable {
+    case invalidValue(String, choices: [String])
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidValue(let value, let choices):
+            return
+                "ablation doit être l'un de : \(choices.joined(separator: ", ")) ; reçu \"\(value)\"."
+        }
+    }
+}
+
+/// P11.2 : résout une chaîne (le `rawValue` d'un cas de
+/// `Qwen4ExpLayerBenchAblation`, `"none"` compris) en la valeur d'ablation
+/// correspondante. Ne décide pas de ce que signifie une valeur *absente* —
+/// c'est au caller de choisir : `flash-chat-probe --ablate` (absent ⇒
+/// `.none`, un process CLI neuf part toujours de zéro) et le champ de
+/// requête serveur `ablation` (absent ⇒ ne touche pas au réglage en
+/// vigueur, voir `Qwen38GenerationOptions.ablation`) ont des conventions
+/// différentes pour ce cas — d'où une fonction qui prend une chaîne non
+/// optionnelle plutôt que de trancher elle-même.
+///
+/// Fonction pure, testable sans charger de checkpoint réel — voir
+/// `AblationResolutionTests`.
+public func qwen4ExpResolveAblation(rawValue: String) throws -> Qwen4ExpLayerBenchAblation {
+    guard let parsed = Qwen4ExpLayerBenchAblation(rawValue: rawValue) else {
+        throw Qwen4ExpAblationResolutionError.invalidValue(
+            rawValue, choices: Qwen4ExpLayerBenchAblation.allCases.map(\.rawValue))
+    }
+    return parsed
+}

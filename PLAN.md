@@ -4334,21 +4334,36 @@ N+1 tokens en un forward au lieu d'en décoder N+1 séparément. Dans un régime
 limité par les lancements de noyaux, vérifier 4 tokens devrait coûter à peine
 plus que d'en vérifier 1.
 
-**Ce qui ne colle pas.** Le MTP mesure 0,85× le greedy avec 47,6 %
-d'acceptation. Si vérifier coûtait 1 unité quel que soit N, un brouillon d'un
-token donnerait 1,48 token par vérification, donc 1,48×. Pour tomber à 0,85×,
-il faut que le brouillon coûte **0,74 forward complet** — pour une seule
-couche d'attention pleine, contre 48 couches côté cible. Soit le drafter porte
-un coût fixe énorme (synchronisations, `eval` supplémentaires, reconstruction
-d'état GDN), soit la vérification coûte bien plus que supposé.
+**Mesuré le 2026-09-12 (nuit).** MTP = **0,939×** le greedy (19,72 contre
+21,01 tok/s), acceptation **48,4 %**, **75,0 ms par pas** de vérification. Et
+le coût marginal d'un token supplémentaire dans un forward groupé n'est **pas
+constant** : ~16 ms à N petit, ~7,7 ms à N grand, contre 47,6 ms pour un token
+décodé seul. Grouper vaut donc entre 3× et 6×, pas 50×.
 
-**Première tâche, décisive et bon marché** : mesurer le coût d'un forward en
-fonction du nombre de tokens qu'il traite — N ∈ {1, 2, 4, 8, 16, 32} — sur le
-checkpoint réel, serveur chaud, tours entrelacés. Cette seule courbe donne le
-gain maximal atteignable par spéculation, **avant** d'écrire la moindre ligne
-de drafter. Si le coût est plat de N=1 à N=8, le levier vaut jusqu'à 2× et
-justifie un arbre spéculatif ; s'il croît vite, le MTP est condamné et on
-l'écrit.
+Plafond du spéculatif avec un **drafter gratuit**, à 48,4 % d'acceptation :
+
+| brouillon | si marginal = 7,7 ms | si marginal = 16 ms |
+|---:|---:|---:|
+| 1 token | **1,28×** | **1,11×** |
+| 2 tokens | **1,30×** | 1,03× |
+| 4 tokens | 1,14× | 0,80× |
+
+Le drafter actuel coûte, par soustraction, 19,6 ms (41 % d'un forward complet)
+ou 11,4 ms (24 %) selon l'hypothèse — pour **une seule couche** contre 48 côté
+cible. C'est du coût fixe, pas du calcul.
+
+**Tout le chantier tient à un nombre que l'instrumentation ne sait pas
+isoler**, d'où la tâche qui passe devant :
+
+**P11.4a — sonde de coût de forward.** Chronométrer le forward du modèle réel
+sur N ∈ {1, 2, 4, 8, 16, 32} tokens, hors serveur, hors tokenisation, hors
+échantillonnage : `eval()` bloquant, médiane sur 50 pas après warm-up. Le TTFT
+ne convient pas, il porte ~250 ms de coût fixe de requête, cinq fois le
+forward lui-même. Critère : la courbe départage les deux colonnes du tableau.
+Si le marginal à petit N vaut ~8 ms, le plafond est 1,30× et il faut ramener
+le drafter sous ~5 ms — le chantier vaut la peine. S'il vaut ~16 ms, le
+plafond est 1,11× même avec un drafter gratuit : **on ferme le MTP et on
+l'écrit**.
 
 À tester ensuite seulement : brouillon par arbre plutôt que par chaîne, budget
 adaptatif, et le brouillon gratuit par recopie du prompt (*prompt lookup*),
