@@ -4088,3 +4088,44 @@ boucle de décodage est identique dans les deux cas ; seule diffère la
 | P9.2 | **Isoler dans QSA** : chronométrer séparément, sur un pas de décodage, l'indexeur (projection, M-RoPE, `makeMask`), l'attention principale, et la mise à jour du cache. Vérifier en particulier si `Qwen4ExpQSAKVCache.updateIndexer` ou `makeMask` fait un travail proportionnel au contexte **et** dépendant du contenu des positions (positions 3 axes de l'image contre horloge texte). | étage dominant identifié, chiffré |
 | P9.3 | **Corriger** ce que P9.1/P9.2 désignent. Hypothèse à vérifier en premier : les positions multimodales stockées empêchent un chemin rapide (par exemple un test de contiguïté, un `min`/`max` recalculé, ou une conversion de dtype par pas). | décodage après image ≥ 80 % du débit texte à contexte égal |
 | P9.4 | **Valider** : rejouer le protocole de bench M1 (image au tour 1, deux tours texte) via le serveur avec `conversation_id`, comparer au tableau ci-dessus ; IDs inchangés sur un prompt texte de référence ; `BENCHMARKS.md`. | 3 tours ≥ 12 tok/s |
+
+### P10 — Ce qui reste : coût hôte par op, fusion des blocs de collage, préfill n-gram — plan du 2026-09-12
+
+**Où on en est.** Décodage 3-bit : **14,7-17,8 tok/s** à contexte court,
+9,8 tok/s à 4 367 tokens ; préfill réel 77,6 tok/s (n-gram sur SSD) ; image
+sans pénalité depuis le correctif du merger. Plus aucune fuite de dtype
+(audit `QWEN38_DTYPE_AUDIT`). Les deux gains majeurs de la campagne étaient
+des bugs ; **ce qui reste est de l'optimisation vraie**, donc à rendement plus
+faible et à risque plus élevé : chaque levier doit être mesuré sur le modèle
+réel avant d'être conservé.
+
+**Attribution par ablation, post-F7** (`flash-layer-bench --fusion-level 7
+--steps 150`, Release, sans checkpoint) :
+
+| Sous-bloc | couche GDN (1,18 ms) | couche QSA (1,63 ms) |
+|---|---|---|
+| **hyper-connexions** (×2 par couche) | **0,32 ms — 27 %** | **0,38 ms — 23 %** |
+| MoE (routage + 3 gather + partagé) | 0,27 ms — 23 % | 0,37 ms — 23 % |
+| attention QSA (indexeur + SDPA) | — | 0,38 ms — 23 % |
+| projections GDN | 0,20 ms — 17 % | — |
+| normes | 0,08 ms — 7 % | 0,13 ms — 8 % |
+| récurrence GDN (kernel Metal) | 0,08 ms — 7 % | — |
+| Σ attribué | 81 % | 77 % |
+
+**Le coût n'est plus concentré** : c'est le modèle « nombre d'ops × coût fixe
+par op » (~106 ops en GDN, ~144 en QSA, 8,58 µs/op mesurés). Deux leviers
+distincts en découlent, et le premier est le plus rentable parce qu'il
+multiplie tout le reste.
+
+| # | Tâche | Critère |
+|---|---|---|
+| P10.1 | **Coût hôte par op : 8,58 µs en Swift contre 4,2 µs en MLX Python sur la même machine et la même version C++ (0.31.1).** Facteur 2 jamais expliqué, qui pèse sur les ~5 800 ops d'un token. Méthode : `sample` sur `qwen38 op-overhead-probe` (chaîne dépendante de 200 additions), puis attribution des 8,58 µs entre retain/release ARC, verrous (`evalLock.withLock` dans mlx-swift), allocation Swift de `MLXArray`, et passage C. Comparer au même profil côté Python (`py-spy` ou `sample` sur l'interpréteur). Conclure : soit un point chaud corrigeable dans **notre** usage (par exemple des `MLXArray` temporaires évitables), soit un défaut de mlx-swift à remonter en amont — auquel cas ouvrir un action-plan `track` avec le profil à l'appui. | attribution chiffrée des 8,58 µs ; si un correctif local existe, gain mesuré sur `op-overhead-probe` **et** sur `flash-layer-bench` |
+| P10.2 | **Fusion des hyper-connexions** (premier poste : 27 % / 23 %, et pur collage — reshape, matmul de rang 320, moyenne, broadcast, addition — appelé deux fois par couche). Un noyau `MLXFast.metalKernel` pour la chaîne mix+inject de `Qwen4ExpHyperConnection` / `Qwen4ExpDecoderLayer.inject`, derrière un nouveau niveau `Qwen4ExpFusionLevel`, chemin d'origine conservé. Compter les ops avant/après. | bench : ms/couche avant/après ; parité 1e-3 ; **≥ 5 % sur le checkpoint réel** sinon retiré |
+| P10.3 | **Fusion de la chaîne de gating/projections GDN** (17 % de la couche GDN) : `-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`, fenêtre conv1d, découpages — hors `gatedDeltaUpdate`, qui est déjà un kernel. Même protocole que P10.2. | idem |
+| P10.4 | **Préfill : lectures n-gram groupées.** 0,208 ms par ligne sur SSD interne, 48 lignes par token, 150 624 lectures pour 3 137 tokens = 31 s, soit 77 % du préfill. Le disque n'est pas la limite (~0,08 ms attendus en NVMe) : le coût est la faute de page mmap + copie hôte, une ligne à la fois. Grouper par plages d'offsets triées (un `pread` par plage contiguë), et n'assembler qu'un tenseur par appel (déjà fait en P6.2 pour les shards, pas pour les lignes). | préfill sur prose réelle (3 137 tokens) : **≥ 120 tok/s** (contre 77,6) ; parité n-gram `delta=0` ; IDs greedy identiques |
+| P10.5 | **Validation d'ensemble** : IDs greedy identiques à la référence, garde Q-B (10/28, −4,80), audit `QWEN38_DTYPE_AUDIT` sans fuite, qualification H6 rejouée sur le 3-bit, dialogue A/B 20 min ; `BENCHMARKS.md` mis à jour. | aucune régression, tableau avant/après |
+| P10.6 | **Nettoyage** : `Qwen4ExpFusionLevel` mélange désormais de vraies fusions (F1-F6, toutes neutres en production) et un correctif de dtype (F7, défaut). Séparer les deux notions ou, a minima, renommer et documenter pour qu'un lecteur ne croie pas que F7 est optionnel. Retirer les niveaux mesurés sans gain s'ils ne servent plus qu'à comparer. | code lisible, tests verts |
+
+Hors périmètre : P3 (déchargement disque des experts — ne se justifie plus
+que par la qualité du 4-bit), le MTP (clos : il ne gagne plus que 3 % depuis
+que le greedy a doublé), le chargement du modèle (~60 s, jugé acceptable).
