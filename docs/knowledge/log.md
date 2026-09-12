@@ -4928,3 +4928,84 @@ lui-même. Il faut une sonde qui chronomètre le forward seul.
 réel sur N ∈ {1, 2, 4, 8, 16, 32} tokens, hors serveur, hors tokenisation,
 hors échantillonnage : `eval()` bloquant, médiane sur 50 pas après warm-up.
 Bon marché, et décide à elle seule de tout le chantier MTP.
+
+---
+
+## 2026-09-13 — P11.2 : l'ablation par soustraction ne mesure pas ce qu'on croit
+
+L'outillage est en place (les neuf ablations de `Qwen4ExpLayerBenchAblation`
+sont désormais applicables au checkpoint réel, modifiables à chaud, publiées
+dans `/healthz`). La mesure, elle, **ne donne pas de chiffre exploitable**, et
+c'est le résultat de la nuit.
+
+### Le signal d'alarme
+
+Serveur chaud, ablations entrelacées, débit de décodage seul
+(`tokensPerSecond` = `generationTokensPerSecond`, vérifié dans
+`Qwen38Server.swift:623` — il exclut bien le préfill) :
+
+| ablation | tok/s | coût attribué |
+|---|---:|---:|
+| aucune | 20,51 | — |
+| `moe` (bloc entier court-circuité) | 26,05 | 10,38 ms |
+| `moe-routing` (routeur réel, sorties mises à zéro) | 30,96 | **16,47 ms** |
+
+**`moe` court-circuite strictement plus de travail que `moe-routing`** — il
+saute le routeur en plus des experts — et mesure pourtant un coût *inférieur*.
+Reproduit en ordre aléatoire sur 8 tours (σ = 0,09 pour `moe`), donc ce n'est
+ni du bruit ni un effet d'ordonnancement.
+
+### La cause
+
+Il suffit de regarder ce que chaque variante produit :
+
+| ablation | sortie (40 tokens) | mots distincts |
+|---|---|---:|
+| aucune | « Le président de la Chine est Xi Jinping. Il est le Secrétaire général… » | 25 |
+| `moe` | charabia multilingue varié | 12 |
+| `moe-routing` | `1225666666666666666666666666666666666666` | **1** |
+| `hyper` | ` (`&nbsp;` (`&nbsp;` (`&nbsp;…` répété 40 fois | **1** |
+
+**Les variantes qui mesurent « le plus rapide » sont exactement celles dont la
+sortie dégénère en un seul token répété.** Un token répété touche toujours la
+même ligne de la table n-gram (donc LRU chaud, zéro lecture disque) et route
+vers les mêmes experts à chaque pas. Ce n'est pas le bloc ablaté qu'on mesure,
+c'est la dégénérescence de la sortie.
+
+Contrôle du même effet sans ablation, quatre prompts produisant des sorties de
+natures différentes (prose, code, chiffres, répétition) : l'étendue est de
+**+5,7 %** entre la plus lente et la plus rapide. Entre une sortie normale et
+un token unique répété, l'effet est manifestement bien plus grand.
+
+### Conséquence
+
+**L'attribution par soustraction sur une génération libre est invalide sur ce
+modèle.** C'est la deuxième fois que cet instrument (écrit pour P7) produit une
+réponse trompeuse : P7 avait conclu « 78-88 % du temps dans le MoE routé », que
+P8 a réfuté en trouvant une fuite de dtype ailleurs. Le motif est le même — on
+compare des exécutions qui ne calculent pas la même chose.
+
+Deux biais distincts, à ne pas confondre :
+1. **La dégénérescence de sortie** (celui-ci, dominant) : l'ablation change les
+   tokens produits, donc les lectures n-gram et le routage.
+2. **Le repliement de constantes**, soupçonné mais non prouvé : les cas qui
+   substituent `MLXArray.zeros(...)` rendent la sortie du bloc identiquement
+   nulle, ce que MLX pourrait replier en aval. `moe-shared-expert` (qui garde
+   la branche routée réelle, donc pas de sortie nulle) mesure un coût petit et
+   crédible, ce qui est cohérent avec cette hypothèse.
+
+### Ce qu'il faut pour mesurer vraiment
+
+**Un décodage à séquence forcée.** Décoder token par token en imposant à chaque
+pas un identifiant fixé au lieu de l'argmax du modèle, de sorte que **toutes
+les variantes décodent exactement les mêmes tokens** — mêmes lectures n-gram,
+même routage, seule la branche ablatée diffère.
+
+`flash-teacher-forced-score` ne convient pas : il fait **un seul forward
+groupé** sur toute la séquence, donc il attribuerait du coût de préfill, pas de
+décodage — et les deux régimes n'ont pas le même mélange d'opérations (matvec
+batch 1 contre matmul).
+
+Tant que cet instrument n'existe pas, **aucun chiffre d'attribution par
+sous-bloc ne doit être inscrit**, et P11.3 (part des hyper-connexions) comme
+P11.10 (cible du noyau Metal) restent sans cible chiffrée.
