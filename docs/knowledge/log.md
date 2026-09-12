@@ -4618,3 +4618,41 @@ débit court/long, audit dtype) sont PASS.
 | P10.2 | kernel mix/inject hyper-connexions (F8) | **retiré** | F7 2,372 s vs F8 2,392 s (32 tok, 4 paires) — F8 systématiquement ~1 % plus lent |
 | P10.3 | kernel L2-norm GDN (F9) | **retiré** | F7 2,370 s vs F9 2,394 s (32 tok, 3 paires) — ~1 % plus lent, pas de gain |
 | P10.4 | `pread` concurrents n-gram | **promu en défaut** | forward 56,19 s → 43,11 s (4 831 tokens, même prompt) — **+30,4 % de débit** |
+
+## 2026-09-12 (fin) — Vérification indépendante de P10 et récupération de l'image de référence
+
+Contrôle des deux points que P10 laissait ouverts.
+
+**Préfill, sur le prompt de référence du 2026-09-11** (3 137 tokens de prose
+française réelle, extrait de ce journal, `--profile-layers`) :
+
+| | forward | débit |
+|---|---|---|
+| avant les `pread` concurrents | 40,43 s | 77,6 tok/s |
+| **après (défaut actuel)** | **28,82 s** | **108,8 tok/s** |
+
+**+40 % sur le préfill réel**, mesure directement comparable à la référence
+(même prompt, même protocole). L'agent annonçait +30 % sur un prompt de
+4 831 tokens ; l'écart entre les deux chiffres vient de la longueur, le cache
+LRU de lignes absorbant une part croissante des lectures.
+
+**Image, que l'agent n'a pas pu tester** : `~/Downloads` est devenu
+inaccessible au terminal (refus TCC de macOS — `ls` voit le fichier, toute
+lecture échoue, y compris depuis le shell). L'image de référence a été
+récupérée depuis une requête H6 archivée
+(`results/h6/H6.3.request.json`, data URL base64) et déposée dans
+`results/assets/ref-image.jpeg` : elle est désormais versionnée avec le dépôt
+et ne dépend plus d'une autorisation. Résultat sur le défaut post-P10 :
+
+```
+image 1216x800 · 950 marqueurs · 976 tokens de prompt
+"Sur cette image, on voit **Emmanuel Macron**, le président de la République
+ française. ### Rôle : Il est **le chef de l'État français**, élu au suffrage
+ univers…"
+40 tokens en 3,14 s = 12,4 tok/s · audit dtype : 0 fuite
+```
+
+Qualité et débit conformes ; le trou de validation de P10.5 est comblé.
+**Les scripts qui référencent `~/Downloads/licensed-image-2.jpeg`
+(`Scripts/h6-qualification.sh`) doivent basculer sur
+`results/assets/ref-image.jpeg`.**

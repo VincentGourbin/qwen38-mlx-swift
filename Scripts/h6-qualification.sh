@@ -12,7 +12,9 @@ model_dir="${1:-/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
 port="${2:-8848}"
 model_id="$(basename "$model_dir")"
 bin=./.xcodebuild/Build/Products/Release/qwen38
-image=/Users/vincent/Downloads/licensed-image-2.jpeg
+# 2026-09-12 : ~/Downloads est devenu inaccessible au terminal (TCC macOS).
+# L'image de référence est versionnée avec le dépôt.
+image=${QWEN38_REF_IMAGE:-results/assets/ref-image.jpeg}
 out=results/flash-qualification-rev4.tsv
 mkdir -p results/h6
 ref="Explique en français qui est le président de la Chine et quel est son rôle."
