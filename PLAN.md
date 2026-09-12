@@ -4163,3 +4163,149 @@ Les quatre questions de la fiche de démo, et les réponses :
 | (d) Veille du Mac | À corriger (profil secteur). Ce réglage a faussé trois jours de mesures. |
 
 Jalons 1, 2 et 3 livrés. Fin de la rév. 4 du plan pour la partie portage.
+
+---
+
+### P11 — Plan révisé après lecture d'Edge0 : nous ne sommes limités ni par la bande passante ni par le calcul — plan du 2026-09-12
+
+**Origine.** Vincent : « je suis étonné qu'un framework + modèle comme celui-ci
+arrive à des résultats très spectaculaires (Edge0) […] ça n'a rien à voir en
+terme d'inférence ». Cette section établit ce qu'Edge0 fait réellement, ce
+qu'on peut lui prendre, et où sont nos gains restants.
+
+#### P11.0 — Ce que dit Edge0, une fois les chiffres remis côte à côte
+
+Edge0 (Apache-2.0, MLX, Python) publie deux modèles. Le tier haut,
+`edge0-35b`, est un **hybride attention-linéaire de la même famille que le
+nôtre** : 40 couches, `full_attention_interval = 4`, soit 30 `GatedDeltaNet`
++ 10 attentions pleines — notre modèle fait 36 + 12 sur 48 couches. Le noyau
+GDN vient de `mlx_lm`, comme le nôtre.
+
+| | edge0-35b | Flash-Next 3 bits (nous) |
+|---|---|---|
+| Machine | Mac mini M4 Pro 24 Go | MacBook Pro M3 Max 96 Go |
+| Paramètres totaux / actifs | 35 B / ~3 B annoncés | 125 B / ~6 B |
+| Experts routés par token (K) | **4** (le checkpoint en déclare 8) | **10** |
+| Octets d'experts lus par token | ≈ 323 Mio (estimé) | **1 005 Mio (mesuré)** |
+| Décodage | 14,9-17,7 tok/s (à ~3,3 k de contexte) | 13,0-13,5 tok/s (court), 9,8 tok/s à 4 367 |
+| Préfill froid / chaud | 113 / 140 tok/s | 108,8 tok/s |
+
+**Trois corrections au récit.**
+
+1. **Edge0 n'est pas plus rapide que nous.** À débit comparable, nous
+   déplaçons **trois fois plus d'octets d'experts par token**, sur un modèle
+   trois fois et demi plus gros. Leur `edge0-35b` tourne en outre à K=4 alors
+   que son `config.json` déclare `num_experts_per_tok = 8` :
+   `LayerOptions.staged_k4()` divise par deux la largeur de routage native,
+   en préfill comme en décodage. C'est un choix non mis en avant qui explique
+   une part du débit **et** une part des 3,9 points de qualité perdus.
+
+2. **Le « +59 % » du prérouteur est une atténuation, pas un gain.** La page
+   d'Edge0 donne le protocole : « à modèle, adaptateur et charge identiques,
+   le projet a alterné prérouteur et routage natif », les deux **avec
+   déchargement disque**. Le prérouteur récupère le temps d'attente d'E/S que
+   le déchargement a lui-même introduit ; il n'est jamais comparé à un modèle
+   résident. Le ticket #16 du dépôt donne une mesure tierce en sens inverse :
+   sur SSD externe, prérouteur **actif = 8 % plus lent**. Sur une machine où
+   le modèle tient en mémoire, cette technique ne peut rien nous apporter.
+
+3. **Le prérouteur n'est pas un préchargement, c'est un remplacement du
+   routeur.** La tête entraînée ne propose pas des experts à vérifier : le
+   décodage route **à travers sa prédiction**, « 100 % replacement, no
+   matching/drops ». Une erreur de prédiction ne provoque ni repli ni
+   blocage : le modèle calcule avec les mauvais experts. Le coût est une
+   perte de qualité, pas une latence — et **aucun taux de succès n'est publié
+   nulle part**. À budgéter comme un changement de qualité à mesurer, jamais
+   comme une optimisation gratuite.
+
+Le « 2,9 Gio de pic » est le pic de l'allocateur MLX, pas la RSS du process,
+et il exclut le cache de pages — la distinction que notre `preflight-resident.sh`
+fait déjà. Sur un Mac mini de 24 Go avec un checkpoint de 23 Go, le cache de
+pages du noyau détient de fait le modèle.
+
+#### P11.1 — Le vrai diagnostic : nous sommes à 28× du toit
+
+Mesures faites sur le checkpoint réel (`switch_mlp`, 3 bits g64, 48 couches,
+512 experts, K=10) :
+
+| Grandeur | Valeur |
+|---|---|
+| Poids d'un expert (packé + scales + biases) | 2,094 Mio |
+| Octets d'experts lus par token décodé | **1 005 Mio** |
+| FLOP d'experts par token | 4,72 GFLOP |
+| Fraction des experts touchée par token | 2,0 % |
+
+Rapportées au M3 Max (≈ 400 Go/s, ordre de 14 TFLOP/s) :
+
+| Débit | Bande passante exigée | % de la bande passante | % du calcul |
+|---|---|---|---|
+| 13,5 tok/s (mesuré) | 13,3 Gio/s | **3,6 %** | **0,46 %** |
+| 17,8 tok/s (record) | 17,5 Gio/s | 4,7 % | 0,60 % |
+
+Le toit de bande passante du seul MoE est de **2,63 ms par token, soit
+380 tok/s**. Nous mesurons 74 ms par token. **Nous sommes à un facteur 28 du
+toit, en n'utilisant ni la bande passante (3,6 %) ni le calcul (0,46 %).**
+
+C'est la confirmation quantitative de ce que P0 → P10 avaient établi
+qualitativement : le coût n'est ni la lecture des poids ni l'arithmétique,
+c'est le **nombre de lancements de noyaux** — ~100 petits ops par couche
+(P2-code), soit ~4 800 par token, à ~16 µs pièce. Toute optimisation qui ne
+réduit pas ce nombre, ou ne l'amortit pas sur plusieurs tokens, ne peut rien
+donner : les six tentatives de fusion F1-F9 l'ont vérifié six fois.
+
+**Conséquence directe sur le déchargement disque :** puisqu'on n'utilise que
+3,6 % de la bande passante mémoire, décharger les experts sur SSD ne coûte
+rien *en principe*. Mesures de lecture faites ce jour, sur une fenêtre de
+travail de 84 Gio (supérieure au cache disponible), `F_NOCACHE`, lectures
+aléatoires :
+
+| Support | 1 fil | 4 fils | 8 fils | 16 fils |
+|---|---:|---:|---:|---:|
+| SSD interne, blocs de 8 Mio | 11,7 Gio/s | **15,2 Gio/s** | 6,5 Gio/s | 1,4 Gio/s |
+| SSD interne, blocs de 2 Mio | 8,4 Gio/s | 10,8 Gio/s | 6,5 Gio/s | 1,4 Gio/s |
+| Lexar USB4, blocs de 8 Mio | 0,71 Gio/s | 0,76 Gio/s | 0,76 Gio/s | 0,76 Gio/s |
+
+Le SSD interne tient 15,2 Gio/s à 4 fils, juste au-dessus des 13,3 Gio/s
+qu'exige le décodage — mais s'effondre à 8 fils et au-delà, et cette marge
+disparaît dès qu'on vise plus de 15 tok/s. Le Lexar, à 0,76 Gio/s, est
+**dix-sept fois trop lent** : il est définitivement écarté comme support des
+experts. Le déchargement reste donc ce que PM4.4 en disait — un moyen de
+rendre le 4-bit utilisable, **pas** un levier de débit.
+
+#### P11.2 — Tâches
+
+Ordre par rapport valeur/effort. Les trois premières ne demandent pas de
+machinerie nouvelle.
+
+| # | Tâche | Critère de succès |
+|---|---|---|
+| **P11.1** | **Réduire K, la largeur de routage.** Edge0 divise K par deux sur son tier phare. Rendre `num_experts_per_tok` réglable à l'exécution (drapeau moteur + CLI + GUI + serveur, comme `--fusion-level`), puis balayer K ∈ {10, 8, 6, 5, 4} sur le prompt de référence. Mesurer pour chaque K : débit greedy court et long, Q-B V32, logprob moyenne, et la sortie greedy sur le prompt de référence. | Une courbe débit/qualité exploitable. Succès si un K < 10 donne ≥ +15 % de débit pour ≤ 0,2 nat de logprob perdue. |
+| **P11.2** | **Refaire l'attribution du coût par sous-bloc, post-F7.** P7 attribuait 78-88 % au MoE routé — mesuré **avant** la correction de la fuite fp32 (P8), qui a multiplié le débit par 2,74. Cette répartition n'est plus valide et c'est elle qui oriente tout le reste. Instrumenter par sous-bloc (GDN, QSA, MoE routé, expert partagé, hyper-connexions, PLE, normes) avec le profileur 1.5.0, hors profilage par couche. | Un tableau à jour de la part de chaque sous-bloc, et le compte réel d'ops GPU par token (aujourd'hui estimé à ~4 800). |
+| **P11.3** | **Chiffrer les hyper-connexions.** Notre modèle porte 4 flux résiduels et un mélange de rang 320 à chaque couche — Edge0 n'a pas cet étage. C'est un suspect structurel de premier plan pour le compte d'ops, et il n'a jamais été mesuré isolément. Ablation : forcer 1 flux, mesurer débit et parité. | La part exacte des hyper-connexions dans les 74 ms. Si elle dépasse 15 %, ouvrir un chantier de fusion dédié. |
+| **P11.4** | **Rendre le MTP rentable.** Le drafter est aujourd'hui à 0,81-0,86× le greedy : il coûte plus qu'il ne rapporte, avec 34,8 % (4-bit) à 47,6 % (3-bit) d'acceptation. C'est pourtant le seul levier qui **amortit** le coût de lancement sur plusieurs tokens, donc le seul aligné sur le diagnostic P11.1. Étudier : arbre spéculatif à plusieurs branches plutôt que chaîne, budget de brouillon adaptatif, et coût réel du drafter par pas. | MTP > 1,0× le greedy sur le prompt de référence, ou un verdict écrit expliquant pourquoi le seuil est hors d'atteinte. |
+| **P11.5** | **Déchargement disque des experts (ex-P3), révisé.** Reprendre `docs/knowledge/investigations/p3-expert-offload.md` à la lumière des débits mesurés ci-dessus. Périmètre réduit et objectif corrigé : rendre le **4-bit** utilisable, cible « pas plus de 20 % sous le 3-bit résident », SSD interne uniquement, Lexar écarté. Garder de l'étude : le layout par couche (nos `switch_mlp` sont déjà empilés `[512, …]`, donc 9 lectures par couche suffisent). Vérifier d'abord le point bloquant n°1 de l'étude : `MLXArray` peut-il adopter des pages `mmap` sans copie ? | Une réponse tranchée sur le zéro-copie (P3.1), puis soit un prototype, soit un abandon écrit. |
+| **P11.6** | **Recover-LoRA, variante utile pour nous.** Le détail intéressant d'Edge0 n'est pas la distillation mais **sa cible** : leurs adaptateurs ne touchent aucun expert routé, seulement l'attention (`linear_attn`, `self_attn`) et l'expert partagé. Les experts quantifiés restent identiques octet pour octet, donc échangeables sans retoucher les 50 Gio. Transposé chez nous : récupérer les 0,42 nat perdues par le 3-bit sans requantifier. | Une note d'étude chiffrant le besoin (infrastructure d'entraînement, teacher, volume de tokens) et un go/no-go. Pas d'implémentation avant. |
+| **P11.7** | **Prérouteur : verdict écrit, pas d'implémentation.** Documenter dans `docs/knowledge/investigations/` pourquoi la technique ne s'applique pas à un modèle résident, avec les trois points de P11.0. À rouvrir seulement si P11.5 aboutit à un déchargement effectif. | La note existe et clôt le sujet. |
+| **P11.8** | **Quantification 3 bits directe depuis les shards BF16 officiels** (option B, §7). Notre 3-bit est dérivé d'un checkpoint tiers déjà quantifié en 4 bits : double quantification. Une passe directe depuis le BF16 devrait récupérer une partie des 0,42 nat gratuitement. | Q-B V32 du 3-bit direct ≥ celui du 4-bit actuel. |
+| **P11.9** | **Remonter le patch `Vendor/mlx-swift-lm-local.patch` en amont.** Sept fichiers modifiés localement, épinglés sur `1a562aa`. Dette qui grossit à chaque mise à jour de mlx-swift. | PR ouverte, ou patch réduit aux seuls écarts irréductibles. |
+
+#### P11.3 — Ce qui n'est plus au programme
+
+- **La fusion de noyaux au niveau des ops MLX.** Neuf tentatives (F1 à F9),
+  zéro gain, deux régressions. Le diagnostic P11.1 explique pourquoi : le
+  coût n'est pas là où la fusion agit. Clos.
+- **Le Lexar comme support d'experts.** 0,76 Gio/s mesurés contre 13,3
+  exigés. Clos.
+- **Le prérouteur d'Edge0** tant que le modèle est résident (P11.7).
+
+#### P11.4 — Ordre d'exécution et prérequis
+
+P11.1 → P11.2 → P11.3 en série (chacune informe la suivante), puis arbitrage
+entre P11.4 et P11.5 selon ce que P11.2 révèle. P11.6 à P11.9 sont
+indépendantes et peuvent partir en parallèle si une machine se libère.
+
+Prérequis inchangés pour toute mesure : build Release
+(`Scripts/build-release.sh`), `Scripts/preflight-resident.sh` au vert,
+`caffeinate -dimsu` autour du run, et vérification du modèle chargé via
+`/healthz` avant d'inscrire un chiffre. **Le réglage de veille sur secteur
+n'est toujours pas corrigé** (G-8 d).

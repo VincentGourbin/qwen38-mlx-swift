@@ -1,5 +1,14 @@
 # P3 — Déchargement disque des experts Flash-Next (étude d'architecture)
 
+> **Révisé le 2026-09-12 — voir `PLAN.md` §P11.5.** Les débits disque que ce
+> document cite de seconde main ont depuis été mesurés : SSD interne 15,2 Gio/s
+> (4 fils, blocs de 8 Mio), qui s'effondre à 6,5 puis 1,4 Gio/s au-delà ; Lexar
+> USB4 0,76 Gio/s. Le décodage exige 13,3 Gio/s (1 005 Mio d'experts par token,
+> mesuré sur le checkpoint). Conséquences : le **Lexar est écarté** comme
+> support des experts, la concurrence doit rester **≤ 4 fils**, et l'objectif du
+> chantier n'est plus le débit mais la mise en service du checkpoint 4 bits.
+
+
 Contexte : checkpoint Vontra 4-bit g32, 512 experts × 48 couches, 10 routés +
 1 partagé par token, chaque expert = 3 matrices 640×2560 (gate/up entrée
 2560 sortie 640 ; down entrée 640 sortie 2560). Poids des experts ≈ 3,1 Mo

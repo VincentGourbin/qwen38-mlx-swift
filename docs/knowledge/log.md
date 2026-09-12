@@ -4691,3 +4691,68 @@ libérés ne sont pas encore rendus par APFS (instantanés locaux Time Machine),
 et la mise en veille sur secteur n'est toujours pas corrigée dans le profil
 d'alimentation (cf. P1, tous les runs restent enveloppés dans
 `caffeinate -dimsu`).
+
+---
+
+## 2026-09-12 — toit de performance du décodage, et débits SSD réels (préparation P11)
+
+Deux mesures faites pour trancher la question posée par Edge0 : sommes-nous
+limités par la bande passante mémoire, et le déchargement disque est-il
+possible ?
+
+### Octets d'experts lus par token décodé
+
+Dérivé des en-têtes safetensors du checkpoint réel
+(`local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`), pas d'une estimation :
+
+| | |
+|---|---|
+| Checkpoint total | 83,9 Gio |
+| dont experts routés (`switch_mlp`, 48 couches) | 50,2 Gio |
+| dont table n-gram PLE (mmap paresseux) | 29,8 Gio |
+| dont attention / vision / expert partagé | 3,9 Gio |
+| Par couche (512 experts) | 1 072 Mio |
+| **Par expert** | **2,094 Mio** |
+| **Lu par token décodé** (10 experts × 48 couches) | **1 005 Mio** |
+| Fraction des experts touchée par token | 2,0 % |
+
+### Où nous sommes par rapport au toit
+
+M3 Max : ≈ 400 Go/s de bande passante, de l'ordre de 14 TFLOP/s.
+
+| Débit | Gio/s exigés | % bande passante | GFLOP/s | % calcul |
+|---|---:|---:|---:|---:|
+| 13,5 tok/s (mesuré, P10.5) | 13,3 | **3,6 %** | 63,7 | **0,46 %** |
+| 17,8 tok/s (record, post-P9) | 17,5 | 4,7 % | 84,0 | 0,60 % |
+
+Toit de bande passante du seul MoE : **2,63 ms/token, soit 380 tok/s**.
+Mesuré : 74 ms/token. **Facteur 28.** Ni la lecture des poids ni
+l'arithmétique n'expliquent le temps ; il part en lancements de noyaux
+(~100 ops/couche d'après P2-code, ~4 800/token, ~16 µs pièce). C'est la
+confirmation chiffrée de ce que P0-P10 avaient établi au cas par cas, et
+l'explication de l'échec systématique des fusions F1-F9.
+
+### Débits de lecture, fenêtre de travail 84 Gio, `F_NOCACHE`, accès aléatoires
+
+Fenêtre volontairement plus grande que le cache de pages disponible, pour ne
+pas mesurer le cache. Threads POSIX, `pread`.
+
+| Support | bloc | 1 fil | 4 fils | 8 fils | 16 fils |
+|---|---|---:|---:|---:|---:|
+| SSD interne | 2 Mio | 8,43 | 10,81 | 6,48 | 1,44 |
+| SSD interne | 8 Mio | 11,66 | **15,22** | 6,50 | 1,44 |
+| Lexar USB4 | 2 Mio | 0,62 | 0,80 | 0,80 | 0,78 |
+| Lexar USB4 | 8 Mio | 0,71 | 0,76 | 0,76 | 0,76 |
+
+(en Gio/s)
+
+Deux enseignements. Le SSD interne plafonne à **15,2 Gio/s à 4 fils avec des
+blocs de 8 Mio**, à peine au-dessus des 13,3 Gio/s qu'exige le décodage — et
+**s'effondre à 8 fils et au-delà** (6,5 puis 1,4 Gio/s), ce qui condamne
+l'idée d'un déchargement à forte concurrence. Le Lexar tient 0,76 Gio/s, soit
+**dix-sept fois moins que nécessaire** : il est écarté définitivement comme
+support des experts. La valeur « 0,7 Go/s » que l'étude P3 citait de seconde
+main est donc confirmée par la mesure.
+
+Ces chiffres réorientent le chantier de déchargement (désormais P11.5) : son
+objectif n'est plus le débit mais la **mise en service du 4-bit**.
