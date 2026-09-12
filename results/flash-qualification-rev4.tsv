@@ -7,3 +7,10 @@ H6.2d	instruct	48	2.4	stop	0	PASS (cohérent)	The cat is sleeping on the couch.
 H6.3	image	48	60.4	length	0	PASS (Emmanuel Macron + rôle)	Sur cette image, on voit **Emmanuel Macron**, le président de la République française. ⏎  ⏎ ### Rôle : ⏎ Il est **le chef de l’État français**, élu au suffrage 
 H6.4-t1	instruct, tour 1	48	9.1	length	0	PASS (cohérent)	Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire cen
 H6.4-t2	instruct, tour 2	48	10.6	length	0	PASS (nomme Hu Jintao)	Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Il a exercé cette fonction de 2003 à 2013. Avant cela, il
+H6.1	thinking	200	11.1	length	869	
+H6.2a	instruct	48	3.0	length	0	La photosynthèse est le processus biochimique par lequel les plantes, les algues et certaines bactéries convertissent l'énergie lumineuse, le dioxyde de carbone et l'eau en glucose (source d'énergie) et
+H6.2b	instruct	48	3.0	length	0	# Inverser une chaîne en Swift ⏎  ⏎ Voici une fonction Swift qui inverse une chaîne de caractères : ⏎  ⏎ ```swift ⏎ func inverserChaîne(_ chaîne: String) -> String { ⏎     return String(chaîne.reversed
+H6.2c	instruct	48	3.0	length	0	La capitale de l'Australie est **Canberra**. ⏎  ⏎ ### Pourquoi pas Sydney ? ⏎  ⏎ Le choix de Canberra comme capitale, plutôt que Sydney (ou Melbourne), est le résultat d'une longue querelle politique et géographique au début du XX
+H6.2d	instruct	48	1.0	stop	0	The cat is sleeping on the couch.
+H6.4-t1	instruct	48	2.8	length	0	Le président de la Chine est Xi Jinping. Il est le Secrétaire général du Comité central du Parti communiste chinois, le Président de la Commission militaire centrale et le Président de la République populaire de Chine. En tant que dirigeant principal
+H6.4-t2	instruct	48	2.9	length	0	Le prédécesseur de Xi Jinping en tant que président de la République populaire de Chine est Hu Jintao. Hu Jintao a exercé la présidence de la Chine de 2003 à 20
