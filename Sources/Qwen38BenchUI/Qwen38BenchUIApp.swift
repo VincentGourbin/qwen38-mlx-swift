@@ -364,21 +364,37 @@ final class BenchViewModel: ObservableObject {
                 // starts directly in the response channel.
                 var visibleParser = Qwen38ThinkingStreamParser(
                     primedInside: thinking)
+                // 2026-09-12 : publier chaque token re-rendait tout le fil à
+                // chaque token, ce qui plafonnait la GUI à 6,5 tok/s là où le
+                // moteur en fait 15. Les fragments sont accumulés et publiés
+                // par lots d'au plus `uiFlushInterval` : le rendu reste fluide
+                // (≈ 12 rafraîchissements par seconde) sans brider la
+                // génération. Le reliquat est publié à la fin du tour.
+                let uiFlushInterval: TimeInterval = 0.08
+                var pendingContent = ""
+                var pendingReasoning = ""
+                var lastFlush = Date()
+                @MainActor func flushPending(force: Bool) {
+                    guard force || Date().timeIntervalSince(lastFlush) >= uiFlushInterval else { return }
+                    guard !pendingContent.isEmpty || !pendingReasoning.isEmpty else { return }
+                    if let index = messages.firstIndex(where: { $0.id == assistantMessageID }) {
+                        if !pendingReasoning.isEmpty { messages[index].reasoning += pendingReasoning }
+                        if !pendingContent.isEmpty { messages[index].text += pendingContent }
+                    }
+                    if !pendingContent.isEmpty { output += pendingContent }
+                    pendingContent = ""
+                    pendingReasoning = ""
+                    lastFlush = Date()
+                }
                 for try await event in stream {
                     switch event {
                     case .chunk(let chunk):
                         let parsed = visibleParser.append(chunk)
-                        if !parsed.reasoning.isEmpty,
-                           let index = messages.firstIndex(where: { $0.id == assistantMessageID }) {
-                            messages[index].reasoning += parsed.reasoning
-                        }
-                        if !parsed.content.isEmpty {
-                            output += parsed.content
-                            if let index = messages.firstIndex(where: { $0.id == assistantMessageID }) {
-                                messages[index].text += parsed.content
-                            }
-                        }
+                        pendingReasoning += parsed.reasoning
+                        pendingContent += parsed.content
+                        flushPending(force: false)
                     case .metrics(let run):
+                        flushPending(force: true)
                         let tail = visibleParser.finish()
                         if let index = messages.firstIndex(where: { $0.id == assistantMessageID }) {
                             if !tail.reasoning.isEmpty {

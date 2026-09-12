@@ -1,0 +1,33 @@
+=== tour 1 ===
+Le connecteur **USB-C** (ou USB Type-C) est bien plus qu'une simple prise de charge ou de transfert de données. C'est une interface physique et logique complexe qui a été conçue pour remplacer la plupart des connecteurs propriétaires (mini-USB, micro-USB, DisplayPort, HDMI, etc.) par une solution universelle, réversible et haute performance.
+
+Voici une explication détaillée de son fonctionnement, de sa structure, de ses modes alternatifs et de ses limites électriques.
+
+---
+
+### 1. Architecture Physique et Broches (Pins)
+
+Contrairement aux anciens connecteurs USB (Type-A, Type-B, Micro-USB) qui avaient un nombre fixe de broches avec des fonctions figées, l'USB-C utilise une architecture **matricielle** et **symétrique**.
+
+#### A. La Symétrie et la Réversibilité
+*   **24 broches (pins)** : Le connecteur mâle (plug) et femelle (receptacle) possèdent chacun 24 broches.
+*   **Symétrie** : Les broches sont disposées en deux rangées de 12 broches (A1–A12 et B1–B12). La rangée A est le miroir exact de la rangée B.
+*   **Réversibilité** : Grâce à cette symétrie, le connecteur peut être inséré dans les deux sens (à 180°). Les broches A1 et B12, par exemple, remplissent la même fonction électrique, peu importe le sens d'insertion.
+
+#### B. Les Groupes de Broches Clés
+
+Les 24 broches ne sont pas toutes utilisées en même temps. Elles sont regroupées par fonction :
+
+| Groupe | Broches | Fonction |
+| :--- | :--- | :--- |
+| **Alimentation** | VBUS (A4, A9, B4, B9) | Transporte la puissance électrique (5V à 28V). |
+| **Masse** | GND (A1, A12, B1, B12) | Référence électrique (0V
+prompt tokens: 38
+generated ids: [2229, 4415, 12199, 2972, 25200, 7415, 332, 318, 282, 11020, 3856, 7415, 8, 1725, 13958, 5346, 893, 29027, 4145, 81413, 401, 6545, 5724, 401, 207689, 401, 44064, 13, 351, 16811, 5992, 3622, 61203, 1778, 209181, 192426, 7528, 264, 22899, 200510, 356, 4755, 210772, 1147, 179187, 909, 4415, 36304, 206536, 318, 35207, 12, 25200, 11, 7752, 12, 25200, 11, 10308, 6864, 11, 39694, 11, 4831, 5946, 1298, 5992, 6093, 10600, 6502, 11, 9056, 62127, 1778, 77241, 4906, 13, 271, 26623, 3266, 5992, 1295, 1633, 174070, 194394, 401, 4292, 181163, 11, 401, 796, 5759, 11, 401, 15081, 19174, 6703, 175757, 1778, 401, 15081, 183606, 196335, 13, 271, 4277, 271, 13962, 220, 16, 13, 36593, 12441, 2295, 1778, 5723, 8266, 318, 47, 1283, 8, 271, 1073, 2103, 45012, 9750, 202072, 4415, 36304, 11020, 318, 900, 6481, 11, 3856, 7428, 11, 17617, 12, 25200, 8, 7528, 180507, 632, 12371, 196353, 401, 2802, 8266, 9462, 909, 187285, 4008, 13306, 11, 324, 6, 25200, 7415, 65755, 5992, 17120, 2972, 8210, 2147, 155311, 332, 1778, 2972, 23057, 153500, 2295, 159034, 271, 794, 357, 13, 4770, 11047, 933, 8657, 1778, 1147, 48437, 2909, 153876, 198, 9, 256, 2972, 17, 19, 2802, 8266, 318, 72020, 31230, 535, 1900, 4415, 12199, 165126, 273, 318, 45891, 8, 1778, 4835, 6502, 318, 265, 1430, 7653, 8, 2157, 230610, 177461, 220, 17, 19, 2802, 8266, 13, 198, 9, 256, 2972, 27006, 933, 8657, 332, 535, 11282, 2802, 8266, 14360, 51354, 13306, 644, 24739, 40707, 13306, 401, 220, 16, 17, 2802, 8266, 318, 32, 16, 4006, 32, 16, 17, 1778, 417, 16, 4006, 33, 16, 17, 553, 4770, 40707, 7639, 357, 1725, 501, 207997, 396, 4581, 401, 1147, 40707, 7639, 417, 13, 198, 9, 256, 2972, 81911, 2909, 153876, 332, 535, 188344, 3656, 19450, 7637, 933, 8657, 11, 501, 4415, 12199, 23889, 22198, 1583, 65479, 6652, 3424, 24739, 5907, 318, 6161, 220, 16, 23, 15, 11283, 553, 11282, 2802, 8266, 357, 16, 1778, 417, 16, 17, 11, 1298, 48388, 11, 65839, 75947, 1147, 25639, 32295, 178985, 11, 26803, 189642, 501, 5907, 293, 6, 4069, 289, 13, 271, 794, 417, 13, 11282, 5559, 287, 401, 5723, 8266, 2356, 5229, 271, 22969, 220, 17, 19, 2802, 8266, 808, 14360, 6167, 38332, 211400, 644, 25639, 25213, 13, 182979, 14360, 224535, 13306, 1298, 32295, 535, 271, 91, 189203, 735, 5723, 8266, 735, 222010, 735, 198, 91, 535, 4277, 735, 535, 4277, 735, 535, 4277, 735, 198, 91, 2972, 2033, 3691, 362, 332, 735, 629, 38879, 318, 32, 19, 11, 357, 24, 11, 417, 19, 11, 417, 24, 8, 735, 16251, 68, 1147, 182235, 178985, 318, 20, 53, 3656, 220, 17, 23, 53, 553, 735, 198, 91, 2972, 44, 12871, 332, 735, 469, 7812, 318, 32, 16, 11, 357, 16, 17, 11, 417, 16, 11, 417, 16, 17, 8, 735, 205035, 178985, 318, 15, 53]
+TTFT: 66.537s
+prefill: 66.536s
+decode: 49.531s
+couches: 22368 visites · load cumulé 65.276s
+P4.2 fin de token (cumulé) : lm_head 0.9616s · sampler.sample 0.0018s · .item() 0.1468s
+MLX mémoire active: 57,41 GB
+MLX mémoire peak: 57,44 GB

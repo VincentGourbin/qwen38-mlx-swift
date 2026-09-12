@@ -4077,3 +4077,29 @@ reste à 55 %. Il demeure opt-in et désactivé par défaut (contrat PM4.3
 inchangé) ; rien à retirer, mais plus rien à en attendre non plus. Le
 chantier P-MTP est donc clos par la disparition de son objet, pas par un
 échec.
+
+## 2026-09-12 — La GUI plafonnait à 6,5 tok/s : c'était SwiftUI, pas le modèle
+
+Vincent a observé 6,5 tok/s en GUI (466 tokens) là où la mesure CLI donnait
+12,9 tok/s. Trois hypothèses testées et écartées dans l'ordre :
+
+| Hypothèse | Test | Résultat |
+|---|---|---|
+| La GUI n'a pas F7 | lecture du câblage `moteur → modèle → décodeur → loader → prepareFusion` | câblage correct |
+| Longueur de génération | CLI 466 tokens (au lieu de 32) | 9,39 tok/s — n'explique pas 6,5 |
+| Contexte long (tour après image) | serveur, prompt 1 480 tok + 466 générés | **14,66 tok/s** — n'explique rien |
+| **Chemin moteur lui-même** | serveur CLI = `Qwen38Runtime` → `Qwen38FlashNextEngine`, 466 tokens | **15,10 tok/s** |
+
+Le moteur — exactement celui de la GUI — fait donc 15 tok/s. Le goulot était
+la boucle de consommation du flux dans `Qwen38BenchUIApp` : chaque `.chunk`
+(un token) mutait `messages[index].text` **et** `output`, deux propriétés
+`@Published`, donc SwiftUI relayait tout le fil de conversation à chaque
+token. Plus le message grandit, plus le rendu coûte : la GUI bridait la
+génération à 6,5 tok/s. Invisible avant F7, où le modèle plafonnait lui-même
+à 6 tok/s — c'est l'accélération du modèle qui a fait apparaître le plafond
+de l'interface.
+
+Correctif : les fragments sont accumulés et publiés par lots d'au plus 80 ms
+(≈ 12 rafraîchissements par seconde, rendu toujours fluide), le reliquat
+étant publié à la fin du tour. Le parseur thinking continue de traiter chaque
+fragment immédiatement, seule la publication est regroupée.
