@@ -4317,6 +4317,7 @@ conversation neuve à chaque K.
 | **P11.7** | **Prérouteur : verdict écrit, pas d'implémentation.** Documenter dans `docs/knowledge/investigations/` pourquoi la technique ne s'applique pas à un modèle résident, avec les trois points de P11.0. À rouvrir seulement si P11.5 aboutit à un déchargement effectif. | La note existe et clôt le sujet. |
 | **P11.8** | **Quantification 3 bits directe depuis les shards BF16 officiels** (option B, §7). Notre 3-bit est dérivé d'un checkpoint tiers déjà quantifié en 4 bits : double quantification. Une passe directe depuis le BF16 devrait récupérer une partie des 0,42 nat gratuitement. | Q-B V32 du 3-bit direct ≥ celui du 4-bit actuel. |
 | **P11.9** | **Remonter le patch `Vendor/mlx-swift-lm-local.patch` en amont.** Sept fichiers modifiés localement, épinglés sur `1a562aa`. Dette qui grossit à chaque mise à jour de mlx-swift. | PR ouverte, ou patch réduit aux seuls écarts irréductibles. |
+| **P11.10** | **Noyau Metal personnalisé — la seule voie qui attaque le goulot de front, et la seule jamais essayée.** Les neuf fusions F1-F9 ont échoué parce qu'elles recomposaient des **ops MLX** : on ne peut pas descendre sous le nombre de dispatches que MLX émet. `MLXFast.metalKernel` (vérifié présent dans mlx-swift 0.31.6, `Source/MLXFast/MLXFastKernel.swift:46`) compile un noyau Metal à la volée depuis une source, avec grille et groupe de threads explicites : **N dispatches deviennent 1**. Cibles par ordre de faisabilité croissante : (a) le mélange des hyper-connexions (4 flux, rang 320, beaucoup de très petits tenseurs — dépend de ce que P11.3 mesure) ; (b) le collage autour de la récurrence GDN (projections, normes, casts ; la récurrence elle-même est déjà un noyau) ; (c) le bloc MoE complet en batch 1 — softmax du routeur, `argPartition`, *gather*, trois matvec quantifiés 3 bits g64 et le SwiGLU en un seul noyau. (c) est le gros lot, 48 couches × plusieurs ops, mais demande d'écrire la déquantification affine 3 bits en Metal. | D'abord un prototype sur (a) : parité bit-à-bit contre le chemin actuel sur poids réels, puis débit mesuré au protocole P11.1. Poursuivre sur (b) et (c) seulement si (a) prouve que le gain de dispatch se traduit en gain de débit. |
 
 #### Pourquoi le MTP passe devant, et l'hypothèse à tester d'abord
 
@@ -4387,6 +4388,14 @@ coût de lancement au lieu d'essayer de le réduire. Sa première mesure (courbe
 du coût d'un forward selon N) est bon marché et décide de tout le reste du
 chantier : la lancer dès que P11.2 et P11.3 ont rendu leur attribution.
 P11.5 dépend de P11.2. P11.6 à P11.9 sont indépendantes.
+
+**P11.10 (noyau Metal) est le seul levier identifié dont le plafond ne soit
+pas déjà connu comme faible.** P11.1 plafonne à +5,9 %, P11.4 à +30 % dans
+la meilleure hypothèse et peut-être +11 % dans l'autre. P11.10 attaque
+directement ce que le diagnostic désigne — le nombre de dispatches — et rien
+dans les mesures ne borne son gain a priori. Il est aussi le plus risqué :
+écrire du Metal, et prouver la parité sur des poids réels. Le lancer dès que
+P11.2 et P11.3 ont dit **où** viser.
 
 Prérequis inchangés pour toute mesure : build Release
 (`Scripts/build-release.sh`), `Scripts/preflight-resident.sh` au vert,
