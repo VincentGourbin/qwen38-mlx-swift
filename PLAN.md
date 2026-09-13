@@ -4511,3 +4511,46 @@ toute comparaison de débit passe par le serveur chaud en tours entrelacés**
 (écart-type 0,05 tok/s) et non par une sonde en process neuf (plusieurs tok/s
 de dispersion, qui avaient fabriqué un « +18 % » inexistant). **Le réglage de veille sur secteur
 n'est toujours pas corrigé** (G-8 d).
+
+---
+
+### P12 — Traitement par lots : le dernier levier, par étapes avec porte de sortie — plan du 2026-09-13
+
+**Pourquoi.** §P11 a fermé onze pistes. Celle-ci est la seule qui reste, et
+c'est la trace Metal qui la désigne : **le GPU est inactif 33 % du pas de
+décodage**, non par surcoût de soumission (desserrer les plafonds de tampons
+MLX *dégrade*) mais par **attente de dépendances** — à lot de taille 1, une
+chaîne autorégressive ne remplit pas 40 cœurs.
+
+**Ce qui est déjà mesuré, et ce qui ne l'est pas.** Dans un forward, doubler
+le travail ne coûte que **+30 %**, et huit jetons rendent **2,40× le débit**.
+Cette mesure porte sur huit jetons **du même flux** : elle inclut donc déjà le
+passage à l'échelle des experts routés et des lectures n-gram, qui étaient le
+tueur le plus probable. Ce qu'elle n'inclut pas, c'est l'**état par séquence** :
+108 Mio d'état récurrent GDN par séquence sur 36 couches, plus le cache
+d'attention des 12 couches pleines.
+
+| séquences | trafic par pas | rapport |
+|---:|---:|---:|
+| 1 | 3 499 Mio | 1,00 |
+| 4 | 4 147 Mio | 1,26 |
+| 8 | 5 011 Mio | 1,53 |
+
+Les 2 258 Mio de poids denses se lisent **une seule fois pour tout le lot** :
+c'est là qu'est le gain. Estimation honnête avant mesure : **~2× de débit
+agrégé** à 4-8 séquences, le surcroît d'état retirant une quinzaine de pour
+cent au 2,40 brut.
+
+**Nature du gain, à garder en tête pour arbitrer** : c'est de la **capacité**,
+pas de la latence. Seul devant la machine, on ne verra rien. Cela ne paie
+qu'avec plusieurs clients simultanés sur le LAN.
+
+| # | Étape | Porte de sortie |
+|---|---|---|
+| **P12.1** | **`flash-batch-probe` — prouver que le modèle sait le faire.** Décoder B séquences indépendantes dans un même forward, prompts de **longueur identique** (pas de remplissage : c'est P12.2). Vérifier quels caches portent déjà une dimension de lot (`Qwen4ExpGatedDeltaStates`, `Qwen4ExpCache`, horloge MRoPE, regroupement des lectures PLE de P6.2) et corriger le nécessaire sans toucher au comportement à B=1. | **Parité inter-séquences** : le même prompt répété B fois doit rendre B fois les identifiants de référence, identiques entre eux et au cas B=1. Puis la mesure du débit agrégé à B ∈ {1,2,4,8}. **Si le gain agrégé est < 1,5× à B=8, on s'arrête là et on l'écrit** : l'ordonnanceur ne se justifierait plus. |
+| **P12.2** | **Longueurs inégales.** Remplissage et masque de remplissage, puisque des clients réels n'envoient pas des prompts de même taille. | Parité inchangée avec des longueurs mélangées. |
+| **P12.3** | **Ordonnanceur continu côté serveur.** Entrée et sortie de requêtes en cours de lot, préfill et décodage entrelacés, échantillonnage par séquence, cohabitation avec le LRU de conversations et le cache de préfixe implicite. | Débit agrégé mesuré sur N clients réels, et **TTFT par client non dégradé** par rapport au service sérialisé. |
+
+**Ordre imposé** : P12.1 seule décide de la suite. Tant que sa mesure n'est pas
+rendue, ni P12.2 ni P12.3 ne sont engagées — l'ordonnanceur est la plus grosse
+pièce de code du projet et il ne se justifie que si la physique suit.
