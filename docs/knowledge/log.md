@@ -5316,3 +5316,71 @@ alors que le budget total est de 9 ms.
 
 Le MTP reste disponible en option (`mtp: true`), documenté comme perdant à
 0,94 ×. Aucun travail supplémentaire n'est justifié.
+
+---
+
+## 2026-09-13 — Le bon toit : 3,19 Gio lus par jeton, 18 % de la bande passante, ×5,6 (et non ×28)
+
+Mon tableau « ×28 du toit, 3,6 % de la bande passante » de §P11 ne comptait que
+les **experts routés**. C'était l'erreur de cadrage. Voici le compte complet,
+dérivé des en-têtes safetensors du checkpoint réel.
+
+### Ce que le modèle lit vraiment à chaque jeton décodé
+
+| étage | Mio/jeton | part | toit à 400 Go/s | ablation (P11.2a) | × le toit |
+|---|---:|---:|---:|---:|---:|
+| **GDN (projections, 36 couches)** | **1 246** | 38 % | 3,27 ms | 17,4 ms | 5,3× |
+| experts routés (10 sur 512) | 1 005 | 31 % | 2,63 ms | 20,4 ms | 7,8× |
+| hyper-connexions | 383 | 12 % | 1,00 ms | **21,9 ms** | **21,8×** |
+| QSA (12 couches) | 368 | 11 % | 0,96 ms | 12,1 ms | 12,5× |
+| expert partagé | 141 | 4 % | 0,37 ms | 11,9 ms | **32,2×** |
+| routeur MoE | 120 | 4 % | 0,31 ms | — | — |
+| normes, divers | 20 | 1 % | 0,05 ms | — | — |
+| **TOTAL** | **3 283** | 100 % | **8,61 ms** | | |
+
+(hors table n-gram et embeddings/lm_head, qui sont des lectures **éparses**, et
+hors tour vision, inutilisée en texte)
+
+| | |
+|---|---|
+| mesuré | 47,84 ms par pas → **72 Go/s**, soit **18 % du pic** |
+| toit à 400 Go/s | 8,61 ms → **116 tok/s**, donc **×5,6** et non ×28 |
+| au rendement du matmul dense isolé (212 Go/s mesurés) | 16,2 ms → **62 tok/s**, soit **×2,9** le débit actuel |
+
+### Trois surprises
+
+1. **Les projections GDN lisent plus d'octets que les experts routés** (1 246
+   contre 1 005 Mio). Sur 36 couches, 34,6 Mio par couche. C'est le premier
+   poste du modèle, et personne ne l'avait regardé.
+2. **Les hyper-connexions et l'expert partagé sont les plus inefficaces** :
+   21,8× et 32,2× leur toit, contre 5,3× pour le GDN. Ils lisent peu (383 et
+   141 Mio) mais coûtent autant que des étages dix fois plus gros. Ce sont des
+   empilements de **très petites opérations** — normes, matmuls de rang 320,
+   sigmoïdes, reshape, moyennes — chacune payant sa latence de lancement de
+   3 à 6 µs (mesurée par `op-overhead-probe`) pour un travail dérisoire.
+3. **Le plancher par op n'explique pas tout le reste.** `op-overhead-probe`
+   donne 3-6 µs pour une op élémentaire, mais **61,8 µs pour un matmul
+   [1,2560]×[2560,2560]** (soit 212 Go/s, 53 % du pic) et **150,7 µs pour le
+   `SwitchGLU` réel** (10 experts sur 512, soit 145 Go/s, 36 % du pic). Les
+   grosses opérations ne sont donc **pas** au plancher de lancement : elles
+   font du vrai travail, à la moitié ou au tiers du pic.
+
+### Diagnostic révisé, et il est bien meilleur que le précédent
+
+Le coût se sépare en deux :
+
+- **Les gros étages (GDN, experts, QSA) tournent à 36-53 % du pic** quand on
+  les mesure isolément. C'est perfectible mais pas scandaleux.
+- **Les petits étages (hyper-connexions, expert partagé, normes) tournent à
+  3-5 % du pic** parce qu'ils sont faits de dizaines d'opérations minuscules
+  dont chacune paie sa latence de lancement. **C'est là qu'est le gras.**
+
+Cible chiffrée : ramener les hyper-connexions et l'expert partagé de 21,8× et
+32,2× leur toit à, disons, 8× — ce que fait déjà le GDN — rendrait environ
+**10 ms sur 47,84, soit +26 % de débit**. Et le faire sur tous les petits
+étages à la fois viserait les 62 tok/s du rendement « matmul dense ».
+
+**C'est le premier chiffre de la campagne qui désigne une cible précise avec un
+gain crédible au-delà de 10 %.** À la différence de F8, qui fusionnait 5 ops
+des hyper-connexions et n'en tirait rien : il en reste une vingtaine par
+couche.
