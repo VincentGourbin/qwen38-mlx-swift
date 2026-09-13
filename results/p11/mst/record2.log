@@ -1,0 +1,13 @@
+Starting recording with the Metal System Trace template. Launching process: qwen38. Time limit: 300.0 s
+Ctrl-C to stop the recording
+routed experts (K) : 10/512
+fusion level : 7
+=== variante : none · 1 jeton(s)/pas ===
+ablation active : none
+routed experts (K) : 10/512
+ms/pas (1 jeton(s)/pas) — pas retenus 24 · médiane 52.664 · moyenne 53.260 · écart-type 4.506 · min 44.219 · max 64.870
+MLX mémoire active: 57,38 GB
+MLX mémoire peak: 57,42 GB
+Target app exited, ending recording...
+Recording completed. Saving output file...
+Output file saved as: decode2.trace

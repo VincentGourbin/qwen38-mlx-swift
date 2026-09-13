@@ -1595,6 +1595,13 @@ struct FlashDecodeBench: AsyncParsableCommand {
     )
     var fusionLevel: Int = Qwen4ExpFusionLevel.f7GatedBranchDtype.rawValue
 
+    @Option(
+        name: .long,
+        help:
+            "Nombre de couches entre deux eval() bloquants (défaut 8 = défaut de production, choisi en P4.1 AVANT la correction de dtype F7). La trace Metal montre 197 tampons de commandes et 33 % de GPU inactif par pas : ce réglage est le levier direct sur ce découpage."
+    )
+    var residentAsyncInterval: Int = 8
+
     /// Décode `count` jetons en greedy (température 0 ⇒ `ArgMaxSampler`,
     /// comme `Qwen4ExpStreamingGenerator`) avec l'ablation forcée à `.none`
     /// — la séquence forcée par défaut doit venir du modèle *non ablaté*,
@@ -1638,6 +1645,9 @@ struct FlashDecodeBench: AsyncParsableCommand {
         if ablate != nil && ablateSweep != nil {
             throw ValidationError(
                 "--ablate et --ablate-sweep sont incompatibles : utiliser l'un ou l'autre")
+        }
+        guard residentAsyncInterval > 0 else {
+            throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusion = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
             throw ValidationError(
@@ -1688,7 +1698,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
             layerLoadingMode: .resident,
             residentEvaluationInterval: 1,
             residentAsyncEval: true,
-            residentAsyncInterval: 8,
+            residentAsyncInterval: residentAsyncInterval,
             uncachedIO: true,
             fusionLevel: resolvedFusion,
             routedExpertCount: routedExperts,
@@ -1701,7 +1711,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
         )
         // Même garde de publication que pour K et l'ablation : le niveau de
         // fusion effectif est toujours imprimé, jamais supposé.
-        print("fusion level : \(resolvedFusion.rawValue)")
+        print("fusion level : \(resolvedFusion.rawValue) · resident-async-interval : \(residentAsyncInterval)")
 
         let built = try Qwen4ExpPromptBuilder.buildFirstTurn(
             tokenizer: tokenizer, configuration: configuration, directory: directory,

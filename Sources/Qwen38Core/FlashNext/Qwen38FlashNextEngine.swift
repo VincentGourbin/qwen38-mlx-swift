@@ -228,11 +228,21 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     /// real 3-bit checkpoint (32 tokens, 2 runs each, IDs bit-identical to
     /// greedy in all 10 runs) gave 0.164/0.150/0.144/0.141/0.140 s/token —
     /// N=8 (-14.4 %) and N=12 (-14.6 %) are within noise of each other with
-    /// diminishing returns past 8, so N=8 (already the reference interval
-    /// used throughout `flash-layer-bench --async-interval`) is the default.
+    /// diminishing returns past 8, so N=8 was the default.
+    ///
+    /// **Révisé le 2026-09-13 (P11) : le défaut passe de 8 à 48**, c'est-à-dire
+    /// un seul `eval` bloquant par forward. Le balayage P4.1 ci-dessus datait
+    /// d'**avant** la correction de dtype F7 (P8.2), qui a multiplié le débit
+    /// par 2,74 et déplacé l'optimum. Une trace Metal System Trace du décodage
+    /// a montré **197 tampons de commandes par pas et 33 % de GPU inactif**
+    /// (46 trous par pas, 17,4 ms perdus sur 52,7) ; remesuré à séquence
+    /// forcée sur le checkpoint réel, N ∈ {8, 16, 24, 48} donne
+    /// 46,82 / 45,51 / 44,89 / **44,36** ms par pas — soit **+5,5 %** à N=48,
+    /// avec des identifiants greedy strictement identiques et un pic MLX
+    /// inchangé (57,42 Go). Voir docs/knowledge/log.md, 2026-09-13.
     public init(
         directory: URL, profileLayers: Bool = false, residentAsyncEval: Bool = true,
-        residentAsyncInterval: Int = 8, uncachedIO: Bool = true,
+        residentAsyncInterval: Int = 48, uncachedIO: Bool = true,
         /// P11.1 : surcharge de `num_experts_per_tok` pour le modèle
         /// résident — voir `Qwen4ExpStreamingTextModel`'s doc comment.
         /// `nil` (le défaut) laisse le comportement inchangé.

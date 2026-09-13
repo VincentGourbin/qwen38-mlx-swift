@@ -5458,3 +5458,80 @@ de préfill paie une recompilation. La sonde synthétique de l'agent la chiffre
 à ~7 ms sur un module isolé ; en contexte réel, sur 48 couches et un serveur
 qui voit des dizaines de longueurs, l'effet sur le TTFT n'est **pas mesuré**.
 À trancher avant toute promotion.
+
+---
+
+## 2026-09-13 — La trace Metal tranche : le GPU est inactif un tiers du temps
+
+Dernier instrument de la boîte, et le seul capable de départager les deux
+hypothèses restantes. Deux tentatives :
+
+1. **Échec** : `serve --metal-trace-seconds 25`, xctrace **attaché** au
+   serveur, puis serveur tué. Bundle de 4,1 Go **inexploitable** — `xctrace
+   export` répond « Document Missing Template Error ». La trace P4 conservée
+   (`results/p4-mst-real.trace`) s'exporte, elle : elle avait été **lancée**
+   par xctrace et le process s'était terminé de lui-même.
+   **Règle : tracer un process qui se termine tout seul, ne jamais tuer la
+   cible.**
+2. **Réussite** : `xctrace record --template 'Metal System Trace' --launch --
+   qwen38 flash-decode-bench … --forced-ids …`, limite 300 s (sous
+   instrumentation le chargement seul prend ~80 s ; une limite de 150 s
+   expirait avant le décodage). Bundle de 176 Mo, exportable.
+
+### Ce que la trace montre pendant le décodage
+
+Fenêtre de décodage isolée (1,366 s, 25,9 pas), canal `Compute` du process
+tracé, intervalles fusionnés par union (ils se chevauchent ×2,7) :
+
+| | |
+|---|---|
+| tampons de commandes | **197 par pas de décodage** |
+| durée par tampon | médiane 0,344 ms · moyenne 0,484 ms |
+| **GPU occupé** | **66,7 %** |
+| **GPU inactif** | **33,3 %** |
+| trous réels | **46 par pas**, médiane 16,7 µs, **17,44 ms perdus par pas** sur 52,7 |
+
+**Le GPU ne fait rien pendant un tiers du pas de décodage.** Et pendant les
+66,7 % où il travaille, il traite 3 283 Mio en 35,2 ms, soit **98 Go/s = 24 %
+du pic** — au lieu des 18 % calculés sur le temps de paroi, et toujours sous
+les 36-53 % que les noyaux atteignent isolément.
+
+Le coût se décompose donc en deux parts, toutes deux attaquables :
+
+| part du pas (52,7 ms sous trace) | |
+|---|---|
+| GPU inactif, en attente de l'hôte | **17,4 ms (33 %)** |
+| GPU actif à 24 % du pic | 35,2 ms (67 %) |
+
+### Le levier immédiat : `residentAsyncInterval`
+
+Le réglage qui contrôle la fréquence des `eval` bloquants valait **8**, choisi
+par le balayage P4.1 — **daté d'avant la correction de dtype F7**, qui a
+multiplié le débit par 2,74 et déplacé l'optimum. Remesuré à séquence forcée,
+deux tours alternés :
+
+| N | ms par pas | gain |
+|---:|---:|---:|
+| 8 (ancien défaut) | 46,82 | — |
+| 16 | 45,51 | +2,9 % |
+| 24 | 44,89 | +4,3 % |
+| **48** (un seul `eval` par forward) | **44,36** | **+5,5 %** |
+
+Combiné avec F9 (hyper-connexions et expert partagé compilés) : **43,26 ms,
+soit +8,2 %** et 23,11 tok/s.
+
+Identifiants greedy **strictement identiques** à N=8 et N=48 sur le checkpoint
+réel, et **pic MLX inchangé** (57,42 Go dans les trois configurations).
+
+**Décision : le défaut de `residentAsyncInterval` passe de 8 à 48.** Il passe
+la barre des 5 % que le projet s'est donnée, avec parité exacte et sans coût
+mémoire. F8/F9 restent opt-in tant que l'effet de la recompilation par forme
+sur le TTFT n'est pas mesuré.
+
+### Ce qui reste
+
+Les 17,4 ms d'inactivité GPU ne disparaissent pas avec N=48 : le réglage ne
+touche que les `eval` **bloquants** (6 par forward à N=8, 1 à N=48), pas les
+197 tampons. Les 46 trous par pas viennent d'ailleurs — soumission de tampons,
+dépendances entre encodeurs, ou synchronisations internes à MLX. **C'est le
+prochain chantier, et la trace donne enfin de quoi le viser.**
