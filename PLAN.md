@@ -4259,16 +4259,36 @@ payant chacune 3 à 6 µs de latence de lancement pour un travail dérisoire :
 `Qwen4ExpGatedResidual.callAsFunction` enchaîne ~15 ops, deux fois par couche,
 soit **~1 440 lancements par jeton pour 0,8 ms de travail utile**.
 
-**C'est là qu'est le gras, et c'est la première cible chiffrée de la campagne
-avec un gain crédible.** Ramener les hyper-connexions et l'expert partagé au
-rendement du GDN rendrait ~10 ms sur 47,84, soit **+26 %**. Le faire sur tous
-les petits étages viserait les 62 tok/s.
+**⚠️ Cette piste a été testée et réfutée le 2026-09-13.** Les niveaux F8
+(hyper-connexions compilées par `MLX.compile`, `hc_norm` groupée comprise) et
+F9 (expert partagé) suppriment **2 304 lancements d'opérations par jeton** et
+ne rendent que **+2,4 %**, soit 1 ms sur 47 — avec parité exacte sur le
+checkpoint réel.
 
-**Pourquoi `MLX.compile` plutôt qu'un noyau Metal** : F8 était déjà un
-`MLXFast.metalKernel` sur cet étage, fusionnant 5 des 15 ops — régression de
-1 %. Il en restait dix. `compile` fusionne les chaînes élémentaires
-automatiquement, et `op-overhead-probe` le mesure gagnant sur ce motif
-(`silu(x)*x` : 4,85 µs non compilé contre 3,24 µs compilé).
+**Deux conclusions dures.** D'abord, **nous ne sommes pas limités par le
+nombre de lancements côté hôte** : c'était mon hypothèse, elle est fausse. Le
+coût des ops élémentaires des hyper-connexions vaut ~1,5 ms, pas les 21,9 ms
+que l'ablation lui attribuait. Ensuite, **l'ablation par soustraction
+sur-attribue d'un facteur ~20 sur cet étage**, même à séquence forcée — la
+somme à 180 % du total en était l'indice, on en a ici la preuve par une
+seconde méthode. **Ne plus s'en servir pour choisir une cible** : c'est la
+troisième fois qu'elle égare la campagne (P7, P11.2, F8/F9).
+
+**Ce qui reste vrai et mesuré** : 3 283 Mio lus par jeton, 72 Go/s atteints
+(18 % du pic), toit à 8,61 ms. La lecture des experts coûte 4,80 ms (pente du
+balayage K). Les gros noyaux mesurés **isolément** atteignent 36 à 53 % du pic
+(matmul 2560² : 61,8 µs soit 212 Go/s ; `SwitchGLU` réel : 150,7 µs soit
+145 Go/s). L'ensemble n'atteint que 18 %.
+
+**L'écart n'est donc ni dans les octets, ni dans les lancements hôte, ni dans
+les ops élémentaires.** Deux explications restent en lice, qu'aucune mesure
+n'a départagées : le coût **GPU** d'enchaîner ~4 800 petits noyaux, ou des
+noyaux qui n'atteignent pas en contexte le rendement qu'ils montrent isolés.
+**Le seul instrument capable de trancher est une trace Metal System Trace du
+décodage** — elle donne le compte réel de dispatches et la durée de chacun.
+C'est le dernier instrument de la boîte qui n'ait pas servi à ça (attention :
+plafonner à 60 s, une capture de 300 s avait produit un bundle de 15 Go et
+gelé la machine).
 
 #### Le diagnostic initial, conservé pour mémoire : nous sommes à 28× du toit
 
