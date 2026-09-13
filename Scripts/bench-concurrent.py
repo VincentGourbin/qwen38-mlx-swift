@@ -51,7 +51,7 @@ def main():
 
     health = get("/healthz")
     model = health["model"]
-    print(f"modèle {model} · batch-size annoncé par le serveur : {health.get('batch_size', '?')}")
+    print(f"modèle {model} · batch-size annoncé par le serveur : {health.get('batch_size_configured', '?')}")
 
     prompts = (MELANGES if args.mixed else HOMOGENES)[: args.clients]
     if len(prompts) < args.clients:
@@ -73,8 +73,9 @@ def main():
             with urllib.request.urlopen(req, timeout=1800) as r:
                 resp = json.loads(r.read())
             dt = time.time() - t0
-            n = (resp.get("usage") or {}).get("completion_tokens")
-            results[i] = {"ok": True, "seconds": dt, "tokens": n,
+            # La réponse ne porte pas de champ `usage` : on compte les jetons
+            # côté serveur, via /metrics, après coup (constaté le 2026-09-13).
+            results[i] = {"ok": True, "seconds": dt, "tokens": None,
                           "finish": resp["choices"][0].get("finish_reason")}
         except Exception as e:
             results[i] = {"ok": False, "seconds": time.time() - t0, "error": repr(e)}
@@ -88,7 +89,12 @@ def main():
     ok = [r for r in results if r and r["ok"]]
     if not ok:
         print("aucune requête aboutie :", results[:2]); sys.exit(1)
-    toks = sum(r["tokens"] or 0 for r in ok)
+    sessions = []
+    try:
+        sessions = [s for s in get("/metrics").get("sessions", []) if isinstance(s, dict)][-args.clients:]
+    except Exception as e:
+        print("  (métriques indisponibles :", repr(e), ")")
+    toks = sum(s.get("generatedTokens") or 0 for s in sessions)
     lat = sorted(r["seconds"] for r in ok)
     print(f"\n{len(ok)}/{args.clients} requêtes abouties · prompts "
           f"{'hétérogènes' if args.mixed else 'de longueurs voisines'}")
@@ -96,13 +102,9 @@ def main():
     print(f"  jetons produits          : {toks}")
     print(f"  DÉBIT AGRÉGÉ             : {toks/wall:.2f} jetons/s")
     print(f"  latence par client       : médiane {st.median(lat):.2f} s · min {lat[0]:.2f} · max {lat[-1]:.2f}")
-    try:
-        sessions = get("/metrics").get("sessions", [])[-args.clients:]
-        bs = {s.get("batchSize") for s in sessions if isinstance(s, dict)}
-        if bs and bs != {None}:
-            print(f"  taille de lot vue par le serveur : {sorted(x for x in bs if x is not None)}")
-    except Exception:
-        pass
+    bs = {s.get("batchSizeServed") for s in sessions}
+    if bs and bs != {None}:
+        print(f"  taille de lot vue par le serveur : {sorted(x for x in bs if x is not None)}")
     if args.out:
         json.dump({"clients": args.clients, "mixed": args.mixed, "wall": wall,
                    "tokens": toks, "aggregate_tok_s": toks/wall,
