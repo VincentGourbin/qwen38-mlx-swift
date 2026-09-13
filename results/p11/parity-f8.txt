@@ -1,0 +1,13 @@
+routed experts (K) : 10/512
+ablation active : none
+=== tour 1 ===
+Le président de la Chine est Xi Jinping. Il est le Secrétaire général
+prompt tokens: 29
+generated ids: [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501, 4372, 41196, 67763, 85041]
+TTFT: 64.587s
+prefill: 64.586s
+decode: 3.035s
+couches: 768 visites · load cumulé 64.241s
+P4.2 fin de token (cumulé) : lm_head 0.0306s · sampler.sample 0.0001s · .item() 0.0048s
+MLX mémoire active: 57,38 GB
+MLX mémoire peak: 57,42 GB

@@ -30,15 +30,27 @@ import MLXNN
 /// logs/scripts that refer to "F1-F6" as a contiguous range stay
 /// meaningful, but they do nothing if passed to `--fusion-level`.
 ///
-/// F8 (hyper-connection mix/inject kernels, P10.2) and F9 (GDN q/k L2-norm
-/// kernel, P10.3) **do not appear below**: both were built, validated for
-/// correctness, and then measured on the real checkpoint — F8 a small
-/// (~1 %) but consistent regression, F9 within noise of F7 either way,
-/// neither clearing the ≥5 % bar this campaign requires (docs/knowledge/
-/// log.md "P10.2"/"P10.3"). Their code was removed, not just their
-/// default, following the same precedent as the retired P2-fusion
-/// `switch_mlp` kernel. A future lever should not reuse 8/9 without
-/// checking git history first, to avoid confusion with these retired ones.
+/// F8 et F9 ont d'abord désigné une paire de noyaux `MLXFast.metalKernel`
+/// (mix/inject des hyper-connexions, P10.2 ; L2-norm q/k du GDN, P10.3),
+/// construits, validés pour l'exactitude, puis mesurés sur le checkpoint
+/// réel — F8 une petite régression (~1 %) mais régulière, F9 dans le bruit
+/// de F7 dans un sens comme dans l'autre, aucun des deux ne franchissant la
+/// barre des ≥5 % exigée par cette campagne (docs/knowledge/log.md,
+/// "P10.2"/"P10.3"). Leur code a été retiré, pas seulement leur défaut,
+/// suivant le même précédent que le noyau `switch_mlp` retiré du
+/// P2-fusion — voir l'historique git et les commentaires de tête de
+/// `Qwen4ExpHyperConnection.swift`/`Qwen4ExpGatedDeltaNet.swift` pour le
+/// détail de ce qui a été retiré.
+///
+/// **2026-09-13 (P11, « le bon toit ») réattribue ces deux numéros** à une
+/// approche différente sur un diagnostic différent : `MLX.compile` plutôt
+/// qu'un noyau Metal écrit à la main, ciblant le coût de lancement par
+/// opération des hyper-connexions et de l'expert partagé — mesurés à 21,8×
+/// et 32,2× leur toit de bande passante malgré le trafic d'octets le plus
+/// faible du modèle (docs/knowledge/log.md, 2026-09-13, « Le bon toit »).
+/// Voir le détail de chaque niveau ci-dessous. La réutilisation des numéros
+/// est délibérée, pas un oubli — consulter l'historique git avant de
+/// retoucher l'un ou l'autre cas.
 public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     case none = 0
     /// F1 (collage): fuse quantized input projections that share the same
@@ -86,6 +98,42 @@ public enum Qwen4ExpFusionLevel: Int, Sendable, Comparable, CaseIterable {
     /// checkpoint 3-bit réel : 5,91 → 12,92 tok/s, IDs bit-identiques,
     /// +0,8 Go de pic. Repasser à `.none` pour comparer.
     case f7GatedBranchDtype = 7
+    /// F8 (P11-fusion, 2026-09-13, opt-in) : enveloppe le chemin normal
+    /// (hors branches d'ablation) de `Qwen4ExpGatedResidual.callAsFunction`
+    /// — `hc_norm` compris, la branche groupée de `Qwen4ExpRMSNorm` étant la
+    /// moitié du gisement — dans un seul `MLX.compile`. Compte d'opérations
+    /// mesuré dans le code, par hyper-connexion et par appel, chemin de
+    /// production (F2 déjà appliqué, donc `hc_norm` sur sa branche à poids
+    /// précalculé) :
+    /// - `hc_norm` (branche groupée, `Qwen4ExpRMSNorm.callAsFunction`,
+    ///   cas `effectiveWeight` + `groupSize`) : 11 lancements (`asType`,
+    ///   2×`reshaped`, `values*values`, `mean`, `+eps`, `rsqrt`, 2×`*`,
+    ///   `reshaped`, `asType`).
+    /// - mélange bas-rang + injection (le reste de `callAsFunction`) :
+    ///   13 lancements (3 matmuls down/up/inject, 2 divisions scalaires,
+    ///   `silu`, `sigmoid`×2, 2 `reshaped`, 2 multiplications, `mean`).
+    /// Soit **24 lancements par hyper-connexion**, ×2 par couche
+    /// (`attn_hyper_connection`, `mlp_hyper_connection`), ×48 couches =
+    /// **2 304 lancements par jeton décodé** avant fusion, contre 2 appels
+    /// à une fermeture `MLX.compile` déjà tracée par couche après (le
+    /// nombre de lancements Metal *à l'intérieur* du graphe compilé dépend
+    /// de ce que MLX choisit de fusionner et n'est pas compté ici — voir
+    /// docs/knowledge/log.md, 2026-09-13). Ne s'applique jamais aux
+    /// branches d'ablation (P7.1) ni quand `captureParity` est actif (le
+    /// graphe compilé n'expose pas les tenseurs intermédiaires nommés que
+    /// la capture de parité a besoin de publier) — voir
+    /// `Qwen4ExpGatedResidual.prepareCompiledPath()`.
+    case f8HyperConnectionsCompiled = 8
+    /// F9 (P11-fusion, 2026-09-13, opt-in) : réutilise `compiledSiluProduct`
+    /// (`MLXLMCommon`, déjà partagé par `SwitchGLU`, donc pas de second
+    /// noyau compilé) pour la partie `silu(gate) * up` de
+    /// `Qwen4ExpSharedExpert.callAsFunction` — `downProj(silu(gateProj(x))
+    /// * upProj(x))` devient `downProj(compiledSiluProduct(gateProj(x),
+    /// upProj(x)))`. Fusionne 2 lancements (`silu`, puis la multiplication)
+    /// en 1 appel à la fermeture compilée, sans toucher aux 3 matmuls. Un
+    /// expert partagé par couche, 48 couches : **48 lancements économisés
+    /// par jeton décodé** (un par couche).
+    case f9SharedExpertCompiled = 9
 
     public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 
@@ -157,6 +205,17 @@ extension Qwen4ExpDecoderLayer {
             for module in modules() {
                 (module as? Qwen4ExpRMSNorm)?.precomputeEffectiveWeight()
             }
+        }
+        // F8 : préparé après F2 ci-dessus (ordre textuel), donc la
+        // fermeture compilée trace `hc_norm` sur sa branche à poids
+        // précalculé, pas la branche `1 + weight` par appel — voir le
+        // commentaire de `Qwen4ExpFusionLevel.f8HyperConnectionsCompiled`.
+        if Qwen4ExpFusionLevel.f8HyperConnectionsCompiled.isReached(by: level) {
+            attnHyperConnection.prepareCompiledPath()
+            mlpHyperConnection.prepareCompiledPath()
+        }
+        if Qwen4ExpFusionLevel.f9SharedExpertCompiled.isReached(by: level) {
+            mlp.sharedExpert.prepareCompiledActivation()
         }
     }
 }

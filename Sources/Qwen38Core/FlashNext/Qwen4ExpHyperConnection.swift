@@ -37,6 +37,15 @@ public final class Qwen4ExpGatedResidual: Module {
     /// `Qwen4ExpSparseMoE.ablation`'s doc comment.
     public private(set) var ablation: Qwen4ExpLayerBenchAblation
 
+    /// F8 (P11-fusion, `--fusion-level 8`) : fermeture `MLX.compile`
+    /// mémorisée pour le chemin normal de `callAsFunction` (`hc_norm` +
+    /// mélange bas-rang + injection). `nil` tant que F8 n'a pas été demandé
+    /// — voir `prepareCompiledPath()`. Jamais consultée par les branches
+    /// d'ablation (P7.1) ni quand `captureParity` est actif : le graphe
+    /// compilé ne renvoie que `(mixed, injection)`, pas `normed`, que la
+    /// capture de parité doit publier.
+    private var compiledPath: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     public init(
         configuration: Qwen4ExpTextConfiguration,
         rmsNormEps: Float = 1e-6,
@@ -86,6 +95,15 @@ public final class Qwen4ExpGatedResidual: Module {
             return (mixed, hyperInput, injection)
         }
 
+        // F8 (`--fusion-level 8`) : chemin compilé, seulement hors ablation
+        // et hors capture de parité (le graphe compilé n'expose pas
+        // `normed`, que `lastParityCapture` doit publier — voir
+        // `prepareCompiledPath()`).
+        if let compiledPath, ablation == .none, !(captureParity && !parityPrefix.isEmpty) {
+            let outputs = compiledPath([hyperInput])
+            return (outputs[0], hyperInput, outputs[1])
+        }
+
         // P7.1 (`--ablate norms`): skip hc_norm, reusing its already
         // shape-correct input for the rest of the mix. Never numerically
         // correct.
@@ -107,6 +125,49 @@ public final class Qwen4ExpGatedResidual: Module {
             ]
         }
         return (mixed, hyperInput, injection)
+    }
+
+    /// F8 (P11-fusion, `--fusion-level 8`) : trace `hc_norm` + le mélange
+    /// bas-rang + l'injection en un seul graphe `MLX.compile`, remplaçant
+    /// ~24 lancements de noyaux élémentaires par appel (voir le commentaire
+    /// de `Qwen4ExpFusionLevel.f8HyperConnectionsCompiled` pour le compte
+    /// détaillé). Idempotent — comme `precomputeEffectiveWeight()`, sûr à
+    /// appeler plusieurs fois. Doit être appelé après que les poids réels
+    /// (et, le cas échéant, la F2 de `hc_norm`) sont en place : les
+    /// tenseurs de poids lus par la fermeture au premier passage de trace
+    /// sont figés dans le graphe compilé, exactement comme `effectiveWeight`
+    /// fige `1 + weight` — voir `Qwen4ExpDecoderLayer.prepareFusion`, où F8
+    /// est appliqué textuellement après F2.
+    ///
+    /// La forme est constante en décodage (`[1, 1, streamCount*hiddenSize]`)
+    /// donc pas de `shapeless` ici. Piège documenté, non vérifié sans
+    /// checkpoint réel : un préfill (`[1, seq, …]`, longueur variable d'une
+    /// conversation à l'autre) et le décodage (`[1, 1, …]`) forcent chacun
+    /// leur propre compilation la première fois qu'ils sont vus — MLX met
+    /// en cache un graphe par forme rencontrée, donc l'alternance
+    /// préfill/décodage à *longueur de préfill fixe* ne recompile qu'une
+    /// fois par forme, mais une longueur de préfill différente à chaque
+    /// nouvelle conversation recompile à chaque fois. À mesurer : le coût
+    /// de cette recompilation au premier jeton d'une conversation.
+    public func prepareCompiledPath() {
+        guard compiledPath == nil else { return }
+        guard blockInjectWeight != nil else {
+            preconditionFailure(
+                "F8 exige une hyper-connexion avec injection (useCombine), voir prepareCompiledPath()")
+        }
+        compiledPath = compile { [unowned self] inputs in
+            let hyperInput = inputs[0]
+            let normed = self.hcNorm(hyperInput)
+            let upOut = self.inputMixWeightUp(
+                silu(self.inputMixWeightDown(normed) / Float(self.streamCount)))
+            let mixed = (sigmoid(upOut)
+                .reshaped([hyperInput.dim(0), hyperInput.dim(1), self.streamCount, self.hiddenSize])
+                * normed.reshaped(
+                    [hyperInput.dim(0), hyperInput.dim(1), self.streamCount, self.hiddenSize]))
+                .mean(axis: -2)
+            let injection = 2 * sigmoid(self.blockInjectWeight!(normed) / Float(self.streamCount))
+            return [mixed, injection]
+        }
     }
 
     public func setParityCapture(_ enabled: Bool) {

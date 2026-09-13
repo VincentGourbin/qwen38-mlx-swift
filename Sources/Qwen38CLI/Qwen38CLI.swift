@@ -557,7 +557,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA) — s'applique aussi au chemin --mtp"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P11-fusion, hyper-connexions/expert partagé compilés, opt-in) — s'applique aussi au chemin --mtp"
     )
     var fusionLevel: Int = 7
 
@@ -588,7 +588,7 @@ struct FlashGenerateProbe: AsyncParsableCommand {
             throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+            throw ValidationError("--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P11-fusion F8/F9)")
         }
         if mtp && image != nil {
             throw ValidationError(
@@ -894,7 +894,7 @@ struct FlashLayerBench: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à la couche après chargement (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P11-fusion, hyper-connexions/expert partagé compilés, opt-in)"
     )
     var fusionLevel: Int = 7
 
@@ -962,10 +962,10 @@ struct FlashLayerBench: AsyncParsableCommand {
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
             throw ValidationError(
-                "--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+                "--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P11-fusion F8/F9)")
         }
         if checkParity && resolvedFusionLevel == .none && stepLayers == 0 {
-            throw ValidationError("--check-parity exige --fusion-level 1-7 (comparaison à .none)")
+            throw ValidationError("--check-parity exige --fusion-level 1-9 (comparaison à .none)")
         }
         let resolvedAblation: Qwen4ExpLayerBenchAblation
         if let ablate {
@@ -1304,7 +1304,7 @@ struct FlashChatProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "P2-fusion : niveau cumulatif F1-F7 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA)"
+            "P2-fusion : niveau cumulatif F1-F9 appliqué à chaque couche (0 = chemin d'origine, défaut ; 7 = P8.2, correction du fuite dtype fp32 GDN/QSA ; 8/9 = P11-fusion, hyper-connexions/expert partagé compilés, opt-in)"
     )
     var fusionLevel: Int = 7
 
@@ -1333,7 +1333,7 @@ struct FlashChatProbe: AsyncParsableCommand {
             throw ValidationError("--resident-async-interval doit être positif")
         }
         guard let resolvedFusionLevel = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
-            throw ValidationError("--fusion-level doit appartenir à 0-7 (P2-fusion F1-F6, P8.2 F7)")
+            throw ValidationError("--fusion-level doit appartenir à 0-9 (P2-fusion F1-F6, P8.2 F7, P11-fusion F8/F9)")
         }
         if let routedExperts, routedExperts < 1 {
             throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
@@ -1588,6 +1588,13 @@ struct FlashDecodeBench: AsyncParsableCommand {
         help: "P11.1 : surcharge de la largeur de routage MoE — même contrat que flash-chat-probe")
     var routedExperts: Int?
 
+    @Option(
+        name: .long,
+        help:
+            "Niveau de fusion cumulatif appliqué à chaque couche (défaut 7 = défaut de production). 8 et 9 ajoutent les chemins compilés des hyper-connexions et de l'expert partagé."
+    )
+    var fusionLevel: Int = Qwen4ExpFusionLevel.f7GatedBranchDtype.rawValue
+
     /// Décode `count` jetons en greedy (température 0 ⇒ `ArgMaxSampler`,
     /// comme `Qwen4ExpStreamingGenerator`) avec l'ablation forcée à `.none`
     /// — la séquence forcée par défaut doit venir du modèle *non ablaté*,
@@ -1631,6 +1638,11 @@ struct FlashDecodeBench: AsyncParsableCommand {
         if ablate != nil && ablateSweep != nil {
             throw ValidationError(
                 "--ablate et --ablate-sweep sont incompatibles : utiliser l'un ou l'autre")
+        }
+        guard let resolvedFusion = Qwen4ExpFusionLevel(rawValue: fusionLevel) else {
+            throw ValidationError(
+                "--fusion-level doit être compris entre 0 et "
+                    + "\(Qwen4ExpFusionLevel.allCases.map(\.rawValue).max() ?? 7)")
         }
         if tokensPerStepSweep != nil && ablateSweep != nil {
             throw ValidationError(
@@ -1678,6 +1690,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
             residentAsyncEval: true,
             residentAsyncInterval: 8,
             uncachedIO: true,
+            fusionLevel: resolvedFusion,
             routedExpertCount: routedExperts,
             ablation: .none)
         // P11.1 : garde de publication — toujours affiché, même sans
@@ -1686,6 +1699,9 @@ struct FlashDecodeBench: AsyncParsableCommand {
         print(
             "routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)"
         )
+        // Même garde de publication que pour K et l'ablation : le niveau de
+        // fusion effectif est toujours imprimé, jamais supposé.
+        print("fusion level : \(resolvedFusion.rawValue)")
 
         let built = try Qwen4ExpPromptBuilder.buildFirstTurn(
             tokenizer: tokenizer, configuration: configuration, directory: directory,

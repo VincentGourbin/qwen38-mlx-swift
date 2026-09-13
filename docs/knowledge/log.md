@@ -5384,3 +5384,77 @@ Cible chiffrée : ramener les hyper-connexions et l'expert partagé de 21,8× et
 gain crédible au-delà de 10 %.** À la différence de F8, qui fusionnait 5 ops
 des hyper-connexions et n'en tirait rien : il en reste une vingtaine par
 couche.
+
+---
+
+## 2026-09-13 — F8/F9 compilés : +2,4 %, et la mort de l'hypothèse « limité par les lancements »
+
+Deux niveaux opt-in ajoutés : **F8** compile le corps de
+`Qwen4ExpGatedResidual.callAsFunction` (`hc_norm` groupée comprise) dans un
+`MLX.compile`, **F9** fait passer l'activation de l'expert partagé par
+`compiledSiluProduct`. Comptage fait dans le code : **24 lancements par
+hyper-connexion** (11 pour la norme groupée, qui ne peut pas utiliser
+`MLXFast.rmsNorm`, et 13 pour le reste), × 2 par couche × 48 couches =
+**2 304 lancements par jeton** remplacés par 2 appels de fermeture compilée par
+couche. F9 économise 48 lancements de plus.
+
+### Mesure
+
+`flash-decode-bench`, séquence forcée identique, 16 warmup + 96 pas, trois
+process alternés par niveau :
+
+| niveau | runs (ms/pas) | médiane | gain |
+|---:|---|---:|---:|
+| 7 (défaut de production) | 52,59 · 47,19 · 47,03 | 47,187 | — |
+| 8 (+ hyper-connexions compilées) | 46,26 · 46,36 · 46,15 | 46,261 | **+2,0 %** |
+| 9 (+ expert partagé compilé) | 46,07 · 46,85 · 45,95 | 46,066 | **+2,4 %** |
+
+**Parité exacte sur le checkpoint réel** : `flash-chat-probe --fusion-level
+7/8/9`, greedy, 16 jetons — identifiants strictement identiques aux trois
+niveaux.
+
+### Ce que ça enterre
+
+**Supprimer 2 304 lancements d'opérations par jeton rapporte 1 ms sur 47.**
+L'hypothèse « nous sommes limités par le nombre de lancements côté hôte » est
+donc **fausse**, et avec elle la lecture que j'en tirais. Le coût des ops
+élémentaires de l'étage hyper-connexion est d'environ **1,5 ms**, pas les
+21,9 ms que l'ablation lui attribuait.
+
+**Corollaire méthodologique dur : l'ablation par soustraction sur-attribue
+d'un facteur ~20 sur cet étage**, même à séquence forcée. La somme à 180 % du
+total en était déjà l'indice ; ici on a la preuve directe par une seconde
+méthode. **Les chiffres d'ablation ne valent ni comme parts ni comme
+classement fiable — au mieux comme borne supérieure.** Ne plus les utiliser
+pour choisir une cible : c'est la troisième fois que cet instrument égare la
+campagne (P7, P11.2, ici).
+
+### Où est donc le temps ?
+
+Ce qui reste solidement mesuré :
+
+| | |
+|---|---|
+| poids lus par jeton | 3 283 Mio |
+| débit atteint | 72 Go/s = **18 % du pic** |
+| lecture des experts (pente mesurée du balayage K) | **4,80 ms** |
+| ops élémentaires des hyper-connexions (mesuré par F8) | **~1,0 ms** |
+| noyaux isolés, mesurés par `op-overhead-probe` | matmul 2560² : 61,8 µs = **212 Go/s** (53 % du pic) · `SwitchGLU` réel : 150,7 µs = **145 Go/s** (36 %) |
+
+Les gros noyaux, mesurés seuls, atteignent 36 à 53 % du pic. L'ensemble
+n'atteint que 18 %. **L'écart n'est ni dans les octets, ni dans les lancements
+hôte, ni dans les ops élémentaires.** Il reste deux explications possibles,
+qu'aucune mesure de la nuit ne départage : le coût GPU d'enchaîner ~4 800
+petits noyaux (que `compile` ne supprime qu'en partie), ou des noyaux qui,
+en contexte, n'atteignent pas le rendement qu'ils montrent isolés.
+
+### Décision sur F8/F9
+
+**+2,4 % avec parité exacte, sous la barre des 5 %** que le projet s'est
+donnée pour promouvoir un niveau de fusion (§P10). Conservés **opt-in**, pas
+promus en défaut, pour une raison précise qui reste à mesurer : `MLX.compile`
+met en cache **un graphe par forme rencontrée**, donc chaque nouvelle longueur
+de préfill paie une recompilation. La sonde synthétique de l'agent la chiffre
+à ~7 ms sur un module isolé ; en contexte réel, sur 48 couches et un serveur
+qui voit des dizaines de longueurs, l'effet sur le TTFT n'est **pas mesuré**.
+À trancher avant toute promotion.

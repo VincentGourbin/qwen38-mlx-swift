@@ -50,6 +50,14 @@ public final class Qwen4ExpSharedExpert: Module, UnaryLayer {
     @ModuleInfo(key: "up_proj") public var upProj: Linear
     @ModuleInfo(key: "down_proj") public var downProj: Linear
 
+    /// F9 (P11-fusion, `--fusion-level 9`) : bascule `callAsFunction` sur
+    /// `compiledSiluProduct` (`MLXLMCommon`, déjà partagé avec `SwitchGLU`
+    /// — aucun second graphe compilé créé) pour la partie `silu(gate) * up`.
+    /// `false` partout par défaut — voir
+    /// `Qwen4ExpFusionLevel.f9SharedExpertCompiled` et
+    /// `prepareCompiledActivation()`.
+    private var useCompiledActivation = false
+
     public init(
         inputDimensions: Int,
         hiddenDimensions: Int,
@@ -68,7 +76,16 @@ public final class Qwen4ExpSharedExpert: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        let gate = gateProj(x)
+        let up = upProj(x)
+        let activated = useCompiledActivation ? compiledSiluProduct(gate, up) : silu(gate) * up
+        return downProj(activated)
+    }
+
+    /// F9 : active `compiledSiluProduct` pour cette instance. Idempotent,
+    /// ne touche à aucun poids — voir `Qwen4ExpDecoderLayer.prepareFusion`.
+    public func prepareCompiledActivation() {
+        useCompiledActivation = true
     }
 }
 

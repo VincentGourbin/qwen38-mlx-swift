@@ -2793,6 +2793,142 @@ func qwen4ExpSparseMoERoutingSurvivesImpreciseSoftmax() {
     #expect(mismatches == 0, "\(mismatches)/200 vecteurs de logits ont changé de routage")
 }
 
+// MARK: - P11-fusion (F8/F9) : hyper-connexions et expert partagé compilés
+
+/// Même générateur que le `randomLeaf` privé de `Qwen4ExpLayerBench` (fichier
+/// séparé, donc non réutilisable tel quel) : poids uint32 empaquetés à bits
+/// aléatoires, sinon flottants de faible amplitude pour rester stable
+/// numériquement sur des poids non entraînés.
+private func qwen4ExpFusionTestRandomLeaf(like array: MLXArray) -> MLXArray {
+    if array.dtype == .uint32 {
+        return MLXRandom.randInt(low: Int32(0), high: Int32(1 << 30), array.shape)
+            .asType(.uint32)
+    }
+    return MLXRandom.uniform(low: Float(-0.05), high: Float(0.05), array.shape)
+        .asType(array.dtype)
+}
+
+/// F8/F9 ne sont **pas** testés via `Qwen4ExpLayerBench.checkParity(fusionLevel:)`
+/// comme F1/F2/F4 le sont plus haut : ce harnais compare toujours au chemin
+/// `.none`, et `Qwen4ExpFusionLevel` est cumulatif (`isReached(by:)`, voir
+/// Qwen4ExpFusion.swift) — au niveau 8, F1/F2/F4/F7 sont *aussi* actifs, dont
+/// F7 qui est une vraie correction numérique (P8.2), pas un simple
+/// réordonnancement. Comparer `.none` à F8/F9 mélangerait donc l'effet de F7
+/// avec celui du niveau testé — exactement le piège que P10.2 a documenté et
+/// contourné pour l'ancien F8/F9 (docs/knowledge/log.md, "P10.2 : ... Fausse
+/// alerte de parité, élucidée") en écrivant des tests dédiés au lieu de
+/// réutiliser `checkParity`. Les deux tests ci-dessous suivent le même
+/// principe : ils appellent le chemin d'origine puis le chemin compilé sur
+/// la **même instance**, mêmes poids, même entrée — isolant l'effet du seul
+/// niveau testé, indépendamment de tout autre levier.
+@Test(
+    "P11-fusion (F8) : le chemin MLX.compile de Qwen4ExpGatedResidual égale le chemin d'origine, aux dimensions et au dtype du checkpoint réel"
+)
+func qwen4ExpGatedResidualCompiledPathMatchesOriginalPathAtProductionDtype() {
+    // Dimensions réelles du checkpoint (Qwen4ExpLayerBenchDimensions.real,
+    // fileprivate à Qwen4ExpLayerBench.swift, donc reconstruites ici) :
+    // hidden 2560, 4 flux, rang bas 320.
+    let configuration = Qwen4ExpTextConfiguration(
+        hiddenSize: 2_560, numHiddenLayers: 1, numAttentionHeads: 24, numKeyValueHeads: 2,
+        headDim: 256, layerTypes: [.linearAttention], fullAttentionInterval: 1,
+        linearNumKeyHeads: 16, linearNumValueHeads: 48, linearKeyHeadDim: 128,
+        linearValueHeadDim: 128, linearConvKernelDim: 4, numExperts: 512, numExpertsPerToken: 10,
+        moeIntermediateSize: 640, sharedExpertIntermediateSize: 640, indexerBudget: 2_048,
+        indexerCompressRatio: 4, indexerHeadDim: 128, indexerKVHeads: 1, indexerNHeads: 4,
+        hcCount: 4, hcLowrank: 320, ngramSize: 3, ngramVocabSizeBase: 20_000_000,
+        splitNgramParts: 128, pleLayerIDs: [], pleConvKernelSize: 4, vocabSize: 248_320,
+        maxPositionEmbeddings: 262_144)
+    let quantization = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4)
+
+    MLXRandom.seed(20_260_913)
+    let residual = Qwen4ExpGatedResidual(configuration: configuration, quantization: quantization)
+    let randomWeights = Dictionary(
+        uniqueKeysWithValues: residual.parameters().flattened().map {
+            ($0.0, qwen4ExpFusionTestRandomLeaf(like: $0.1))
+        })
+    eval(Array(randomWeights.values))
+    try! residual.update(parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
+    // F2 déjà appliqué, comme en production dès le niveau 8 (cumulatif) —
+    // sans ceci, `hc_norm` prendrait sa branche `1 + weight` par appel, pas
+    // la branche à poids précalculé que F8 doit réellement tracer (voir le
+    // commentaire de `Qwen4ExpFusionLevel.f8HyperConnectionsCompiled`).
+    residual.hcNorm.precomputeEffectiveWeight()
+
+    MLXRandom.seed(20_260_913 &+ 1)
+    let hyperInput = MLXRandom.uniform(
+        low: Float(-1), high: Float(1), [1, 1, 4 * 2_560], dtype: .bfloat16)
+    eval(hyperInput)
+
+    let eagerOutput = residual(hyperInput)
+    eval(eagerOutput.mixedInput, eagerOutput.injectionWeights)
+
+    residual.prepareCompiledPath()
+    let compiledOutput = residual(hyperInput)
+    eval(compiledOutput.mixedInput, compiledOutput.injectionWeights)
+
+    let relativeTolerance: Float = 1e-3
+    let absoluteTolerance: Float = 1e-3
+    for (label, baseline, fused) in [
+        ("mixedInput", eagerOutput.mixedInput, compiledOutput.mixedInput),
+        ("injectionWeights", eagerOutput.injectionWeights, compiledOutput.injectionWeights),
+    ] {
+        let baselineF32 = baseline.asType(.float32)
+        let fusedF32 = fused.asType(.float32)
+        let absoluteDiff = MLX.abs(baselineF32 - fusedF32)
+        let tolerance = absoluteTolerance + relativeTolerance * MLX.abs(baselineF32)
+        let normalizedDiff = absoluteDiff / tolerance
+        eval(normalizedDiff)
+        let maxNormalizedDiff = normalizedDiff.max().item(Float.self)
+        #expect(
+            maxNormalizedDiff <= 1,
+            "\(label) : écart normalisé max \(maxNormalizedDiff) (attendu ≤ 1, bruit d'arrondi bf16)")
+    }
+}
+
+@Test(
+    "P11-fusion (F9) : compiledSiluProduct dans Qwen4ExpSharedExpert égale silu(gate)*up, aux dimensions du checkpoint réel"
+)
+func qwen4ExpSharedExpertCompiledActivationMatchesOriginalPathAtProductionDtype() {
+    // Dimensions réelles : hidden 2560, intermédiaire de l'expert partagé
+    // 640 (Qwen4ExpLayerBenchDimensions.real).
+    let quantization = Qwen4ExpQuantizationSpec(groupSize: 32, bits: 4)
+
+    MLXRandom.seed(20_260_913 &+ 2)
+    let sharedExpert = Qwen4ExpSharedExpert(
+        inputDimensions: 2_560, hiddenDimensions: 640, quantization: quantization)
+    let randomWeights = Dictionary(
+        uniqueKeysWithValues: sharedExpert.parameters().flattened().map {
+            ($0.0, qwen4ExpFusionTestRandomLeaf(like: $0.1))
+        })
+    eval(Array(randomWeights.values))
+    try! sharedExpert.update(
+        parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
+
+    MLXRandom.seed(20_260_913 &+ 3)
+    let x = MLXRandom.uniform(low: Float(-1), high: Float(1), [1, 1, 2_560], dtype: .bfloat16)
+    eval(x)
+
+    let eagerOutput = sharedExpert(x)
+    eval(eagerOutput)
+
+    sharedExpert.prepareCompiledActivation()
+    let compiledOutput = sharedExpert(x)
+    eval(compiledOutput)
+
+    let eagerF32 = eagerOutput.asType(.float32)
+    let compiledF32 = compiledOutput.asType(.float32)
+    let absoluteDiff = MLX.abs(eagerF32 - compiledF32)
+    let relativeTolerance: Float = 1e-3
+    let absoluteTolerance: Float = 1e-3
+    let tolerance = absoluteTolerance + relativeTolerance * MLX.abs(eagerF32)
+    let normalizedDiff = absoluteDiff / tolerance
+    eval(normalizedDiff)
+    let maxNormalizedDiff = normalizedDiff.max().item(Float.self)
+    #expect(
+        maxNormalizedDiff <= 1,
+        "écart normalisé max \(maxNormalizedDiff) (attendu ≤ 1, bruit d'arrondi bf16)")
+}
+
 // MARK: - P11.1 : largeur de routage MoE réglable à l'exécution
 
 @Test("P11.1 : sans surcharge, la valeur du checkpoint est utilisée telle quelle")
