@@ -4280,15 +4280,37 @@ balayage K). Les gros noyaux mesurés **isolément** atteignent 36 à 53 % du pi
 (matmul 2560² : 61,8 µs soit 212 Go/s ; `SwitchGLU` réel : 150,7 µs soit
 145 Go/s). L'ensemble n'atteint que 18 %.
 
-**L'écart n'est donc ni dans les octets, ni dans les lancements hôte, ni dans
-les ops élémentaires.** Deux explications restent en lice, qu'aucune mesure
-n'a départagées : le coût **GPU** d'enchaîner ~4 800 petits noyaux, ou des
-noyaux qui n'atteignent pas en contexte le rendement qu'ils montrent isolés.
-**Le seul instrument capable de trancher est une trace Metal System Trace du
-décodage** — elle donne le compte réel de dispatches et la durée de chacun.
-C'est le dernier instrument de la boîte qui n'ait pas servi à ça (attention :
-plafonner à 60 s, une capture de 300 s avait produit un bundle de 15 Go et
-gelé la machine).
+**Tranché le 2026-09-13 par une trace Metal System Trace du décodage.** Le
+coût se décompose en deux parts, toutes deux attaquables :
+
+| part du pas (52,7 ms sous trace) | |
+|---|---|
+| **GPU inactif, en attente de l'hôte** | **17,4 ms (33 %)** — 46 trous par pas, médiane 16,7 µs |
+| GPU actif, à 24 % du pic | 35,2 ms (67 %) |
+
+197 tampons de commandes par pas, durée médiane 0,344 ms, se chevauchant
+×2,7. Pendant qu'il travaille, le GPU traite 3 283 Mio en 35,2 ms, soit
+98 Go/s — mieux que les 18 % calculés sur le temps de paroi, toujours sous
+les 36-53 % des noyaux isolés.
+
+**Premier gain encaissé : `residentAsyncInterval` passe de 8 à 48** (un seul
+`eval` bloquant par forward). Le 8 venait du balayage P4.1, **daté d'avant la
+correction de dtype F7** qui a déplacé l'optimum. Remesuré à séquence forcée :
+46,82 → 45,51 → 44,89 → **44,36 ms** pour N = 8/16/24/48, soit **+5,5 %**,
+identifiants greedy identiques, pic MLX inchangé. Combiné à F9 : **+8,2 %**,
+23,11 tok/s.
+
+**Prochain chantier, et c'est le dernier gros** : les 17,4 ms d'inactivité ne
+disparaissent pas avec N=48, qui ne touche que les `eval` bloquants (6 par
+forward à N=8, 1 à N=48) et non les 197 tampons. Les 46 trous par pas viennent
+d'ailleurs — soumission de tampons, dépendances entre encodeurs, ou
+synchronisations internes à MLX. La trace donne enfin de quoi les viser.
+
+*Note d'outillage : tracer un process qui se termine tout seul
+(`xctrace record --launch -- …`), jamais attacher puis tuer la cible — un
+bundle de 4,1 Go a été perdu ainsi (« Document Missing Template Error »). Et
+sous instrumentation le chargement seul prend ~80 s, donc prévoir 300 s de
+limite.*
 
 #### Le diagnostic initial, conservé pour mémoire : nous sommes à 28× du toit
 
