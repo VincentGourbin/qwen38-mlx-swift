@@ -3345,3 +3345,75 @@ func qwen4ExpTokensPerStepSweepSharesForcedSequence() throws {
         try qwen4ExpSplitForcedDecodeSteps(forcedIDs: ids, tokensPerStep: 5, stepCount: 4)
     }
 }
+
+// MARK: - P11 : logique pure de flash-batch-probe (sans checkpoint)
+
+@Test("P11 : --prompts découpe sur la barre verticale et débarrasse chaque prompt de ses espaces de bord")
+func qwen4ExpSplitBatchPromptsSplitsAndTrims() throws {
+    #expect(try qwen4ExpSplitBatchPrompts("a|b|c") == ["a", "b", "c"])
+    #expect(try qwen4ExpSplitBatchPrompts(" a | b |c ") == ["a", "b", "c"])
+    #expect(try qwen4ExpSplitBatchPrompts("un seul prompt") == ["un seul prompt"])
+}
+
+@Test("P11 : --prompts rejette une chaîne vide ou faite d'espaces")
+func qwen4ExpSplitBatchPromptsRejectsBlank() {
+    #expect(throws: Qwen4ExpBatchProbeError.noPrompts) {
+        try qwen4ExpSplitBatchPrompts("")
+    }
+    #expect(throws: Qwen4ExpBatchProbeError.noPrompts) {
+        try qwen4ExpSplitBatchPrompts("   ")
+    }
+}
+
+@Test("P11 : --prompts rejette un prompt vide (barre finale ou consécutive), en nommant sa position")
+func qwen4ExpSplitBatchPromptsRejectsEmptyEntry() {
+    #expect(throws: Qwen4ExpBatchProbeError.emptyPromptAtIndex(2)) {
+        try qwen4ExpSplitBatchPrompts("a|b|")
+    }
+    #expect(throws: Qwen4ExpBatchProbeError.emptyPromptAtIndex(1)) {
+        try qwen4ExpSplitBatchPrompts("a| |b")
+    }
+}
+
+@Test("P11 : des longueurs de prompt égales renvoient la longueur commune")
+func qwen4ExpValidateEqualPromptTokenCountsAccepts() throws {
+    #expect(try qwen4ExpValidateEqualPromptTokenCounts([12, 12, 12]) == 12)
+    #expect(try qwen4ExpValidateEqualPromptTokenCounts([7]) == 7)
+}
+
+@Test("P11 : des longueurs de prompt inégales sont rejetées avec le détail de chacune")
+func qwen4ExpValidateEqualPromptTokenCountsRejects() {
+    #expect(throws: Qwen4ExpBatchProbeError.unequalPromptLengths(tokenCounts: [12, 15, 12])) {
+        try qwen4ExpValidateEqualPromptTokenCounts([12, 15, 12])
+    }
+}
+
+@Test("P11 : le message d'erreur de longueur inégale nomme chaque prompt et sa longueur")
+func qwen4ExpUnequalPromptLengthsMessageNamesEachPrompt() {
+    let error = Qwen4ExpBatchProbeError.unequalPromptLengths(tokenCounts: [12, 15])
+    let message = error.errorDescription ?? ""
+    #expect(message.contains("prompt 0 : 12 jeton"))
+    #expect(message.contains("prompt 1 : 15 jeton"))
+}
+
+@Test("P11 : la parité inter-séquences réussit quand toutes les séquences sont identiques")
+func qwen4ExpBatchParityChecksSucceedsOnIdenticalSequences() {
+    let sequences: [[Int32]] = [[1, 2, 3], [1, 2, 3], [1, 2, 3]]
+    let result = qwen4ExpBatchParityCheck(sequences)
+    #expect(result.allEqual)
+    #expect(result.firstMismatchIndex == nil)
+}
+
+@Test("P11 : la parité inter-séquences échoue et nomme le premier rang fautif")
+func qwen4ExpBatchParityCheckFailsOnMismatch() {
+    let sequences: [[Int32]] = [[1, 2, 3], [1, 2, 3], [1, 9, 3]]
+    let result = qwen4ExpBatchParityCheck(sequences)
+    #expect(!result.allEqual)
+    #expect(result.firstMismatchIndex == 2)
+}
+
+@Test("P11 : la parité inter-séquences réussit trivialement à B=1 ou sur un lot vide")
+func qwen4ExpBatchParityCheckTrivialCases() {
+    #expect(qwen4ExpBatchParityCheck([[1, 2, 3]]).allEqual)
+    #expect(qwen4ExpBatchParityCheck([]).allEqual)
+}

@@ -5603,3 +5603,83 @@ chaque client au-delà de +234 % sur un pas qui sert 8 clients au lieu d'un.
 C'est un gain de **capacité**, pas de latence mono-utilisateur : cette
 dernière est désormais bornée par la sérialité du modèle, qu'aucune des
 douze pistes de §P11 n'a pu contourner.
+
+---
+
+## 2026-09-13 — P12.1 : le lot passe la porte, ×2,94 à huit séquences
+
+La sonde `flash-batch-probe` décode B séquences indépendantes dans un même
+forward, prompts de longueur identique, greedy strict par séquence.
+
+### La surprise : aucune modification de production n'a été nécessaire
+
+Revue module par module, en suivant `dim(0)` de bout en bout :
+
+| module | état |
+|---|---|
+| `Qwen4ExpGatedDeltaStates` (état conv + récurrent GDN) | construit en `[batch, …]` depuis `inputs.dim(0)`, **déjà générique** |
+| `Qwen4ExpCache` / `Qwen4ExpQSAKVCache` | délègue à `KVCacheSimple`, dimensionné sur `keys.dim(0)`, **déjà générique** |
+| `Qwen4ExpPLE` (regroupement P6.2) | construit ses identifiants en `[batch, sequence, ngramHeads]` et reforme la sortie sur `IDs.dim(0)` — **ne suppose jamais une séquence unique**, contrairement à ce que le libellé « 231 → 2 lookups » laissait craindre |
+| MoE, hyper-connexions, embeddings/`lm_head` | génériques sur `dim(0)` |
+| `Qwen4ExpMRoPE` / `logicalOffset` | `[3,1,S]` diffusé contre B, et un offset scalaire pour tout le lot — **correct uniquement parce que les séquences avancent en pas synchrone à longueur égale**. C'est le premier blocage pour P12.2. |
+
+Le seul code neuf est la sonde elle-même et sa logique pure. **Zéro
+changement de comportement à B=1.**
+
+### Parité — le critère qui comptait
+
+Le même prompt répété B fois rend, à B = 1, 2, 3, 4 et 8, **exactement les
+mêmes identifiants**, identiques entre séquences et identiques à la référence
+du dépôt. `parité inter-séquences : OK` partout. **Les séquences ne se
+contaminent pas.**
+
+### Le passage à l'échelle
+
+| séquences | ms/pas | débit agrégé | gain | par séquence | coût marginal |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 42,32 | 23,63 t/s | 1,00× | 23,63 t/s | — |
+| 2 | 51,17 | 39,08 t/s | 1,65× | 19,54 t/s | 8,85 ms |
+| 3 | 60,93 | 49,24 t/s | 2,08× | 16,41 t/s | 9,76 ms |
+| 4 | 72,78 | 54,96 t/s | 2,33× | 13,74 t/s | 11,84 ms |
+| **8** | **115,09** | **69,51 t/s** | **2,94×** | 8,69 t/s | 10,58 ms |
+
+**La porte de P12.1 demandait ≥ 1,5× à B=8. On mesure 2,94×.** C'est même
+au-dessus des 2,40× du lot de jetons d'un même flux, et bien au-dessus de mon
+estimation de ~2× : le coût marginal d'une séquence de plus est de **9 à
+12 ms**, contre 42,32 ms pour la première, parce que les 2 258 Mio de poids
+denses se lisent **une seule fois pour tout le lot**.
+
+Pic mémoire : 57,76 Go à B=1, **58,62 Go à B=8** — moins d'un gigaoctet pour
+huit séquences.
+
+### Et pour un client, la latence s'améliore aussi
+
+Le lot ralentit chaque séquence (8,69 t/s contre 23,63 seul), mais le service
+sérialisé fait attendre son tour. Pour une réponse de 100 jetons :
+
+| clients simultanés | par lot | sérialisé | rapport |
+|---:|---:|---:|---:|
+| 2 | 5,1 s | 6,3 s | ×1,24 |
+| 4 | 7,3 s | 10,6 s | ×1,45 |
+| 8 | **11,5 s** | **19,0 s** | **×1,65** |
+
+Donc ce n'est pas seulement de la capacité : **dès deux clients simultanés, le
+lot est aussi meilleur en latence de bout en bout.**
+
+### Réserves à porter à P12.2 et P12.3
+
+1. **L'horloge de position est scalaire pour tout le lot.** Valide en pas
+   synchrone, fausse dès que les longueurs diffèrent : il faudra un décalage
+   par ligne et des `positionIDs` `[3,B,S]` réels.
+2. **Aucun masque de remplissage**, ni QSA ni GDN. `Qwen4ExpQSAKVCache`
+   documente déjà un masque `[B,S]` optionnel « réservé aux lots irréguliers »,
+   jamais implémenté.
+3. **La sélection éparse QSA n'est pas exercée** : son budget de 2 048 jetons
+   n'est pas atteint à ces longueurs. Son comportement en lot reste à vérifier
+   au-delà de ce seuil.
+4. Côté vendor, `ArraysCache`/`MambaCache` exposent déjà
+   `leftPadding`/`lengths`/`filter(batchIndices:)`/`extend(other:)` — l'outillage
+   du lot continu existe, il n'est branché nulle part côté Flash-Next.
+5. **Écarts-types élevés** (40-46 ms, maxima vers 400 ms) à tous les B : une
+   perturbation périodique que la médiane absorbe mais qu'il faudra élucider
+   avant de promettre une latence au client.

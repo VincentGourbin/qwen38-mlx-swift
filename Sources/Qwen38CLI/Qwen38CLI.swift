@@ -36,6 +36,7 @@ struct Qwen38CLI: AsyncParsableCommand {
             FlashMTPProbe.self,
             FlashChatProbe.self,
             FlashDecodeBench.self,
+            FlashBatchProbe.self,
             Generate.self, MTPProbe.self, MTPParity.self,
             MTPConversationProbe.self,
             ConversationBenchmark.self,
@@ -1843,6 +1844,155 @@ struct FlashDecodeBench: AsyncParsableCommand {
         print(
             "MLX mémoire active: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.activeMemory), countStyle: .file))"
         )
+        print(
+            "MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))"
+        )
+    }
+}
+
+/// P11 (dernier chantier) : sonde de décodage par lots.
+///
+/// La trace Metal (`docs/knowledge/log.md` 2026-09-13, « Les 33 % d'inactivité
+/// GPU ne viennent pas de la soumission : ils sont structurels ») montre qu'à
+/// lot de taille 1 une chaîne autorégressive n'a pas assez de travail
+/// indépendant pour remplir le GPU, et que doubler le travail par forward ne
+/// coûte que +30 % (P11.4a). Cette place ne se remplit pas avec des jetons du
+/// même flux (la spéculation MTP plafonne à 1,14×, P11.4 fermée) : il faut du
+/// travail indépendant, c'est-à-dire plusieurs séquences. Cette sonde répond
+/// à une seule question, rien de plus : le modèle sait-il décoder B séquences
+/// indépendantes dans un même forward, et à quel coût — sans ordonnanceur, ni
+/// gestion des longueurs inégales, ni file d'attente serveur.
+///
+/// Défauts de production repris tels quels de `Qwen38FlashNextEngine.init`
+/// (couches résidentes, `residentAsyncEval` actif, `residentAsyncInterval`
+/// 48 depuis le 2026-09-13, lecture F_NOCACHE, niveau de fusion F7, aucune
+/// surcharge de routage ni d'ablation), comme `FlashDecodeBench`.
+struct FlashBatchProbe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "flash-batch-probe",
+        abstract:
+            "P11 : décodage par lots — B séquences indépendantes dans un même forward MLX, coût et parité inter-séquences"
+    )
+
+    @Argument(help: "Répertoire local du checkpoint qwen4_exp")
+    var modelPath: String
+
+    @Option(
+        name: .long,
+        help:
+            "Prompts séparés par des barres verticales (« a|b|c »), un par séquence du lot. Doivent produire exactement le même nombre de jetons après rendu ChatML — pas de remplissage à cette étape."
+    )
+    var prompts: String
+
+    @Option(name: .long, help: "Nombre de jetons décodés par séquence, greedy strict (température 0, argmax)")
+    var maxNewTokens: Int = 64
+
+    func run() async throws {
+        guard maxNewTokens > 0 else {
+            throw Qwen4ExpBatchProbeError.invalidMaxNewTokens(maxNewTokens)
+        }
+        let promptList = try qwen4ExpSplitBatchPrompts(prompts)
+        let batchSize = promptList.count
+
+        _ = Device.defaultDevice()
+        let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+        let configuration = try Qwen4ExpConfiguration.load(from: directory)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+
+        // P11 : mêmes défauts de production que FlashDecodeBench — voir le
+        // commentaire de ce type et Qwen38FlashNextEngine.init. Aucun n'est
+        // exposé en option ici : cette sonde mesure la configuration qui
+        // tourne réellement, pas une variante.
+        let model = try Qwen4ExpStreamingTextModel(
+            directory: directory,
+            layerLoadingMode: .resident,
+            residentEvaluationInterval: 1,
+            residentAsyncEval: true,
+            residentAsyncInterval: 48,
+            uncachedIO: true,
+            routedExpertCount: nil,
+            ablation: .none)
+        print(
+            "routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)"
+        )
+        print("ablation active : \(model.ablation.rawValue)")
+        print("lot : \(batchSize) séquence(s)")
+
+        let builtPrompts = try promptList.map {
+            try Qwen4ExpPromptBuilder.buildFirstTurn(
+                tokenizer: tokenizer, configuration: configuration, directory: directory,
+                prompt: $0, imageURL: nil, thinking: false)
+        }
+        // Contrainte assumée par cette étape (voir le commentaire de ce
+        // type) : longueurs égales après rendu ChatML, sinon échec explicite
+        // qui imprime la longueur de chaque prompt.
+        let sequenceLength = try qwen4ExpValidateEqualPromptTokenCounts(
+            builtPrompts.map(\.tokenIDs.count))
+        print("longueur de prompt commune : \(sequenceLength) jeton(s)")
+
+        // [B, S] dans l'ordre des prompts — même contrat que
+        // Qwen4ExpStreamingTextModel.forward(inputIDs:), qui tire batch et
+        // séquence de inputIDs.dim(0)/dim(1).
+        let flatPromptIDs = builtPrompts.flatMap(\.tokenIDs)
+        let promptArray = MLXArray(flatPromptIDs).reshaped([batchSize, sequenceLength])
+
+        model.resetConversation()
+        let prefill = try model.forward(inputIDs: promptArray)
+        var logits = prefill.logits[0..., -1, 0...]
+
+        let sampler = ArgMaxSampler()
+        var generated: [[Int32]] = Array(repeating: [], count: batchSize)
+        var stepMs: [Double] = []
+        stepMs.reserveCapacity(maxNewTokens)
+
+        for _ in 0..<maxNewTokens {
+            let sampled = sampler.sample(logits: logits)
+            eval(sampled)
+            let ids = sampled.asArray(Int32.self)
+            for row in 0..<batchSize {
+                generated[row].append(ids[row])
+            }
+            let nextInput = MLXArray(ids).reshaped([batchSize, 1])
+            let start = ContinuousClock.now
+            let stepResult = try model.forward(inputIDs: nextInput)
+            stepMs.append(durationSeconds(ContinuousClock.now - start) * 1000)
+            logits = stepResult.logits[0..., -1, 0...]
+        }
+
+        for row in 0..<batchSize {
+            print("=== séquence \(row) : \"\(promptList[row])\" ===")
+            print("identifiants : \(generated[row])")
+            print("texte : \(tokenizer.decode(tokens: generated[row].map(Int.init), skipSpecialTokens: false))")
+        }
+
+        // Critère de justesse : les B séquences ne doivent jamais se
+        // contaminer entre elles. Avec le même prompt répété B fois, les B
+        // lignes doivent être strictement identiques (et identiques à la
+        // sortie de B=1 sur ce même prompt — vérification manuelle contre
+        // la référence).
+        let parity = qwen4ExpBatchParityCheck(generated)
+        if parity.allEqual {
+            print("parité inter-séquences : OK")
+        } else {
+            print(
+                "parité inter-séquences : ÉCHEC — la séquence "
+                    + "\(parity.firstMismatchIndex ?? -1) diffère de la séquence 0")
+        }
+
+        let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: stepMs)
+        print(
+            "ms/pas (\(batchSize) séquence(s)/pas) — pas retenus \(stats.count) · "
+                + "médiane \(String(format: "%.3f", stats.medianMs)) · "
+                + "moyenne \(String(format: "%.3f", stats.meanMs)) · "
+                + "écart-type \(String(format: "%.3f", stats.stddevMs)) · "
+                + "min \(String(format: "%.3f", stats.minMs)) · "
+                + "max \(String(format: "%.3f", stats.maxMs))")
+        let totalDecodeSeconds = stepMs.reduce(0, +) / 1000
+        let aggregateThroughput =
+            totalDecodeSeconds > 0 ? Double(batchSize * stepMs.count) / totalDecodeSeconds : .nan
+        print(
+            "débit agrégé : \(String(format: "%.2f", aggregateThroughput)) jetons/s "
+                + "(\(batchSize) jeton(s) par pas)")
         print(
             "MLX mémoire peak: \(ByteCountFormatter.string(fromByteCount: Int64(Memory.peakMemory), countStyle: .file))"
         )
