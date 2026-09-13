@@ -1880,7 +1880,7 @@ struct FlashBatchProbe: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "Prompts séparés par des barres verticales (« a|b|c »), un par séquence du lot. Doivent produire exactement le même nombre de jetons après rendu ChatML — pas de remplissage à cette étape."
+            "Prompts séparés par des barres verticales (« a|b|c »), un par séquence du lot. Des longueurs inégales déclenchent le remplissage à gauche (P12.2, voir Qwen4ExpBatchPadding.swift) ; des longueurs égales suivent le chemin P12.1 d'origine, strictement inchangé."
     )
     var prompts: String
 
@@ -1923,21 +1923,47 @@ struct FlashBatchProbe: AsyncParsableCommand {
                 tokenizer: tokenizer, configuration: configuration, directory: directory,
                 prompt: $0, imageURL: nil, thinking: false)
         }
-        // Contrainte assumée par cette étape (voir le commentaire de ce
-        // type) : longueurs égales après rendu ChatML, sinon échec explicite
-        // qui imprime la longueur de chaque prompt.
-        let sequenceLength = try qwen4ExpValidateEqualPromptTokenCounts(
-            builtPrompts.map(\.tokenIDs.count))
-        print("longueur de prompt commune : \(sequenceLength) jeton(s)")
-
-        // [B, S] dans l'ordre des prompts — même contrat que
-        // Qwen4ExpStreamingTextModel.forward(inputIDs:), qui tire batch et
-        // séquence de inputIDs.dim(0)/dim(1).
-        let flatPromptIDs = builtPrompts.flatMap(\.tokenIDs)
-        let promptArray = MLXArray(flatPromptIDs).reshaped([batchSize, sequenceLength])
+        let tokenCounts = builtPrompts.map(\.tokenIDs.count)
+        // P12.2 : des longueurs égales suivent le chemin P12.1 d'origine,
+        // strictement inchangé (aucun positionIDs/leftPadding explicite,
+        // exactement les appels d'avant P12.2). Des longueurs inégales
+        // déclenchent le remplissage à gauche — voir Qwen4ExpBatchPadding.swift
+        // pour la justification complète (sens du remplissage, choix du
+        // jeton EOS, positionIDs par ligne, masque de validité).
+        let hasEqualLengths = Set(tokenCounts).count <= 1
+        var leftPadding: [Int]? = nil
 
         model.resetConversation()
-        let prefill = try model.forward(inputIDs: promptArray)
+        let prefill: (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport])
+        if hasEqualLengths {
+            // Contrainte assumée par cette étape (voir le commentaire de ce
+            // type) : longueurs égales après rendu ChatML, sinon échec
+            // explicite qui imprime la longueur de chaque prompt.
+            let sequenceLength = try qwen4ExpValidateEqualPromptTokenCounts(tokenCounts)
+            print("longueur de prompt commune : \(sequenceLength) jeton(s)")
+
+            // [B, S] dans l'ordre des prompts — même contrat que
+            // Qwen4ExpStreamingTextModel.forward(inputIDs:), qui tire batch
+            // et séquence de inputIDs.dim(0)/dim(1).
+            let flatPromptIDs = builtPrompts.flatMap(\.tokenIDs)
+            let promptArray = MLXArray(flatPromptIDs).reshaped([batchSize, sequenceLength])
+            prefill = try model.forward(inputIDs: promptArray)
+        } else {
+            let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: tokenCounts)
+            leftPadding = layout.leftPadding
+            let padTokenID = configuration.textConfiguration.eosTokenID ?? 0
+            print(
+                "longueurs de prompt inégales : \(tokenCounts) jeton(s) · "
+                    + "remplissage à gauche sur \(layout.maxLength) jeton(s) avec le jeton EOS "
+                    + "\(padTokenID) · décalages \(layout.leftPadding)")
+            let paddedRows = qwen4ExpLeftPadTokenIDs(
+                builtPrompts.map(\.tokenIDs), layout: layout, padTokenID: padTokenID)
+            let promptArray = MLXArray(paddedRows.flatMap { $0 })
+                .reshaped([batchSize, layout.maxLength])
+            let positionIDs = qwen4ExpLeftPaddedPositionIDsArray(layout: layout)
+            prefill = try model.forward(
+                inputIDs: promptArray, positionIDs: positionIDs, leftPadding: layout.leftPadding)
+        }
         var logits = prefill.logits[0..., -1, 0...]
 
         let sampler = ArgMaxSampler()
@@ -1945,7 +1971,7 @@ struct FlashBatchProbe: AsyncParsableCommand {
         var stepMs: [Double] = []
         stepMs.reserveCapacity(maxNewTokens)
 
-        for _ in 0..<maxNewTokens {
+        for step in 0..<maxNewTokens {
             let sampled = sampler.sample(logits: logits)
             eval(sampled)
             let ids = sampled.asArray(Int32.self)
@@ -1953,8 +1979,15 @@ struct FlashBatchProbe: AsyncParsableCommand {
                 generated[row].append(ids[row])
             }
             let nextInput = MLXArray(ids).reshaped([batchSize, 1])
+            // À longueurs égales, `leftPadding` est `nil` et
+            // `decodePositionIDs` aussi : cet appel est alors identique,
+            // argument pour argument, à celui d'avant P12.2.
+            let decodePositionIDs = leftPadding != nil
+                ? qwen4ExpLeftPaddedDecodePositionIDsArray(tokenCounts: tokenCounts, step: step)
+                : nil
             let start = ContinuousClock.now
-            let stepResult = try model.forward(inputIDs: nextInput)
+            let stepResult = try model.forward(
+                inputIDs: nextInput, positionIDs: decodePositionIDs, leftPadding: leftPadding)
             stepMs.append(durationSeconds(ContinuousClock.now - start) * 1000)
             logits = stepResult.logits[0..., -1, 0...]
         }
@@ -1970,13 +2003,43 @@ struct FlashBatchProbe: AsyncParsableCommand {
         // lignes doivent être strictement identiques (et identiques à la
         // sortie de B=1 sur ce même prompt — vérification manuelle contre
         // la référence).
-        let parity = qwen4ExpBatchParityCheck(generated)
-        if parity.allEqual {
-            print("parité inter-séquences : OK")
+        // P12.2 : ce contrôle n'a de sens que si tous les prompts sont
+        // identiques — sinon des sorties différentes sont le comportement
+        // attendu, et annoncer un « ÉCHEC » induit en erreur (constaté le
+        // 2026-09-13 sur un lot à longueurs mélangées, où les trois lignes
+        // étaient pourtant justes).
+        let promptsIdentical = Set(promptList).count == 1
+        if promptsIdentical {
+            let parity = qwen4ExpBatchParityCheck(generated)
+            if parity.allEqual {
+                print("parité inter-séquences : OK (prompts identiques)")
+            } else {
+                print(
+                    "parité inter-séquences : ÉCHEC — la séquence "
+                        + "\(parity.firstMismatchIndex ?? -1) diffère de la séquence 0")
+            }
         } else {
             print(
-                "parité inter-séquences : ÉCHEC — la séquence "
-                    + "\(parity.firstMismatchIndex ?? -1) diffère de la séquence 0")
+                "parité inter-séquences : sans objet (prompts différents) — "
+                    + "le critère applicable est la ligne « référence (rang N) » ci-dessous")
+        }
+
+        // P12.2 : critère de justesse non négociable — le prompt de
+        // référence doit rendre les mêmes jetons quelle que soit sa position
+        // dans le lot et les longueurs des autres prompts. Vérifié ici pour
+        // toute ligne dont le texte est le prompt canonique, qu'elle soit à
+        // longueur égale ou noyée dans un lot rempli à gauche.
+        for row in 0..<batchSize {
+            guard let check = qwen4ExpCheckBatchReference(prompt: promptList[row], generated: generated[row])
+            else { continue }
+            if check.matches {
+                print("référence (rang \(row)) : OK")
+            } else {
+                print(
+                    "référence (rang \(row)) : ÉCHEC à partir du jeton "
+                        + "\(check.firstMismatchIndex ?? -1) — attendu \(check.expected), "
+                        + "obtenu \(check.actual)")
+            }
         }
 
         let stats = qwen4ExpDecodeBenchStats(millisecondsPerStep: stepMs)

@@ -3417,3 +3417,319 @@ func qwen4ExpBatchParityCheckTrivialCases() {
     #expect(qwen4ExpBatchParityCheck([[1, 2, 3]]).allEqual)
     #expect(qwen4ExpBatchParityCheck([]).allEqual)
 }
+
+// MARK: - P12.2 : logique pure du remplissage à gauche (sans checkpoint)
+
+@Test("P12.2 : le calcul de disposition aligne toutes les lignes sur la plus longue")
+func qwen4ExpComputeBatchPaddingLayoutAligns() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [5, 8, 3])
+    #expect(layout.maxLength == 8)
+    #expect(layout.leftPadding == [3, 0, 5])
+    #expect(layout.batchSize == 3)
+}
+
+@Test("P12.2 : des longueurs déjà égales donnent un remplissage nul partout")
+func qwen4ExpComputeBatchPaddingLayoutTrivialOnEqualLengths() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [4, 4, 4])
+    #expect(layout.maxLength == 4)
+    #expect(layout.leftPadding == [0, 0, 0])
+}
+
+@Test("P12.2 : un lot vide est rejeté explicitement")
+func qwen4ExpComputeBatchPaddingLayoutRejectsEmptyBatch() {
+    #expect(throws: Qwen4ExpBatchPaddingError.emptyBatch) {
+        try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [])
+    }
+}
+
+@Test("P12.2 : le remplissage à gauche place le jeton de remplissage avant chaque séquence réelle")
+func qwen4ExpLeftPadTokenIDsPadsBeforeContent() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [2, 4])
+    let padded = qwen4ExpLeftPadTokenIDs(
+        [[10, 11], [20, 21, 22, 23]], layout: layout, padTokenID: 0)
+    #expect(padded == [[0, 0, 10, 11], [20, 21, 22, 23]])
+}
+
+@Test("P12.2 : les positionIDs par ligne recommencent à 0 sur le premier jeton réel de chacune")
+func qwen4ExpLeftPaddedPositionIDsRestartPerRow() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [2, 4])
+    let positions = qwen4ExpLeftPaddedPositionIDs(layout: layout)
+    // Ligne 0 : 2 colonnes de remplissage (position 0, sans conséquence),
+    // puis les positions 0 et 1 de ses 2 jetons réels.
+    #expect(positions[0] == [0, 0, 0, 1])
+    // Ligne 1 : aucun remplissage, positions 0..3 comme seule.
+    #expect(positions[1] == [0, 1, 2, 3])
+}
+
+@Test("P12.2 : les positionIDs par ligne tiennent compte d'un décalage de reprise")
+func qwen4ExpLeftPaddedPositionIDsHonorOffset() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [1, 3])
+    let positions = qwen4ExpLeftPaddedPositionIDs(layout: layout, offset: 10)
+    #expect(positions[0] == [0, 0, 10])
+    #expect(positions[1] == [10, 11, 12])
+}
+
+@Test("P12.2 : les positionIDs de décodage avancent chaque ligne depuis sa propre longueur réelle")
+func qwen4ExpLeftPaddedDecodePositionIDsUsePerRowLength() {
+    #expect(qwen4ExpLeftPaddedDecodePositionIDs(tokenCounts: [3, 5], step: 0) == [3, 5])
+    #expect(qwen4ExpLeftPaddedDecodePositionIDs(tokenCounts: [3, 5], step: 2) == [5, 7])
+}
+
+@Test("P12.2 : le masque de validité est faux sur le remplissage et vrai sur tout jeton réel")
+func qwen4ExpBatchPaddingValidityMaskMarksPaddingOnly() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [2, 5])
+    let mask = qwen4ExpBatchPaddingValidityMask(
+        layout: layout, columnOffset: 0, columnCount: layout.maxLength)
+    #expect(mask[0] == [false, false, false, true, true])
+    #expect(mask[1] == [true, true, true, true, true])
+}
+
+@Test("P12.2 : le masque de validité reste vrai partout après le préremplissage")
+func qwen4ExpBatchPaddingValidityMaskAllTrueAfterPrefill() throws {
+    let layout = try qwen4ExpComputeBatchPaddingLayout(tokenCounts: [2, 5])
+    // Un pas de décodage n'introduit plus de remplissage : le décalage
+    // absolu (`columnOffset`) dépasse déjà tout `leftPadding`.
+    let mask = qwen4ExpBatchPaddingValidityMask(
+        layout: layout, columnOffset: layout.maxLength, columnCount: 1)
+    #expect(mask[0] == [true])
+    #expect(mask[1] == [true])
+}
+
+// MARK: - P12.2 : vérification du prompt de référence (sans checkpoint)
+
+@Test("P12.2 : la vérification de référence ignore toute ligne qui n'est pas le prompt canonique")
+func qwen4ExpCheckBatchReferenceIgnoresOtherPrompts() {
+    #expect(qwen4ExpCheckBatchReference(prompt: "autre chose", generated: [1, 2, 3]) == nil)
+}
+
+@Test("P12.2 : la vérification de référence réussit sur la suite attendue, espaces de bord compris")
+func qwen4ExpCheckBatchReferenceMatchesExpectedSequence() {
+    let generated = qwen4ExpBatchReferenceTokenIDs + [999, 998]
+    let check = qwen4ExpCheckBatchReference(
+        prompt: "  " + qwen4ExpBatchReferencePrompt + "\n", generated: generated)
+    #expect(check?.matches == true)
+    #expect(check?.firstMismatchIndex == nil)
+}
+
+@Test("P12.2 : la vérification de référence nomme le premier jeton qui diverge")
+func qwen4ExpCheckBatchReferenceNamesFirstMismatch() {
+    var generated = qwen4ExpBatchReferenceTokenIDs
+    generated[3] = 0
+    let check = qwen4ExpCheckBatchReference(prompt: qwen4ExpBatchReferencePrompt, generated: generated)
+    #expect(check?.matches == false)
+    #expect(check?.firstMismatchIndex == 3)
+}
+
+// MARK: - P12.2 : masques MLXArray (device Metal requis, aucun checkpoint)
+
+@Test("P12.2 : le masque causal QSA avec remplissage interdit les colonnes de remplissage, jamais les autres")
+func qwen4ExpQSACausalMaskWithLeftPaddingBlocksPaddingColumnsOnly() {
+    let mask = Qwen4ExpQSAAttention.causalMask(
+        batch: 2, queryLength: 1, keyLength: 4, offset: 3, leftPadding: [2, 0])
+    eval(mask)
+    // Query unique en position absolue 3 : cause seule autoriserait les 4
+    // clés (0..3) pour les deux lignes. Le remplissage retire les colonnes
+    // 0 et 1 de la ligne 0 uniquement.
+    #expect(mask[0].asArray(Bool.self) == [false, false, true, true])
+    #expect(mask[1].asArray(Bool.self) == [true, true, true, true])
+}
+
+@Test("P12.2 : le masque causal QSA avec un remplissage nul égale le masque causal usuel")
+func qwen4ExpQSACausalMaskWithZeroLeftPaddingMatchesPlainCausalMask() {
+    let plain = Qwen4ExpQSAAttention.causalMask(batch: 2, queryLength: 3, keyLength: 3, offset: 0)
+    let padded = Qwen4ExpQSAAttention.causalMask(
+        batch: 2, queryLength: 3, keyLength: 3, offset: 0, leftPadding: [0, 0])
+    eval(plain, padded)
+    #expect(allClose(plain.asType(.float32), padded.asType(.float32)).item(Bool.self))
+}
+
+@Test("P12.2 : le masque de validité MLXArray correspond au calcul pur")
+func qwen4ExpBatchPaddingValidityMaskArrayMatchesPureLogic() {
+    let array = qwen4ExpBatchPaddingValidityMaskArray(leftPadding: [2, 0], columnOffset: 0, columnCount: 5)
+    eval(array)
+    #expect(array[0].asArray(Bool.self) == [false, false, true, true, true])
+    #expect(array[1].asArray(Bool.self) == [true, true, true, true, true])
+}
+
+// MARK: - P12.2 : parité de bout en bout sans checkpoint (Qwen4ExpNGramEmbedding, GDN, QSA)
+
+@Test("P12.2 : remplir à gauche avec l'EOS ne change pas l'historique de n-grammes lu par le contenu réel")
+func qwen4ExpNGramEmbeddingLeftPaddingWithEOSMatchesUnpadded() throws {
+    // `heads_per_ngram: 1` réduit `ngramHeads` à `contextLength (=ngram_size-1) ×
+    // headsPerNgram = 2`, pour que `embeddingDimension (= hidden_size, faute de
+    // ple_embed_dim) % ngramHeads == 0` — la configuration standard des autres
+    // tests (headsPerNgram implicite = 8) ne le vérifie pas.
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 1,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention"], "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32, "heads_per_ngram": 1,
+      "split_ngram_parts": 4, "ple_layer_ids": [1], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+    #expect(configuration.eosTokenID == nil)  // remplissage attendu au jeton 0 (défaut)
+
+    let embedding = Qwen4ExpNGramEmbedding(
+        configuration: configuration, embeddingDimension: configuration.hiddenSize,
+        pleLayerIndex: 0)
+
+    let realIDs = MLXArray([5, 6, 7, 8] as [Int32]).reshaped([1, 4])
+    let reference = embedding(realIDs)
+    eval(reference)
+
+    // Remplissage de longueur 3 — ni égale ni multiple de `contextLength`
+    // (2), pour prouver que la parité ne dépend pas de cette relation.
+    let paddedIDs = MLXArray([0, 0, 0, 5, 6, 7, 8] as [Int32]).reshaped([1, 7])
+    let padded = embedding(paddedIDs)
+    eval(padded)
+
+    let realSlice = padded[0..., 3..., 0...]
+    #expect(realSlice.shape == reference.shape)
+    #expect(allClose(realSlice, reference).item(Bool.self))
+}
+
+@Test("P12.2 : le masque GDN [B,S] rend le remplissage à gauche invisible à la récurrence")
+func qwen4ExpGatedDeltaNetLeftPaddingMatchesUnpaddedRow() {
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+
+    // Couche 0 : linear_attention, sans PLE (`ple_layer_ids` vide) — isole
+    // le masque `[B,S]` de `Qwen4ExpGatedDeltaNet` de celui, distinct, de
+    // `Qwen4ExpPLELayer` (déjà couvert par le test `Qwen4ExpNGramEmbedding`
+    // ci-dessus).
+    let hiddenReal = MLXRandom.normal([1, 3, 32])
+    let idsReal = MLXArray([11, 12, 13]).reshaped([1, 3])
+
+    MLXRandom.seed(99)
+    let referenceLayer = Qwen4ExpDecoderLayer(configuration: configuration, layerIndex: 0)
+    let referenceOutput = referenceLayer(hiddenReal, inputIDs: idsReal, cache: MambaCache())
+    eval(referenceOutput)
+
+    // Remplissage à gauche de 2 colonnes de bruit non nul — pour prouver
+    // que c'est bien le masque, et non une coïncidence de valeurs déjà
+    // nulles, qui neutralise leur effet — plus une seconde ligne entièrement
+    // réelle, sans remplissage, pour vérifier l'absence de contamination
+    // croisée dans le même appel.
+    let padNoise = MLXArray.ones([1, 2, 32]) * 3.7
+    let hiddenRow0 = concatenated([padNoise, hiddenReal], axis: 1)
+    let hiddenRow1 = MLXRandom.normal([1, 5, 32])
+    let hiddenBatched = concatenated([hiddenRow0, hiddenRow1], axis: 0)
+    let idsBatched = MLXArray([0, 0, 11, 12, 13, 21, 22, 23, 24, 25]).reshaped([2, 5])
+    let validity = qwen4ExpBatchPaddingValidityMaskArray(
+        leftPadding: [2, 0], columnOffset: 0, columnCount: 5)
+
+    MLXRandom.seed(99)
+    let batchedLayer = Qwen4ExpDecoderLayer(configuration: configuration, layerIndex: 0)
+    let batchedOutput = batchedLayer(
+        hiddenBatched, inputIDs: idsBatched, mask: validity, cache: MambaCache())
+    eval(batchedOutput)
+
+    #expect(batchedOutput.shape == [2, 5, 32])
+    #expect(!isNaN(batchedOutput).any().item(Bool.self))
+    let row0RealSlice = batchedOutput[0..<1, 2..., 0...]
+    #expect(allClose(row0RealSlice, referenceOutput, atol: 1e-5).item(Bool.self))
+}
+
+@Test("P12.2 : le masque causal QSA avec remplissage reste correct au décodage, après le préremplissage")
+func qwen4ExpQSACausalMaskWithLeftPaddingSurvivesDecodeStep() {
+    let json = """
+    {
+      "hidden_size": 8, "num_hidden_layers": 4,
+      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+      "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+      "full_attention_interval": 4,
+      "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+      "linear_key_head_dim": 4, "linear_value_head_dim": 4, "linear_conv_kernel_dim": 4,
+      "num_experts": 4, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4,
+      "indexer_budget": 8, "indexer_compress_ratio": 4,
+      "indexer_head_dim": 128, "indexer_kv_heads": 1, "indexer_n_heads": 4,
+      "hc_count": 4, "hc_lowrank": 2,
+      "ngram_size": 3, "ngram_vocab_size_base": 32,
+      "split_ngram_parts": 128, "ple_layer_ids": [], "ple_conv_kernel_size": 4,
+      "vocab_size": 32, "max_position_embeddings": 128
+    }
+    """
+    let configuration = try! JSONDecoder().decode(
+        Qwen4ExpTextConfiguration.self, from: Data(json.utf8))
+
+    let hiddenPrefillReal = MLXRandom.normal([1, 3, 32])
+    let idsPrefillReal = MLXArray([31, 32, 33]).reshaped([1, 3])
+    let hiddenDecode = MLXRandom.normal([1, 1, 32])
+    let idsDecode = MLXArray([34]).reshaped([1, 1])
+
+    MLXRandom.seed(7)
+    let referenceLayer = Qwen4ExpDecoderLayer(configuration: configuration, layerIndex: 3)
+    let referenceCache = Qwen4ExpQSAKVCache()
+    _ = referenceLayer(
+        hiddenPrefillReal, inputIDs: idsPrefillReal, cache: referenceCache,
+        positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 3, offset: 0))
+    let referenceOutput = referenceLayer(
+        hiddenDecode, inputIDs: idsDecode, cache: referenceCache,
+        positionIDs: Qwen4ExpMRoPE.textPositionIDs(sequenceLength: 1, offset: referenceCache.offset))
+    eval(referenceOutput)
+
+    // Ligne 0 : les 3 mêmes jetons réels, remplis à gauche de 2 colonnes.
+    // Ligne 1 : 5 jetons réels, sans remplissage — `layout.maxLength = 5`.
+    let layout = Qwen4ExpBatchPaddingLayout(maxLength: 5, leftPadding: [2, 0])
+    let padNoise = MLXArray.ones([1, 2, 32]) * 3.7
+    let hiddenPrefillRow0 = concatenated([padNoise, hiddenPrefillReal], axis: 1)
+    let hiddenPrefillRow1 = MLXRandom.normal([1, 5, 32])
+    let hiddenPrefillBatched = concatenated([hiddenPrefillRow0, hiddenPrefillRow1], axis: 0)
+    let idsPrefillBatched = MLXArray([0, 0, 31, 32, 33, 41, 42, 43, 44, 45]).reshaped([2, 5])
+    let prefillPositions = qwen4ExpLeftPaddedPositionIDsArray(layout: layout)
+
+    MLXRandom.seed(7)
+    let batchedLayer = Qwen4ExpDecoderLayer(configuration: configuration, layerIndex: 3)
+    let batchedCache = Qwen4ExpQSAKVCache()
+    _ = batchedLayer(
+        hiddenPrefillBatched, inputIDs: idsPrefillBatched, cache: batchedCache,
+        positionIDs: prefillPositions)
+
+    let hiddenDecodeRow1 = MLXRandom.normal([1, 1, 32])
+    let hiddenDecodeBatched = concatenated([hiddenDecode, hiddenDecodeRow1], axis: 0)
+    let idsDecodeBatched = MLXArray([34, 46]).reshaped([2, 1])
+    let decodeMask = Qwen4ExpQSAAttention.causalMask(
+        batch: 2, queryLength: 1, keyLength: batchedCache.offset + 1, offset: batchedCache.offset,
+        leftPadding: layout.leftPadding)
+    let decodePositions = qwen4ExpLeftPaddedDecodePositionIDsArray(tokenCounts: [3, 5], step: 0)
+
+    let batchedOutput = batchedLayer(
+        hiddenDecodeBatched, inputIDs: idsDecodeBatched, mask: decodeMask, cache: batchedCache,
+        positionIDs: decodePositions)
+    eval(batchedOutput)
+
+    #expect(batchedOutput.shape == [2, 1, 32])
+    #expect(!isNaN(batchedOutput).any().item(Bool.self))
+    let row0Output = batchedOutput[0..<1, 0..., 0...]
+    #expect(allClose(row0Output, referenceOutput, atol: 1e-4).item(Bool.self))
+}

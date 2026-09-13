@@ -273,4 +273,26 @@ public final class Qwen4ExpQSAAttention: Module {
             keys[.newAxis, .newAxis, .ellipsis] .< ends[.newAxis, .ellipsis, .newAxis],
             to: [batch, 1, queryLength, keyLength])
     }
+
+    /// P12.2 (lots à longueurs inégales, remplis à gauche — voir
+    /// `Qwen4ExpBatchPadding.swift`) : variante qui, en plus de la
+    /// restriction causale usuelle, interdit à toute requête d'assister aux
+    /// colonnes de remplissage à gauche d'une ligne. Ces colonnes restent
+    /// invalides pour toute la durée de vie du cache — bien après le
+    /// préremplissage — donc cette variante doit être utilisée à chaque
+    /// appel tant qu'un lot porte du remplissage, y compris au décodage à un
+    /// seul jeton : contrairement à P2-code (e), le cache contient alors des
+    /// colonnes définitivement invalides, et le masque n'est plus jamais
+    /// trivialement vrai partout. `leftPadding` doit compter `batch` entrées,
+    /// une par ligne.
+    public static func causalMask(
+        batch: Int, queryLength: Int, keyLength: Int, offset: Int, leftPadding: [Int]
+    ) -> MLXArray {
+        precondition(
+            leftPadding.count == batch, "leftPadding doit compter une entrée par ligne du lot")
+        let base = causalMask(batch: batch, queryLength: queryLength, keyLength: keyLength, offset: offset)
+        let keyIndices = MLXArray(Int32(0) ..< Int32(keyLength)).reshaped([1, 1, 1, keyLength])
+        let padding = MLXArray(leftPadding.map(Int32.init)).reshaped([batch, 1, 1, 1])
+        return MLX.logicalAnd(base, keyIndices .>= padding)
+    }
 }

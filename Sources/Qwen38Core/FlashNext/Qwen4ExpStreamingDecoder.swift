@@ -190,7 +190,15 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
         // to roll its `ArraysCache` back to any prefix of the newly fed
         // tokens — see `rollbackVerification` and `Qwen4ExpVerificationCapture`.
         verificationCapture: Qwen4ExpVerificationCapture? = nil,
-        onLayerVisited: (@Sendable (Int) -> Void)? = nil
+        onLayerVisited: (@Sendable (Int) -> Void)? = nil,
+        /// P12.2 : décalage à gauche de chaque ligne du lot (voir
+        /// `Qwen4ExpBatchPaddingLayout`), constant pour toute la durée de la
+        /// conversation — un lot est constitué une fois, au départ (pas
+        /// d'ordonnanceur ici). `nil` (le défaut, tout appelant existant)
+        /// laisse le comportement inchangé : ni masque de remplissage GDN/PLE,
+        /// ni restriction de validité de clé QSA au-delà de la restriction
+        /// causale usuelle.
+        leftPadding: [Int]? = nil
     ) throws -> (output: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
         precondition(hiddenStates.ndim == 3)
         precondition(hiddenStates.dim(-1) == configuration.hiddenSize * configuration.hcCount)
@@ -252,8 +260,37 @@ public final class Qwen4ExpStreamingDecoder: @unchecked Sendable {
                 cache = created
             }
 
+            let isFullAttention = configuration.layerTypes[layerIndex] == .fullAttention
             let attentionMask: MLXArray?
-            if configuration.layerTypes[layerIndex] != .fullAttention {
+            if let leftPadding {
+                // P12.2 : lot à longueurs inégales, rempli à gauche — voir
+                // `Qwen4ExpBatchPaddingLayout`. Le remplissage laisse des
+                // colonnes de cache définitivement invalides pour la durée
+                // de la conversation : contrairement au chemin par défaut
+                // ci-dessous, P2-code (e) ne s'applique plus jamais (même à
+                // un seul jeton décodé, le masque n'est pas trivialement
+                // vrai partout) et le masque GDN/PLE `[B,S]`, documenté mais
+                // jamais alimenté jusqu'ici (« reserved for padded/ragged
+                // batches »), est enfin construit.
+                if isFullAttention {
+                    attentionMask = Qwen4ExpQSAAttention.causalMask(
+                        batch: inputIDs.dim(0), queryLength: inputIDs.dim(1),
+                        keyLength: cache.offset + inputIDs.dim(1), offset: cache.offset,
+                        leftPadding: leftPadding)
+                } else if inputIDs.dim(1) > 1 {
+                    // Le remplissage n'existe que dans le bloc préremplissage
+                    // (un seul appel multi-jeton, à décalage absolu 0 — un
+                    // lot est constitué une fois, au départ). Les pas de
+                    // décodage suivants n'introduisent plus jamais de
+                    // remplissage : chaque ligne y avance d'exactement un
+                    // jeton réel, donc `inputIDs.dim(1) == 1` n'a besoin
+                    // d'aucun masque GDN/PLE.
+                    attentionMask = qwen4ExpBatchPaddingValidityMaskArray(
+                        leftPadding: leftPadding, columnOffset: 0, columnCount: inputIDs.dim(1))
+                } else {
+                    attentionMask = nil
+                }
+            } else if !isFullAttention {
                 // GDN's recurrence is causal by construction.  Its optional
                 // mask has a different [B,S] contract and is reserved for
                 // padded/ragged batches.

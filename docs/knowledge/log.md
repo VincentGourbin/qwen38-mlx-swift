@@ -5683,3 +5683,78 @@ lot est aussi meilleur en latence de bout en bout.**
 5. **Écarts-types élevés** (40-46 ms, maxima vers 400 ms) à tous les B : une
    perturbation périodique que la médiane absorbe mais qu'il faudra élucider
    avant de promettre une latence au client.
+
+---
+
+## 2026-09-13 — P12.2 : longueurs inégales, et le critère tient
+
+### Le critère, d'abord
+
+Le prompt de référence a été placé en **tête, au milieu et en queue** d'un lot
+de trois séquences aux longueurs très différentes (« Bonjour », le prompt de
+référence, et une demande d'essai en dix paragraphes). Aux trois positions, il
+rend exactement `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13,
+7305, 1725, 501]`, la référence du dépôt.
+
+**Et le résultat est plus fort que le critère demandé** : *chaque* séquence du
+lot rend des identifiants strictement identiques quelle que soit sa position.
+« Bonjour » et l'essai donnent les mêmes douze jetons dans les trois
+dispositions. **Le remplissage et la position dans le lot n'influencent rien.**
+
+### Comment
+
+**Remplissage à gauche.** La dernière colonne du lot devient alors, pour
+chaque ligne, son dernier jeton réel : le pas de décodage relit
+`logits[:, -1, :]` exactement comme à longueur égale. Le remplissage à droite
+aurait exigé un `takeAlong` par ligne à chaque pas. Le vendor confirme le
+sens : `ArraysCache.leftPadding` et `ArraysCache.makeMask` sont construits pour
+celui-là.
+
+**Trois modifications de production, toutes additives** (paramètre par défaut
+`nil`, comportement à B=1 et à longueurs égales strictement inchangé) :
+`Qwen4ExpQSAAttention.causalMask(…, leftPadding:)`, et le relais
+`leftPadding: [Int]? = nil` dans `Qwen4ExpStreamingDecoder.forward` puis
+`Qwen4ExpStreamingTextModel.forward`.
+
+**Ce qui a évité du travail, et ce n'est pas ce que je croyais.**
+`ArraysCache`/`MambaCache` ne servent qu'au découpage et à la fusion de lots en
+cours de route — hors périmètre ici. En revanche
+`Qwen4ExpGatedDeltaNet.callAsFunction` et `Qwen4ExpPLELayer.callAsFunction`
+acceptaient **déjà** un `mask: MLXArray?` de contrat `[B, S]`, documenté comme
+« reserved for padded/ragged batches » et jamais alimenté. Il a suffi de le
+construire et de le brancher. Même histoire qu'en P12.1 : l'ossature était là.
+
+**Le point malin, à retenir : le jeton de remplissage doit être l'EOS.**
+`Qwen4ExpNGramEmbedding` construit son historique en l'absence de contexte avec
+des EOS, et `shiftRightIgnoringEOS` traite déjà tout EOS comme frontière de
+segment dure. Remplir à gauche avec l'EOS rend donc l'historique de n-grammes
+des jetons réels **identique**, quelle que soit la longueur du remplissage, et
+**sans masque supplémentaire pour cette partie**. Tout autre jeton de
+remplissage aurait cassé la parité de toute ligne dont le remplissage est plus
+court que la fenêtre de contexte n-gramme.
+
+Une optimisation tombe au passage : P2-code (e) sautait la construction du
+masque causal en décodage à un jeton, « provablement toujours vrai ». Ce n'est
+plus vrai dès que le cache porte des colonnes de remplissage définitivement
+invalides — le masque est donc reconstruit à chaque pas tant qu'un
+`leftPadding` est fourni.
+
+### Le coût du remplissage, et il n'est pas négligeable
+
+| lot de 3 | ms par pas |
+|---|---:|
+| trois prompts identiques, courts | 60,93 |
+| trois prompts de longueurs mêlées | **75,48** (+24 %) |
+
+**Le lot avance au rythme de sa séquence la plus longue** : tout le monde paie
+un contexte allongé par le remplissage. C'est la contrainte principale à porter
+à P12.3 — un ordonnanceur doit **grouper des longueurs voisines**, sinon il
+dilapide une bonne part du ×2,94.
+
+### Correction d'un message trompeur
+
+La sonde annonçait « parité inter-séquences : ÉCHEC » sur un lot à prompts
+différents — où des sorties différentes sont évidemment le comportement
+attendu. Le contrôle ne s'exécute plus que si tous les prompts sont
+identiques ; sinon la sonde renvoie explicitement vers la ligne
+« référence (rang N) », qui est le vrai critère.

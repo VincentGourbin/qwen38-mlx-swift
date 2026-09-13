@@ -1,0 +1,18 @@
+routed experts (K) : 10/512
+ablation active : none
+lot : 3 séquence(s)
+longueurs de prompt inégales : [13, 29, 43] jeton(s) · remplissage à gauche sur 43 jeton(s) avec le jeton EOS 248044 · décalages [30, 14, 0]
+=== séquence 0 : "Bonjour" ===
+identifiants : [78768, 729, 11905, 42280, 12, 3628, 8740, 87653, 72163, 84146, 907, 248046]
+texte : Bonjour ! Comment puis-je vous aider aujourd'hui ?<|im_end|>
+=== séquence 1 : "Explique en français qui est le président de la Chine et quel est son rôle." ===
+identifiants : [2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, 13, 7305, 1725, 501]
+texte : Le président de la Chine est Xi Jinping. Il est le
+=== séquence 2 : "Rédige un essai détaillé de dix paragraphes sur l'histoire de l'astronomie moderne, de Copernic à nos jours." ===
+identifiants : [43, 6, 86271, 401, 324, 6, 19843, 158313, 73863, 53486, 181914, 468]
+texte : L'histoire de l'astronomie moderne commence véritablement
+parité inter-séquences : ÉCHEC — la séquence 1 diffère de la séquence 0
+référence (rang 1) : OK
+ms/pas (3 séquence(s)/pas) — pas retenus 12 · médiane 75.484 · moyenne 106.211 · écart-type 100.007 · min 73.614 · max 437.804
+débit agrégé : 28.25 jetons/s (3 jeton(s) par pas)
+MLX mémoire peak: 57,83 GB

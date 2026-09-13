@@ -106,7 +106,16 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         // forward. `nil` (every other caller) is the original path,
         // unchanged.
         verificationCapture: Qwen4ExpVerificationCapture? = nil,
-        onLayerVisited: (@Sendable (Int) -> Void)? = nil
+        onLayerVisited: (@Sendable (Int) -> Void)? = nil,
+        /// P12.2 : décalage à gauche de chaque ligne du lot — voir
+        /// `Qwen4ExpBatchPaddingLayout` et le commentaire de
+        /// `Qwen4ExpStreamingDecoder.forward`'s propre paramètre du même
+        /// nom, vers lequel celui-ci n'est qu'un relais direct. `nil` (le
+        /// défaut) laisse `logicalOffset` gouverner comme avant : cette
+        /// sonde n'a d'effet que pour un appelant qui fournit explicitement
+        /// ses propres `positionIDs` par ligne, ce que ce paramètre seul ne
+        /// change pas.
+        leftPadding: [Int]? = nil
     ) throws -> (
         logits: MLXArray,
         preMixerHidden: MLXArray,
@@ -136,7 +145,8 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             positionIDs: positions,
             materializeLayers: materializeLayers,
             verificationCapture: verificationCapture,
-            onLayerVisited: onLayerVisited)
+            onLayerVisited: onLayerVisited,
+            leftPadding: leftPadding)
         let lmHeadStart = ContinuousClock.now
         let reduced = global.reduceHyperStreams(result.output)
         let output = global.logits(from: reduced)
