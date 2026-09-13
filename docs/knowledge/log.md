@@ -5241,3 +5241,78 @@ ouvertes, dans l'ordre :
    tentée en P2-code au niveau d'une couche et en P7 (où elle cassait la parité
    GDN), jamais sur le pas entier. C'est la seule technique qui attaque un coût
    fixe diffus plutôt qu'un bloc particulier.
+
+---
+
+## 2026-09-13 — P11.4a refaite correctement : le MTP est définitivement fermé
+
+La première courbe (entrée précédente) utilisait **un process par valeur de
+N** — exactement la méthodologie que P11.1 avait déclarée non fiable. Refaite
+avec `--tokens-per-step-sweep`, qui alterne les N **dans un seul process**, sur
+la même séquence forcée.
+
+### La courbe
+
+6 variantes × 80 tours (16 warmup + 64 mesurés), séquence forcée commune :
+
+| jetons par forward | ms par pas | écart-type | marginal du jeton ajouté |
+|---:|---:|---:|---:|
+| 1 | 49,240 | 1,12 | — |
+| 2 | 64,061 | 1,31 | 14,82 |
+| 3 | 80,034 | 1,64 | 15,97 |
+| 4 | 96,756 | 2,61 | 16,72 |
+| 6 | 132,302 | 6,58 | 17,77 |
+| 8 | 164,363 | 6,83 | 16,03 |
+
+Droite : **16,65 ms par jeton ajouté + 31,18 ms de coût fixe par forward**.
+
+Contrôle croisé avec le chemin à variante unique (sans `snapshot`/`restore`,
+donc sans vidage d'allocateur) : 47,84 ms à N=1 et 62,42 à N=2, marginal
+14,58. Le balayage entrelacé paie **1,40 ms de plus par pas**, constant, ce qui
+laisse les écarts — donc les marginaux — intacts. Les deux instruments
+concordent.
+
+**Le coût marginal d'un jeton supplémentaire vaut donc 15 à 17 ms, stable**, à
+comparer aux 49,2 ms d'un forward à un jeton. Un forward groupé n'amortit
+qu'un tiers du coût, pas la quasi-totalité comme l'asymptote du préfill
+(7,7 ms) le laissait espérer.
+
+### Le verdict, chiffré
+
+À 48,4 % d'acceptation (mesurée), **avec un drafter parfaitement gratuit** :
+
+| profondeur du brouillon | jetons par pas | coût du pas | gain |
+|---:|---:|---:|---:|
+| 1 | 1,484 | 64,1 ms | **1,14×** |
+| 2 | 1,718 | 80,0 ms | 1,06× |
+| 3 | 1,832 | 96,8 ms | 0,93× |
+| 5 | 1,913 | 132,3 ms | 0,71× |
+| 7 | 1,932 | 164,4 ms | 0,58× |
+
+**Approfondir le brouillon est contre-productif dès la profondeur 2.**
+
+Validation du modèle de coût : avec le drafter actuel à 12,6 ms il prédit
+**0,953×**, on mesure **0,939×** — 1,5 % d'écart. Le modèle tient.
+
+Ce qu'il faudrait pour gagner quelque chose :
+
+| | |
+|---|---|
+| seuil de rentabilité | drafter sous **9,0 ms** (actuel : 12,6) |
+| drafter divisé par 3 | 1,07× |
+| drafter divisé par 6 | 1,11× |
+| drafter **gratuit** | **1,14×** |
+| pour atteindre 1,2× | acceptation de **56,1 %** (mesurée : 48,4 %) |
+| pour atteindre 1,3× | acceptation de **69,1 %** |
+| pour atteindre 1,5× | acceptation de **95,1 %** |
+
+### Décision
+
+**P11.4 est fermée.** Le meilleur résultat concevable est **1,14×**, et il
+suppose un drafter de coût nul, ce qui n'existe pas. Un drafter six fois moins
+cher que l'actuel donnerait 1,11 ×. Monter l'acceptation à 69 % rendrait 1,3 ×,
+mais une meilleure acceptation demande un drafter plus gros, donc plus cher,
+alors que le budget total est de 9 ms.
+
+Le MTP reste disponible en option (`mtp: true`), documenté comme perdant à
+0,94 ×. Aucun travail supplémentaire n'est justifié.
