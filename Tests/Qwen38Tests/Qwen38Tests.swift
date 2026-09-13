@@ -3169,3 +3169,43 @@ func decodeBenchStatsEmptySeries() {
     #expect(stats.count == 0)
     #expect(stats.medianMs.isNaN)
 }
+
+// MARK: - P11.4a : balayage de --tokens-per-step
+
+@Test("P11.4a : le balayage de tokens-per-step préserve l'ordre, qui fixe l'alternance")
+func qwen4ExpTokensPerStepSweepPreservesOrder() throws {
+    #expect(try qwen4ExpParseTokensPerStepSweep("1,2,4,8") == [1, 2, 4, 8])
+    #expect(try qwen4ExpParseTokensPerStepSweep("8, 1 ,2") == [8, 1, 2])
+    #expect(try qwen4ExpParseTokensPerStepSweep("3") == [3])
+}
+
+@Test("P11.4a : le balayage rejette le vide, le non-entier et le nul")
+func qwen4ExpTokensPerStepSweepRejectsInvalid() {
+    #expect(throws: Qwen4ExpDecodeBenchError.emptyTokensPerStepSweep) {
+        try qwen4ExpParseTokensPerStepSweep("  ")
+    }
+    #expect(throws: Qwen4ExpDecodeBenchError.invalidTokensPerStepSweepEntry("0")) {
+        try qwen4ExpParseTokensPerStepSweep("1,0,4")
+    }
+    #expect(throws: Qwen4ExpDecodeBenchError.invalidTokensPerStepSweepEntry("deux")) {
+        try qwen4ExpParseTokensPerStepSweep("1,deux")
+    }
+    #expect(throws: Qwen4ExpDecodeBenchError.invalidTokensPerStepSweepEntry("-2")) {
+        try qwen4ExpParseTokensPerStepSweep("-2")
+    }
+}
+
+@Test("P11.4a : chaque N puise dans la même séquence forcée, à son propre pas")
+func qwen4ExpTokensPerStepSweepSharesForcedSequence() throws {
+    let ids: [Int32] = Array(1...16).map(Int32.init)
+    let n1 = try qwen4ExpSplitForcedDecodeSteps(forcedIDs: ids, tokensPerStep: 1, stepCount: 4)
+    let n2 = try qwen4ExpSplitForcedDecodeSteps(forcedIDs: ids, tokensPerStep: 2, stepCount: 4)
+    let n4 = try qwen4ExpSplitForcedDecodeSteps(forcedIDs: ids, tokensPerStep: 4, stepCount: 4)
+    #expect(n1[0] == [1] && n1[3] == [4])
+    #expect(n2[0] == [1, 2] && n2[3] == [7, 8])
+    #expect(n4[0] == [1, 2, 3, 4] && n4[3] == [13, 14, 15, 16])
+    // Le dimensionnement doit se faire sur le plus grand N : 4 tours × 4 = 16.
+    #expect(throws: Qwen4ExpDecodeBenchError.insufficientForcedIDs(required: 20, provided: 16)) {
+        try qwen4ExpSplitForcedDecodeSteps(forcedIDs: ids, tokensPerStep: 5, stepCount: 4)
+    }
+}

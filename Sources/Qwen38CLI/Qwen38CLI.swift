@@ -1578,6 +1578,13 @@ struct FlashDecodeBench: AsyncParsableCommand {
 
     @Option(
         name: .long,
+        help:
+            "P11.4a : plusieurs valeurs de --tokens-per-step comparées dans un seul process, en alternant à chaque tour (CSV, ex. 1,2,4,8). C'est la seule façon d'obtenir un coût marginal fiable : un process par valeur de N rouvre la dispersion inter-process que P11.1 a mesurée. Incompatible avec --tokens-per-step et --ablate-sweep."
+    )
+    var tokensPerStepSweep: String?
+
+    @Option(
+        name: .long,
         help: "P11.1 : surcharge de la largeur de routage MoE — même contrat que flash-chat-probe")
     var routedExperts: Int?
 
@@ -1625,14 +1632,36 @@ struct FlashDecodeBench: AsyncParsableCommand {
             throw ValidationError(
                 "--ablate et --ablate-sweep sont incompatibles : utiliser l'un ou l'autre")
         }
+        if tokensPerStepSweep != nil && ablateSweep != nil {
+            throw ValidationError(
+                "--tokens-per-step-sweep et --ablate-sweep sont incompatibles : "
+                    + "une seule dimension balayée à la fois")
+        }
+        if tokensPerStepSweep != nil && tokensPerStep != 1 {
+            throw ValidationError(
+                "--tokens-per-step-sweep remplace --tokens-per-step : ne pas passer les deux")
+        }
 
+        // P11.4a : une « variante » est un couple (ablation, jetons par pas).
+        // Le balayage d'ablations fait varier la première à N constant ; le
+        // balayage de N fait varier la seconde sans ablation. Les deux
+        // empruntent la même machinerie d'alternance.
         let variants: [Qwen4ExpLayerBenchAblation]
-        if let ablateSweep {
-            variants = try qwen4ExpParseAblationSweep(ablateSweep)
+        let stepSizes: [Int]
+        if let tokensPerStepSweep {
+            let sizes = try qwen4ExpParseTokensPerStepSweep(tokensPerStepSweep)
+            variants = Array(repeating: .none, count: sizes.count)
+            stepSizes = sizes
+        } else if let ablateSweep {
+            let parsed = try qwen4ExpParseAblationSweep(ablateSweep)
+            variants = parsed
+            stepSizes = Array(repeating: tokensPerStep, count: parsed.count)
         } else if let ablate {
             variants = [try qwen4ExpResolveAblation(rawValue: ablate)]
+            stepSizes = [tokensPerStep]
         } else {
             variants = [.none]
+            stepSizes = [tokensPerStep]
         }
 
         _ = Device.defaultDevice()
@@ -1666,7 +1695,9 @@ struct FlashDecodeBench: AsyncParsableCommand {
         }
 
         let roundCount = warmup + steps
-        let requiredForcedCount = roundCount * tokensPerStep
+        // Dimensionné sur la plus grande valeur de N : toutes les variantes
+        // puisent dans la même séquence, chacune à son pas.
+        let requiredForcedCount = roundCount * (stepSizes.max() ?? 1)
 
         let forcedIDs: [Int32]
         if let forcedIdsOption = forcedIds {
@@ -1690,8 +1721,10 @@ struct FlashDecodeBench: AsyncParsableCommand {
 
         // Lève Qwen4ExpDecodeBenchError.insufficientForcedIDs si --forced-ids
         // est trop court — jamais une troncature silencieuse de `roundCount`.
-        let forcedSteps = try qwen4ExpSplitForcedDecodeSteps(
-            forcedIDs: forcedIDs, tokensPerStep: tokensPerStep, stepCount: roundCount)
+        let forcedStepsPerVariant = try stepSizes.map {
+            try qwen4ExpSplitForcedDecodeSteps(
+                forcedIDs: forcedIDs, tokensPerStep: $0, stepCount: roundCount)
+        }
 
         // Préfixage commun à toutes les variantes : toujours reconstruit
         // avec l'ablation none (même état de base pour tout le monde), et
@@ -1726,7 +1759,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
                 variantCount: variants.count, roundCount: roundCount)
             for visit in schedule {
                 let variant = variants[visit.variantIndex]
-                let chunk = forcedSteps[visit.round]
+                let chunk = forcedStepsPerVariant[visit.variantIndex][visit.round]
                 model.restore(perVariantSnapshot[visit.variantIndex])
                 model.setAblation(variant)
                 let inputArray = MLXArray(chunk).reshaped([1, chunk.count])
@@ -1748,7 +1781,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
             // rien à en tirer).
             model.setAblation(variants[0])
             for round in 0..<roundCount {
-                let chunk = forcedSteps[round]
+                let chunk = forcedStepsPerVariant[0][round]
                 let inputArray = MLXArray(chunk).reshaped([1, chunk.count])
                 let start = ContinuousClock.now
                 _ = try model.forward(inputIDs: inputArray)
@@ -1762,7 +1795,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
         for (index, variant) in variants.enumerated() {
             // P11.2 : même garde de publication que flash-chat-probe — à
             // chaque variante, jamais une seule fois en tête.
-            print("=== variante : \(variant.rawValue) ===")
+            print("=== variante : \(variant.rawValue) · \(stepSizes[index]) jeton(s)/pas ===")
             print("ablation active : \(variant.rawValue)")
             print(
                 "routed experts (K) : \(model.routedExpertCount)/\(configuration.textConfiguration.numExperts)"
@@ -1773,7 +1806,7 @@ struct FlashDecodeBench: AsyncParsableCommand {
                 continue
             }
             print(
-                "ms/pas (\(tokensPerStep) jeton(s)/pas) — pas retenus \(stats.count) · "
+                "ms/pas (\(stepSizes[index]) jeton(s)/pas) — pas retenus \(stats.count) · "
                     + "médiane \(String(format: "%.3f", stats.medianMs)) · "
                     + "moyenne \(String(format: "%.3f", stats.meanMs)) · "
                     + "écart-type \(String(format: "%.3f", stats.stddevMs)) · "

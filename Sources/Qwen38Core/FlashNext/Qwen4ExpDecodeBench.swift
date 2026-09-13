@@ -28,6 +28,8 @@ public enum Qwen4ExpDecodeBenchError: LocalizedError, Equatable {
     case invalidStepCount(Int)
     case insufficientForcedIDs(required: Int, provided: Int)
     case emptyAblationSweep
+    case emptyTokensPerStepSweep
+    case invalidTokensPerStepSweepEntry(String)
 
     public var errorDescription: String? {
         switch self {
@@ -42,6 +44,12 @@ public enum Qwen4ExpDecodeBenchError: LocalizedError, Equatable {
                 + "\(required) (warmup + steps, multiplié par tokens-per-step)."
         case .emptyAblationSweep:
             return "--ablate-sweep ne peut pas être vide ou ne contenir que des espaces."
+        case .emptyTokensPerStepSweep:
+            return "--tokens-per-step-sweep ne peut pas être vide ou ne contenir que des espaces."
+        case .invalidTokensPerStepSweepEntry(let raw):
+            return
+                "--tokens-per-step-sweep : « \(raw) » n'est pas un entier positif "
+                + "(valeurs attendues : 1,2,4,8…)."
         }
     }
 }
@@ -89,6 +97,30 @@ public func qwen4ExpSplitForcedDecodeSteps(
 /// `qwen4ExpResolveAblation("")`. Les doublons sont acceptés tels quels —
 /// répéter une variante dans la liste répète juste sa visite à chaque tour,
 /// ce qui reste une alternance valide, seulement redondante.
+/// P11.4a : découpe `"1,2,4,8"` en valeurs de `--tokens-per-step`. Rejette
+/// les entrées vides, non entières ou nulles. Pendant de
+/// `qwen4ExpParseAblationSweep` pour l'autre dimension balayée : l'ordre est
+/// préservé, c'est lui qui fixe l'alternance des tours.
+public func qwen4ExpParseTokensPerStepSweep(_ raw: String) throws -> [Int] {
+    let parts = raw.split(separator: ",").map {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    // Une chaîne vide ou faite d'espaces donne `[]` ou `[""]` selon qu'elle
+    // contient une virgule : les deux valent « balayage vide », pas « entrée
+    // invalide ».
+    guard !parts.isEmpty, parts.contains(where: { !$0.isEmpty }) else {
+        throw Qwen4ExpDecodeBenchError.emptyTokensPerStepSweep
+    }
+    var out: [Int] = []
+    for part in parts {
+        guard let value = Int(part), value > 0 else {
+            throw Qwen4ExpDecodeBenchError.invalidTokensPerStepSweepEntry(part)
+        }
+        out.append(value)
+    }
+    return out
+}
+
 public func qwen4ExpParseAblationSweep(_ raw: String) throws -> [Qwen4ExpLayerBenchAblation] {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
