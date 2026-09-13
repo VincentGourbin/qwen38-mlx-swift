@@ -4226,41 +4226,49 @@ et il exclut le cache de pages — la distinction que notre `preflight-resident.
 fait déjà. Sur un Mac mini de 24 Go avec un checkpoint de 23 Go, le cache de
 pages du noyau détient de fait le modèle.
 
-#### ⚠️ Ce diagnostic a été corrigé le 2026-09-13 — lire d'abord ceci
+#### ⚠️ Diagnostic corrigé deux fois le 2026-09-13 — lire ceci, pas le tableau suivant
 
-Le tableau ci-dessous (« 28× du toit, 3,6 % de la bande passante ») est **juste
-en agrégat mais trompeur sur la cible**. Il laissait croire qu'il fallait mieux
-lire les poids des experts. La mesure à séquence forcée l'a réfuté :
+Le tableau conservé plus bas (« ×28 du toit, 3,6 % de la bande passante ») ne
+comptait que les **experts routés**. C'était l'erreur de cadrage. Voici le
+compte complet, dérivé des en-têtes safetensors du checkpoint.
 
-| K | Mio d'experts lus | ms par pas |
-|---:|---:|---:|
-| 10 | 1 005 | 46,944 |
-| 5 | 503 | 44,608 |
-| 1 | 101 | 42,576 |
+**Ce que le modèle lit vraiment par jeton décodé** (hors table n-gram et
+embeddings, lectures éparses, et hors tour vision) :
 
-Droite ajustée à mieux que 0,08 ms : **pente 4,78 µs par Mio (219 Go/s, 55 %
-du pic) et ordonnée 42,13 ms**. Donc sur un pas de 46,94 ms :
+| étage | Mio/jeton | part | toit à 400 Go/s | coût attribué | × le toit |
+|---|---:|---:|---:|---:|---:|
+| **GDN (projections, 36 couches)** | **1 246** | 38 % | 3,27 ms | 17,4 ms | 5,3× |
+| experts routés (10 sur 512) | 1 005 | 31 % | 2,63 ms | 20,4 ms | 7,8× |
+| **hyper-connexions** | 383 | 12 % | 1,00 ms | 21,9 ms | **21,8×** |
+| QSA (12 couches) | 368 | 11 % | 0,96 ms | 12,1 ms | 12,5× |
+| **expert partagé** | 141 | 4 % | 0,37 ms | 11,9 ms | **32,2×** |
+| routeur MoE | 120 | 4 % | 0,31 ms | — | — |
+| **TOTAL** | **3 283** | 100 % | **8,61 ms** | | |
 
-- **4,80 ms (10 %)** pour lire les experts — **et cette part-là fonctionne
-  bien**, à 55 % de la bande passante crête ;
-- **42,13 ms (90 %)** de **coût fixe**, indépendant du volume lu.
+| | |
+|---|---|
+| mesuré | 47,84 ms par pas → **72 Go/s = 18 % du pic** |
+| toit à 400 Go/s | 8,61 ms → **116 tok/s**, soit **×5,6** (et non ×28) |
+| au rendement du matmul dense isolé (212 Go/s mesurés) | 16,2 ms → **62 tok/s**, soit **×2,9** |
 
-**Diviser les octets lus par dix ne rend que 9,3 %.** La cible n'est donc pas
-la lecture des poids mais les **42 ms de travail fixe par jeton**, répartis sur
-48 couches de petites opérations (GDN, QSA, hyper-connexions, normes, routeur,
-expert partagé) — un coût **diffus**, sans bloc dominant.
+**Le coût se sépare en deux régimes.** Les gros étages (GDN, experts, QSA)
+tournent à 36-53 % du pic quand on les mesure isolément — perfectible, pas
+scandaleux. Les petits (hyper-connexions, expert partagé, normes) tournent à
+3-5 % du pic parce qu'ils sont faits de **dizaines d'opérations minuscules**
+payant chacune 3 à 6 µs de latence de lancement pour un travail dérisoire :
+`Qwen4ExpGatedResidual.callAsFunction` enchaîne ~15 ops, deux fois par couche,
+soit **~1 440 lancements par jeton pour 0,8 ms de travail utile**.
 
-C'est ce qui explique d'un coup toutes les mesures de §P11 : K plafonne à
-+5,9 %, les noyaux Metal F8/F9 ont donné −1 %, ablater n'importe quoi
-« économise » 20-40 % pour une somme de 180 %, et le spéculatif plafonne à
-1,14×.
+**C'est là qu'est le gras, et c'est la première cible chiffrée de la campagne
+avec un gain crédible.** Ramener les hyper-connexions et l'expert partagé au
+rendement du GDN rendrait ~10 ms sur 47,84, soit **+26 %**. Le faire sur tous
+les petits étages viserait les 62 tok/s.
 
-**Les deux seules directions qui restent** attaquent un coût fixe diffus, pas
-un bloc : compter les ops GPU réelles par jeton (jamais vérifié depuis F7 ;
-42,13 ms sur ~4 800 ops ferait 8,8 µs par op, c'est-à-dire un plancher de
-latence de lancement que rien de ponctuel ne bougera), puis tenter une
-**capture de graphe sur le pas entier** — `MLX.compile` n'a été essayé qu'au
-niveau d'une couche (P2-code) et en P7, où il cassait la parité GDN.
+**Pourquoi `MLX.compile` plutôt qu'un noyau Metal** : F8 était déjà un
+`MLXFast.metalKernel` sur cet étage, fusionnant 5 des 15 ops — régression de
+1 %. Il en restait dix. `compile` fusionne les chaînes élémentaires
+automatiquement, et `op-overhead-probe` le mesure gagnant sur ce motif
+(`silu(x)*x` : 4,85 µs non compilé contre 3,24 µs compilé).
 
 #### Le diagnostic initial, conservé pour mémoire : nous sommes à 28× du toit
 
