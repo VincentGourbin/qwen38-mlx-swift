@@ -5758,3 +5758,95 @@ différents — où des sorties différentes sont évidemment le comportement
 attendu. Le contrôle ne s'exécute plus que si tous les prompts sont
 identiques ; sinon la sonde renvoie explicitement vers la ligne
 « référence (rang N) », qui est le vrai critère.
+
+---
+
+## 2026-09-13 — P12.3 : l'ordonnanceur livre ×2,16 sur le serveur réel
+
+`serve --batch-size N`, défaut 1 (chemin d'aujourd'hui, strictement inchangé).
+Au-delà, les requêtes **froides** en attente sont regroupées dans un même pas
+de décodage ; une requête qui touche le cache de conversations garde le chemin
+sérialisé et son TTFT plat.
+
+### Un crash trouvé par la mesure, et sa vraie cause
+
+Première version : `--batch-size 4` avec **8 clients** (donc deux exécutions de
+lot successives) tuait le serveur — `EXC_BAD_ACCESS` dans
+`unloadResidentLayers()` appelé par `resetConversation()` depuis
+`generateBatch`. Avec 8 clients et `--batch-size 8` (un seul lot), aucun
+problème. Mon hypothèse était que le verrou d'exécution n'existait pas ou ne
+couvrait pas la réinitialisation.
+
+**La vraie cause est plus fine** : le verrou existait et était bien acquis,
+mais **sa libération dépendait de la consommation des flux SSE, pas de la fin
+réelle de l'exécution**. `continuation.finish()` réveille son lecteur de façon
+asynchrone ; le serveur relâchait donc le verrou dès que les flux étaient
+consommés, ce qui pouvait précéder l'exécution du `model.resetConversation()`
+final. Un second lot démarrait alors sa propre réinitialisation pendant que le
+premier terminait la sienne : **deux `resetCaches()` concurrents sur le même
+modèle résident.**
+
+Correctif : la génération par lot retourne désormais une tâche `completion`
+qui ne se termine qu'à la fin réelle de `run()`, et c'est elle que le
+coordinateur attend avant de relâcher le verrou. Le
+`model.resetConversation()` final est en outre déplacé **avant** la fermeture
+des continuations. Test de non-régression
+(`serverNeverOverlapsTwoSuccessiveBatchExecutions`) : deux exécutions
+successives avec un délai injecté entre « flux livrés » et « exécution
+terminée » — **vérifié qu'il échoue sans le correctif** et passe avec.
+
+**Leçon : les 13 tests initiaux ne couvraient que le cas d'un lot unique.**
+C'est le trou par lequel le bug est passé, et c'est la mesure sur serveur réel
+qui l'a trouvé, pas la suite de tests.
+
+### La matrice
+
+Clients simultanés à départ synchronisé, 96 jetons, prompts de longueurs
+voisines (`Scripts/bench-concurrent.py`).
+
+**Débit agrégé, en jetons par seconde :**
+
+| clients | sérialisé | lot de 4 | lot de 8 | gain |
+|---:|---:|---:|---:|---:|
+| 1 | 20,48 | 19,71 | 20,38 | ×1,00 |
+| 2 | 20,05 | 28,90 | 29,14 | ×1,45 |
+| 4 | 20,04 | 36,90 | 36,91 | ×1,84 |
+| 8 | 19,91 | 36,67 | **43,07** | **×2,16** |
+
+**Latence de bout en bout par client — médiane / dernier servi :**
+
+| clients | sérialisé | lot de 4 | lot de 8 |
+|---:|---:|---:|---:|
+| 1 | 4,69 / 4,69 s | 4,87 / 4,87 s | 4,71 / 4,71 s |
+| 2 | 7,19 / 9,58 s | 6,64 / 6,64 s | 6,59 / 6,59 s |
+| 4 | 11,96 / 19,17 s | 10,41 / 10,41 s | 10,40 / 10,40 s |
+| 8 | 21,80 / **38,57 s** | 15,59 / 20,94 s | 17,83 / **17,83 s** |
+
+### Ce qu'il faut en retenir
+
+1. **×2,16 de débit agrégé à 8 clients**, et le dernier servi passe de 38,57 s
+   à 17,83 s. En lot, **toutes les latences sont égales** : personne n'attend
+   derrière personne.
+2. **Aucune régression à un seul client** : 20,38 contre 20,48 jetons/s, et
+   4,71 s contre 4,69. Le chemin solo n'est pas payé.
+3. **Le ×2,16 du serveur est en dessous du ×2,94 de la sonde P12.1**, et c'est
+   attendu : le serveur paie en plus le préfill de chaque requête, la fenêtre
+   de regroupement de 30 ms, et le fait qu'une ligne finie garde sa place
+   jusqu'à la fin du lot.
+4. **Arbitrage réel entre taille de lot et médiane.** À 8 clients, un lot de 4
+   donne une *meilleure médiane* (15,59 s contre 17,83) parce que le premier
+   lot sort tôt, mais un *dernier servi plus tardif* (20,94 contre 17,83).
+   Grand lot = meilleur débit ; petit lot = meilleure latence médiane.
+5. Mémoire : RSS max **52,9 Go**, 277 décompressions sur toute la matrice. Le
+   lot ne coûte rien en mémoire à cette échelle.
+
+### Limites connues, à porter à la suite
+
+- Fenêtre de regroupement de **30 ms codée en dur**, ni mesurée ni exposée.
+- **Une requête servie en lot n'est jamais mémorisée** comme conversation
+  active : elle perd l'opportunité d'un tour 2 rapide. Une requête froide
+  *isolée* garde le chemin d'aujourd'hui et reste éligible.
+- Toute requête portant une **image** reste mono-séquence.
+- L'entrée et la sortie de séquences **en cours** de lot ne sont pas
+  implémentées : une ligne finie occupe sa place jusqu'au bout. C'est le
+  gâchis mesurable dans l'écart entre ×2,16 et ×2,94.

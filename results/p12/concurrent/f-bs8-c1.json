@@ -1,0 +1,10 @@
+{
+ "clients": 1,
+ "mixed": false,
+ "wall": 4.710568189620972,
+ "tokens": 96,
+ "aggregate_tok_s": 20.379707104446883,
+ "latencies": [
+  4.710406064987183
+ ]
+}

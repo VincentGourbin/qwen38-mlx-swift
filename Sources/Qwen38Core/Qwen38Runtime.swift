@@ -216,6 +216,41 @@ public struct Qwen38ChatMessage: Sendable, Equatable {
     }
 }
 
+/// P12.3 : une ligne d'un lot soumis à `Qwen38FlashNextEngineProtocol.
+/// generateBatch` — le pendant transport-neutre de `Qwen38ChatMessage`
+/// pour l'ordonnanceur du serveur (`serve --batch-size N`). Chaque ligne
+/// garde ses propres `options` (température, top-p/top-k, pénalités,
+/// `maxTokens` — voir PLAN.md P12.3, « échantillonnage par séquence »).
+public struct Qwen38BatchGenerationRequest: Sendable {
+    public let messages: [Qwen38ChatMessage]
+    public let options: Qwen38GenerationOptions
+
+    public init(messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) {
+        self.messages = messages
+        self.options = options
+    }
+}
+
+/// P12.3 (correctif du 2026-09-13, crash mémoire) : `completion` est le
+/// SEUL signal sûr pour savoir qu'une exécution de lot a fini de toucher le
+/// modèle résident — jamais la clôture des `streams`. Un appelant (le
+/// coordinateur du serveur) qui libérerait un verrou d'exclusion mutuelle
+/// dès que les flux sont consommés pourrait laisser un second lot démarrer
+/// pendant que celui-ci exécute encore son propre nettoyage après avoir
+/// déjà refermé ses flux — deux `resetConversation()` concurrents sur le
+/// même modèle résident, cause vérifiée du crash (`EXC_BAD_ACCESS` dans les
+/// couches résidentes). Voir `Qwen4ExpBatchStreamingGenerator.Result`, dont
+/// ceci est le pendant côté `Qwen38FlashNextEngineProtocol`.
+public struct Qwen38BatchGenerationResult: Sendable {
+    public let streams: [AsyncThrowingStream<Qwen38GenerationEvent, Error>]
+    public let completion: Task<Void, Never>
+
+    public init(streams: [AsyncThrowingStream<Qwen38GenerationEvent, Error>], completion: Task<Void, Never>) {
+        self.streams = streams
+        self.completion = completion
+    }
+}
+
 private struct Qwen38ConversationTurn: Sendable {
     let role: Chat.Message.Role
     let text: String
@@ -529,6 +564,93 @@ public actor Qwen38Runtime {
             conversationCache.count, totalCacheBytes(), conversationCacheBudgetBytes,
             cacheMissCount, prefixHitCount, prefixMissCount
         )
+    }
+
+    /// P12.3 : sonde en LECTURE SEULE — aucun effet de bord sur l'état de
+    /// conversation actif ni sur le LRU, contrairement à
+    /// `prepareFlashConversation`. Réservée au nouvel ordonnanceur de lot du
+    /// serveur (`serve --batch-size N > 1`) pour classer une requête
+    /// « chaude » (elle correspond à une conversation active ou restaurable)
+    /// avant de décider si elle rejoint un lot — décider APRÈS aurait déjà
+    /// déclenché l'effet de bord de démarrage de cache de
+    /// `prepareFlashConversation`/`coldStartConversation` pour une requête
+    /// finalement détournée vers le lot, laissant l'engin croire à tort
+    /// qu'une conversation est active alors qu'elle n'a jamais tourné (voir
+    /// PLAN.md P12.3 : « le lot et le cache de conversations sont
+    /// incompatibles en l'état »).
+    ///
+    /// Duplique délibérément les conditions de correspondance de
+    /// `prepareFlashConversation`/`prepareImplicitConversation` plutôt que de
+    /// les appeler : ces méthodes commencent par muter l'état (export vers
+    /// le LRU, `clearActiveConversation`) avant même de savoir si la requête
+    /// est un succès ou un échec, ce qu'une sonde en lecture seule ne peut
+    /// pas se permettre.
+    public func flashConversationCacheWouldHit(
+        id: String?,
+        model: String,
+        messages: [Qwen38ChatMessage],
+        options: Qwen38GenerationOptions
+    ) -> Bool {
+        guard isFlashNextLoaded, conversationCacheBudgetBytes > 0 else { return false }
+        if let id {
+            if activeConversationID == id, activeConversationModel == model,
+               activeConversationOptions.map({ cacheOptionsCompatible($0, options) }) == true,
+               messages.count == activeConversationMessages.count + 1,
+               Array(messages.dropLast()) == activeConversationMessages {
+                return true
+            }
+            if let cached = conversationCache[id], cached.model == model,
+               cacheOptionsCompatible(cached.options, options),
+               messages.count == cached.ledger.count + 1,
+               Array(messages.dropLast()) == cached.ledger {
+                return true
+            }
+            return false
+        }
+        // Chemin implicite (pas de `conversation_id`) : un succès suppose
+        // des tours antérieurs à comparer — même garde que
+        // `prepareImplicitConversation`.
+        guard messages.count > 1 else { return false }
+        let priorMessages = Array(messages.dropLast())
+        guard
+            let priorRenderedIDs = (try? renderedFlashTokenIDs(messages: priorMessages, options: options))
+                .flatMap({ $0.isEmpty ? nil : $0 })
+        else { return false }
+        if activeConversationModel == model, activeConversationID != nil,
+           activeConversationOptions.map({ cacheOptionsCompatible($0, options) }) == true,
+           !activeConversationMessages.isEmpty,
+           let activeRenderedIDs = try? renderedFlashTokenIDs(
+               messages: activeConversationMessages, options: options),
+           activeRenderedIDs == priorRenderedIDs {
+            return true
+        }
+        for candidateID in conversationCacheOrder.reversed() {
+            guard let cached = conversationCache[candidateID], cached.model == model,
+                  cacheOptionsCompatible(cached.options, options), !cached.ledger.isEmpty,
+                  let candidateRenderedIDs = try? renderedFlashTokenIDs(
+                      messages: cached.ledger, options: options),
+                  candidateRenderedIDs == priorRenderedIDs
+            else { continue }
+            return true
+        }
+        return false
+    }
+
+    /// P12.3 : décodage en lot pour l'ordonnanceur du serveur — voir
+    /// `Qwen38FlashNextEngineProtocol.generateBatch`. Chemin strictement
+    /// séparé de `generate`/`generateStateless` : jamais de conversation
+    /// active touchée, jamais de LRU consulté (voir
+    /// `Qwen4ExpBatchStreamingGenerator`, « toujours stateless »). N'est
+    /// atteint par le serveur qu'après vérification de `isFlashNextLoaded`
+    /// et de `flashConversationCacheWouldHit` — l'erreur ci-dessous est un
+    /// filet de sécurité, pas un chemin normal.
+    public func generateBatchFlashConversations(
+        requests: [Qwen38BatchGenerationRequest]
+    ) throws -> Qwen38BatchGenerationResult {
+        guard let flashEngine else {
+            throw Qwen38RuntimeError.modelNotLoaded
+        }
+        return try flashEngine.generateBatch(requests: requests)
     }
 
     /// Invalidates every cached Flash-Next conversation state — called when

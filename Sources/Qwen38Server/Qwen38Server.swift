@@ -53,8 +53,16 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     /// `/healthz` : ne jamais laisser croire à tort qu'une mesure a été
     /// prise avec (ou sans) ablation active (PLAN.md P11.2).
     public var ablation: String?
-    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, cacheRestored: Bool = false, cacheReplayed: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil, routedExpertCount: Int? = nil, ablation: String? = nil) {
-        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.cacheRestored = cacheRestored; self.cacheReplayed = cacheReplayed; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error; self.routedExpertCount = routedExpertCount; self.ablation = ablation
+    /// P12.3 : taille du lot dans lequel cette session a été effectivement
+    /// servie (`1` pour le chemin mono-séquence, `N > 1` pour un lot réel)
+    /// — `nil` tant que ce n'est pas encore décidé. Publiée uniquement au
+    /// moment où l'ordonnanceur a réellement tranché, jamais devinée à
+    /// l'avance : même garde de publication que `routedExpertCount`/
+    /// `ablation` (PLAN.md P12.3, « ne jamais mesurer en croyant à tort
+    /// avoir groupé »). Toujours `nil` quand `serve --batch-size` vaut 1.
+    public var batchSizeServed: Int?
+    public init(id: UUID = UUID(), client: String, path: String, model: String = "Qwen3.8", conversationID: String? = nil, startedAt: Date = Date(), status: Qwen38ServerSessionStatus = .queued, inputDescription: String = "Texte", promptTokens: Int = 0, generatedTokens: Int = 0, timeToFirstToken: TimeInterval? = nil, tokensPerSecond: Double? = nil, lastToken: String = "", cacheReused: Bool = false, cacheRestored: Bool = false, cacheReplayed: Bool = false, conversationReplayed: Bool = false, mtp: String = "indisponible", mtpProposed: Int = 0, mtpAccepted: Int = 0, mtpAcceptRate: Double? = nil, error: String? = nil, routedExpertCount: Int? = nil, ablation: String? = nil, batchSizeServed: Int? = nil) {
+        self.id = id; self.client = client; self.path = path; self.model = model; self.conversationID = conversationID; self.startedAt = startedAt; self.status = status; self.inputDescription = inputDescription; self.promptTokens = promptTokens; self.generatedTokens = generatedTokens; self.timeToFirstToken = timeToFirstToken; self.tokensPerSecond = tokensPerSecond; self.lastToken = lastToken; self.cacheReused = cacheReused; self.cacheRestored = cacheRestored; self.cacheReplayed = cacheReplayed; self.conversationReplayed = conversationReplayed; self.mtp = mtp; self.mtpProposed = mtpProposed; self.mtpAccepted = mtpAccepted; self.mtpAcceptRate = mtpAcceptRate; self.error = error; self.routedExpertCount = routedExpertCount; self.ablation = ablation; self.batchSizeServed = batchSizeServed
     }
 }
 
@@ -84,7 +92,13 @@ public struct Qwen38ServerSnapshot: Sendable, Equatable, Codable {
     /// ever counts explicit-`conversation_id` misses.
     public let prefixHits: Int
     public let prefixMisses: Int
-    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil, cacheMisses: Int = 0, cachedConversations: Int = 0, cacheBytes: Int64 = 0, cacheBudgetBytes: Int64 = 0, prefixHits: Int = 0, prefixMisses: Int = 0) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError; self.cacheMisses = cacheMisses; self.cachedConversations = cachedConversations; self.cacheBytes = cacheBytes; self.cacheBudgetBytes = cacheBudgetBytes; self.prefixHits = prefixHits; self.prefixMisses = prefixMisses }
+    /// P12.3 : taille de lot configurée au démarrage (`serve --batch-size`,
+    /// défaut 1) — toujours publiée, jamais devinée : c'est la garde de
+    /// publication qui permet de distinguer « le lot est actif » de « je
+    /// crois qu'il l'est » (même contrat que `routedExpertCount`/`ablation`
+    /// sur `/healthz`, PLAN.md P11/P12.3).
+    public let batchSizeConfigured: Int
+    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil, cacheMisses: Int = 0, cachedConversations: Int = 0, cacheBytes: Int64 = 0, cacheBudgetBytes: Int64 = 0, prefixHits: Int = 0, prefixMisses: Int = 0, batchSizeConfigured: Int = 1) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError; self.cacheMisses = cacheMisses; self.cachedConversations = cachedConversations; self.cacheBytes = cacheBytes; self.cacheBudgetBytes = cacheBudgetBytes; self.prefixHits = prefixHits; self.prefixMisses = prefixMisses; self.batchSizeConfigured = batchSizeConfigured }
 }
 
 public enum Qwen38ServerError: LocalizedError, Equatable {
@@ -197,7 +211,7 @@ private struct ChatCompletionDelta: Codable, Sendable {
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
-private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation } }
+private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation, batchSizeConfigured = "batch_size_configured" } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
 
@@ -287,6 +301,25 @@ public actor Qwen38InferenceServer {
     /// des sorties numériquement fausses par construction et ne doit
     /// jamais être déclenchable par un client ordinaire (PLAN.md P11.2).
     private var allowAblation = false
+    /// P12.3 : `serve --batch-size` (défaut 1). À 1, `start` n'enregistre
+    /// même pas la route batchée : `/v1/chat/completions` reste
+    /// `chatCompletionsResponse`, strictement inchangée — voir `start`'s
+    /// commentaire. `> 1` construit `batchCoordinator` et enregistre
+    /// `chatCompletionsResponseBatched` à la place.
+    private var batchSize = 1
+    /// P12.3 : verrou d'exécution du chemin batché — séparé de `queue`
+    /// (utilisé uniquement par le chemin `batchSize == 1` inchangé) pour ne
+    /// jamais toucher son comportement. Tenu depuis `ensureModelLoaded`
+    /// jusqu'à ce que l'exécution qui touche réellement le modèle résident
+    /// (chemin chaud/seul ou lot) soit terminée — jamais seulement jusqu'à
+    /// la construction de la `Response` HTTP, et jamais seulement jusqu'à
+    /// la consommation des flux (correctif du 2026-09-13, crash mémoire :
+    /// voir `Qwen38BatchGenerationResult`'s commentaire pour le chemin lot,
+    /// `Qwen38BatchCompletionGate`'s pour le chemin chaud/seul).
+    private let batchExecutionLock = FIFORequestQueue()
+    /// P12.3 : `nil` quand `batchSize == 1`. Construit par `start` avec un
+    /// `runBatch` qui referme sur `self.runtime`.
+    private var batchCoordinator: Qwen38BatchCoordinator?
     // P6.4: the per-conversation LRU (id/prefix matching, restore/export,
     // budget, prefix hit/miss counters) moved to `Qwen38Runtime` so the GUI
     // shares it too (`Qwen38Runtime.generate`'s Flash-Next branch) instead
@@ -296,8 +329,55 @@ public actor Qwen38InferenceServer {
     // call sites and tests are unaffected.
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false) async throws {
+    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1) async throws {
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
+        // P12.3 : mémorisé pour toute la durée de vie du serveur — voir
+        // `batchSize`'s doc comment. `<= 1` désactive le regroupement,
+        // exactement comme avant P12.3 (aucun `Qwen38BatchCoordinator`
+        // construit, route `chatCompletionsResponse` inchangée ci-dessous).
+        self.batchSize = max(batchSize, 1)
+        if self.batchSize > 1 {
+            // P12.3 : `batchExecutionLock` doit être tenu pour TOUTE
+            // exécution qui touche réellement le modèle résident, lot
+            // compris — pas seulement le chemin chaud/seul de
+            // `chatCompletionsResponseBatched`. Sans ce verrou ici, un lot
+            // pourrait démarrer pendant qu'une requête chaude — ou un AUTRE
+            // lot — est encore en train d'appeler `model.forward()`,
+            // corrompant l'état partagé.
+            //
+            // Correctif du 2026-09-13 (crash mémoire, `EXC_BAD_ACCESS` dans
+            // les couches résidentes) : le verrou n'est PAS relâché quand
+            // les flux du lot sont consommés (`rawStreams` retournés ici
+            // sont livrés immédiatement au client, avant même que la
+            // génération n'ait commencé). Il est relâché uniquement quand
+            // `result.completion` se termine — le signal que
+            // `Qwen4ExpBatchStreamingGenerator.run()` a réellement fini de
+            // toucher le modèle, y compris sa propre réinitialisation de
+            // fin de lot (voir `Qwen38BatchGenerationResult`'s
+            // commentaire). La libération via consommation des flux
+            // laissait un second lot démarrer sa réinitialisation pendant
+            // que le premier exécutait encore la sienne, après avoir déjà
+            // refermé ses flux — deux `resetConversation()` concurrents sur
+            // le même modèle résident, cause vérifiée du crash.
+            batchCoordinator = Qwen38BatchCoordinator(batchSize: self.batchSize) {
+                [runtime, batchExecutionLock] requests in
+                await batchExecutionLock.acquire()
+                do {
+                    let result = try await runtime.generateBatchFlashConversations(
+                        requests: requests.map { .init(messages: $0.messages, options: $0.options) })
+                    Task {
+                        _ = await result.completion.value
+                        await batchExecutionLock.release()
+                    }
+                    return result.streams
+                } catch {
+                    await batchExecutionLock.release()
+                    throw error
+                }
+            }
+        } else {
+            batchCoordinator = nil
+        }
         // P11.1 : mémorisé pour tout (re)chargement ultérieur — voir
         // `startupRoutedExpertCount`'s doc comment. Ne touche pas le modèle
         // déjà résident au moment de cet appel (chargé séparément par le
@@ -322,7 +402,17 @@ public actor Qwen38InferenceServer {
         router.get("healthz") { [self] _, _ in await self.healthResponse() }
         router.get("v1/models") { [self] request, _ in try await self.modelsResponse(request: request) }
         router.get("metrics") { [self] _, _ in await self.metricsResponse() }
-        router.post("v1/chat/completions") { [self] request, _ in try await self.chatCompletionsResponse(request: request) }
+        // P12.3 : à `batchSize == 1` (le défaut), `/v1/chat/completions`
+        // reste très exactement `chatCompletionsResponse` — pas une variante
+        // qui passerait par le nouveau code avec un lot de taille 1, la
+        // fonction non modifiée d'avant P12.3. `batchSize > 1` enregistre à
+        // la place `chatCompletionsResponseBatched`, qui seule connaît
+        // `batchCoordinator`/`batchExecutionLock`.
+        if self.batchSize > 1 {
+            router.post("v1/chat/completions") { [self] request, _ in try await self.chatCompletionsResponseBatched(request: request) }
+        } else {
+            router.post("v1/chat/completions") { [self] request, _ in try await self.chatCompletionsResponse(request: request) }
+        }
         let application = Application(router: router, configuration: .init(address: .hostname("0.0.0.0", port: port), serverName: "Qwen38Inference"))
         serverTask = Task { [weak self, application] in
             do { try await application.run(); await self?.serverDidStop() }
@@ -334,6 +424,9 @@ public actor Qwen38InferenceServer {
 
     public func stop() async {
         guard serverStatus != .stopped else { return }; serverStatus = .stopping; serverTask?.cancel(); if let serverTask { await serverTask.value }; self.serverTask = nil; serverStatus = .stopped
+        // P12.3 : ne laisse jamais un client suspendu derrière une fenêtre
+        // de regroupement qui ne se déclenchera plus.
+        if let batchCoordinator { await batchCoordinator.drain() }
     }
     public func snapshot() async -> Qwen38ServerSnapshot {
         refreshModelCatalog()
@@ -347,7 +440,7 @@ public actor Qwen38InferenceServer {
             lastError: lastError, cacheMisses: cache.cacheMisses,
             cachedConversations: cache.cachedConversations, cacheBytes: cache.cacheBytes,
             cacheBudgetBytes: cache.cacheBudgetBytes, prefixHits: cache.prefixHits,
-            prefixMisses: cache.prefixMisses)
+            prefixMisses: cache.prefixMisses, batchSizeConfigured: batchSize)
     }
     private func serverDidStop() { if serverStatus != .stopping { serverStatus = .stopped } }
     private func serverDidFail(_ error: String) { lastError = error; serverStatus = .failed }
@@ -359,7 +452,7 @@ public actor Qwen38InferenceServer {
     // P11.2 : `ablation` publié systématiquement, `"none"` quand il n'y en a
     // pas (aucun engin Flash-Next chargé, ou aucune ablation demandée) —
     // même garde de publication que `routed_expert_count`, PLAN.md P11.2.
-    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none")) }
+    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize)) }
     private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
     private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
 
@@ -450,6 +543,168 @@ public actor Qwen38InferenceServer {
                 primedInside: thinkingIsPrimed,
                 trackingID: trackingID,
                 requestMessages: prepared.messages, options: options)
+        } catch {
+            if input.effectiveConversationID != nil {
+                await runtime.clearActiveFlashConversation()
+                await runtime.resetConversation()
+            }
+            updateSession(id) { $0.status = .failed; $0.error = error.localizedDescription; $0.finishedAt = Date() }
+            return Self.errorResponse(Self.status(for: error), message: error.localizedDescription)
+        }
+    }
+
+    /// P12.3 : jumelle de `chatCompletionsResponse` pour `serve --batch-size
+    /// N > 1` — un fichier séparé plutôt qu'un `if batchSize > 1` glissé
+    /// dans la fonction d'aujourd'hui, précisément pour que celle-ci reste
+    /// intouchée (voir `start`'s commentaire et le critère « bit-identique
+    /// à batch-size 1 » de PLAN.md P12.3).
+    ///
+    /// Différences avec le chemin d'aujourd'hui :
+    ///  - Une requête « chaude » (elle touche une conversation active ou
+    ///    restaurable — `Qwen38Runtime.flashConversationCacheWouldHit`, une
+    ///    sonde en LECTURE SEULE) ou porteuse d'une image suit exactement
+    ///    la même logique que `chatCompletionsResponse`
+    ///    (`prepareConversation` puis `generate`/`generateStateless`), mais
+    ///    sous `batchExecutionLock` plutôt que `queue` — un verrou séparé
+    ///    tenu jusqu'à la fin RÉELLE de la génération (voir
+    ///    `qwen38AttachCompletionGate`), pas seulement jusqu'à la
+    ///    construction de la réponse HTTP, pour rester mutuellement exclusif
+    ///    avec un lot en cours.
+    ///  - Une requête « froide » rejoint `batchCoordinator` : si elle se
+    ///    retrouve seule à l'issue de la fenêtre de regroupement (`.solo`),
+    ///    elle est traitée exactement comme une requête chaude (même
+    ///    `prepareConversation`, donc éligible à devenir une conversation
+    ///    active pour un futur tour) ; si elle rejoint un lot (`.batched`),
+    ///    elle ne touche JAMAIS `prepareConversation`/`rememberConversation`
+    ///    — `trackingID` reste `nil` (voir PLAN.md P12.3, « le lot et le
+    ///    cache de conversations sont incompatibles »).
+    private func chatCompletionsResponseBatched(request: Request) async throws -> Response {
+        try authorize(request); var request = request; let buffer = try await request.collectBody(upTo: 64 * 1024 * 1024)
+        guard let data = buffer.getData(at: buffer.readerIndex, length: buffer.readableBytes) else { throw Qwen38ServerError.invalidRequest("Le corps JSON est vide.") }
+        let input: ChatCompletionRequest
+        do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
+        guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
+        guard input.messages.last?.role == "user" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user.") }
+        let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); updateSession(id) { $0.status = .running }
+        do {
+            await batchExecutionLock.acquire()
+            let selectedModel: String
+            do { selectedModel = try await ensureModelLoaded(requestedModel) }
+            catch { await batchExecutionLock.release(); throw error }
+            await batchExecutionLock.release()
+            updateSession(id) { $0.model = selectedModel }
+            let prepared = try prepare(input.messages)
+            let temperature = input.temperature ?? 0
+            let presencePenalty = input.explicitPresencePenalty ?? (temperature > 0 ? 1.5 : 0)
+            let requestedAblation: Qwen4ExpLayerBenchAblation?
+            if let rawAblation = input.effectiveAblation {
+                guard allowAblation else {
+                    throw Qwen38ServerError.invalidRequest(
+                        "Le champ ablation est refusé : redémarrez le serveur avec --allow-ablation pour l'autoriser. L'ablation produit des sorties numériquement fausses par construction.")
+                }
+                requestedAblation = try qwen4ExpResolveAblation(rawValue: rawAblation)
+            } else {
+                requestedAblation = nil
+            }
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation)
+            let conversationID = input.effectiveConversationID
+
+            // P12.3 : une image, ou une requête qui touche le cache de
+            // conversations/de préfixe, suit toujours le chemin
+            // chaud/mono-séquence — jamais le coordinateur de lot. Voir le
+            // commentaire de fonction.
+            let hasImages = prepared.messages.contains { !$0.imageURLs.isEmpty }
+            let flashNextLoaded = await runtime.isFlashNextLoaded
+            var isEligibleForBatching = !hasImages && batchCoordinator != nil && flashNextLoaded
+            if isEligibleForBatching {
+                isEligibleForBatching = !(await runtime.flashConversationCacheWouldHit(
+                    id: conversationID, model: selectedModel, messages: prepared.messages, options: options))
+            }
+
+            var joinResult: Qwen38BatchJoinResult = .solo
+            if isEligibleForBatching, let batchCoordinator {
+                let promptTokenCount = ((try? await runtime.renderedFlashTokenIDs(
+                    messages: prepared.messages, options: options)).flatMap { $0 })?.count
+                if let promptTokenCount {
+                    joinResult = try await batchCoordinator.join(
+                        promptTokenCount: promptTokenCount,
+                        request: .init(messages: prepared.messages, options: options))
+                }
+            }
+
+            let thinkingIsPrimed = options.enableThinking
+            switch joinResult {
+            case .batched(let rawStream, let batchSizeServed):
+                // Jamais mémorisé — voir le commentaire de fonction et
+                // `Qwen4ExpBatchStreamingGenerator`, « toujours stateless ».
+                updateSession(id) { $0.batchSizeServed = batchSizeServed }
+                for url in prepared.temporaryFiles { try? FileManager.default.removeItem(at: url) }
+                if input.stream == true {
+                    return try await makeStreamingResponse(
+                        stream: rawStream, sessionID: id, model: selectedModel,
+                        primedInside: thinkingIsPrimed, trackingID: nil,
+                        requestMessages: prepared.messages, options: options)
+                }
+                return try await makeJSONResponse(
+                    stream: rawStream, sessionID: id, model: selectedModel,
+                    primedInside: thinkingIsPrimed, trackingID: nil,
+                    requestMessages: prepared.messages, options: options)
+
+            case .solo:
+                // Exactement la logique de `chatCompletionsResponse` (une
+                // requête chaude, une image, ou une requête froide restée
+                // seule à l'issue de la fenêtre de regroupement) — sous
+                // `batchExecutionLock`, tenu jusqu'à la fin réelle de la
+                // génération plutôt que jusqu'à la réponse HTTP (voir le
+                // commentaire de fonction).
+                await batchExecutionLock.acquire()
+                let usePersistentCache: Bool
+                let cacheRestored: Bool
+                let trackingID: String?
+                do {
+                    (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
+                        id: conversationID, model: selectedModel, messages: prepared.messages, options: options)
+                } catch {
+                    await batchExecutionLock.release()
+                    throw error
+                }
+                let cacheReplayed = !usePersistentCache && trackingID != nil && prepared.messages.count > 1
+                updateSession(id) { $0.cacheRestored = cacheRestored; $0.cacheReplayed = cacheReplayed; $0.batchSizeServed = 1 }
+                let rawStream: AsyncThrowingStream<Qwen38GenerationEvent, Error>
+                do {
+                    if usePersistentCache, let last = prepared.messages.last {
+                        let systemPrompt = prepared.messages.first(where: { $0.role == .system })?.content
+                        rawStream = try await runtime.generate(
+                            prompt: last.content, systemPrompt: systemPrompt, imageURLs: last.imageURLs, options: options)
+                    } else {
+                        rawStream = try await runtime.generateStateless(messages: prepared.messages, options: options)
+                    }
+                } catch {
+                    await batchExecutionLock.release()
+                    throw error
+                }
+                for url in prepared.temporaryFiles { try? FileManager.default.removeItem(at: url) }
+                // Sûr ici (contrairement au lot, voir le commentaire de
+                // `Qwen38BatchCompletionGate`) : `Qwen4ExpStreamingGenerator.
+                // run()` ne touche plus jamais `model` après avoir yield
+                // `.finished` — rien à attendre de plus que la clôture du
+                // flux avant de relâcher le verrou.
+                let gate = Qwen38BatchCompletionGate(rowCount: 1) { [batchExecutionLock] in
+                    Task { await batchExecutionLock.release() }
+                }
+                let stream = qwen38AttachCompletionGate(rawStream, gate: gate)
+                if input.stream == true {
+                    return try await makeStreamingResponse(
+                        stream: stream, sessionID: id, model: selectedModel,
+                        primedInside: thinkingIsPrimed, trackingID: trackingID,
+                        requestMessages: prepared.messages, options: options)
+                }
+                return try await makeJSONResponse(
+                    stream: stream, sessionID: id, model: selectedModel,
+                    primedInside: thinkingIsPrimed, trackingID: trackingID,
+                    requestMessages: prepared.messages, options: options)
+            }
         } catch {
             if input.effectiveConversationID != nil {
                 await runtime.clearActiveFlashConversation()

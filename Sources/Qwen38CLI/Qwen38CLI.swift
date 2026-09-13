@@ -3152,9 +3152,19 @@ struct Serve: AsyncParsableCommand {
     )
     var allowAblation = false
 
+    @Option(
+        name: .long,
+        help:
+            "P12.3 : regrouper jusqu'à N requêtes froides dans un même pas de décodage (défaut 1 = comportement actuel strictement inchangé, aucun regroupement). Voir PLAN.md P12.3 : une requête qui touche le cache de conversations/de préfixe, ou porte une image, garde toujours le chemin mono-séquence."
+    )
+    var batchSize: Int = 1
+
     func run() async throws {
         if let routedExperts, routedExperts < 1 {
             throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
+        }
+        guard batchSize >= 1 else {
+            throw ValidationError("--batch-size doit être un entier positif (1 = comportement actuel)")
         }
         let runtime = Qwen38Runtime()
         var session: ProfilingSession?
@@ -3202,9 +3212,13 @@ struct Serve: AsyncParsableCommand {
                 .deletingLastPathComponent(),
             conversationCacheGB: conversationCacheGb,
             routedExpertCount: routedExperts,
-            allowAblation: allowAblation)
+            allowAblation: allowAblation,
+            batchSize: batchSize)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
+        if batchSize > 1 {
+            print("P12.3 : regroupement actif, taille de lot \(batchSize) (voir /healthz · batch_size_configured)")
+        }
 
         var recorder: MetalSystemTrace.Recorder?
         if metalTraceSeconds > 60 {

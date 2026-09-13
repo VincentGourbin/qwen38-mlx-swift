@@ -915,6 +915,62 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
         return Self.makeCompletedStream()
     }
 
+    /// P12.3 : imite `Qwen38FlashNextEngine.generateBatch` sans lot MLX réel
+    /// — un flux par requête, dont le contenu (`"mock-row-<i>"`) encode le
+    /// rang de la ligne pour qu'un test puisse vérifier la non-contamination
+    /// (chaque flux ne porte que le contenu de SA propre ligne) sans device
+    /// Metal ni checkpoint.
+    ///
+    /// `generateBatchActiveCount`/`generateBatchMaxObservedConcurrency`
+    /// reproduisent, côté mock, le contrat de `Qwen38BatchGenerationResult.
+    /// completion` : ils ne redeviennent cohérents (`activeCount` décrémenté)
+    /// qu'une fois `completion` terminée, jamais à la simple construction
+    /// des flux — exactement le point qui a causé le crash mémoire du
+    /// 2026-09-13 quand le serveur libérait son verrou d'exécution sur la
+    /// consommation des flux plutôt que sur `completion`.
+    /// `generateBatchCompletionDelay` élargit délibérément la fenêtre entre
+    /// « les flux sont livrés » et « l'exécution est réellement terminée »,
+    /// pour qu'un test de non-régression puisse détecter de manière fiable
+    /// un recouvrement entre deux exécutions de lot successives.
+    private(set) var lastGenerateBatchRequests: [Qwen38BatchGenerationRequest]?
+    private(set) var generateBatchCallCount = 0
+    private(set) var generateBatchActiveCount = 0
+    private(set) var generateBatchMaxObservedConcurrency = 0
+    var generateBatchCompletionDelay: Duration = .zero
+    private let batchConcurrencyLock = NSLock()
+
+    /// `NSLock.lock()/unlock()` sont marqués indisponibles depuis un
+    /// contexte asynchrone (Swift 6) — cet enrobage synchrone les rend
+    /// appelables depuis la tâche de complétion ci-dessous sans rien
+    /// changer à la sémantique (verrouillage bref, aucun `await` pendant
+    /// qu'il est tenu).
+    private func withBatchConcurrencyLock<T>(_ body: () -> T) -> T {
+        batchConcurrencyLock.lock()
+        defer { batchConcurrencyLock.unlock() }
+        return body()
+    }
+
+    func generateBatch(
+        requests: [Qwen38BatchGenerationRequest]
+    ) throws -> Qwen38BatchGenerationResult {
+        lastGenerateBatchRequests = requests
+        withBatchConcurrencyLock {
+            generateBatchCallCount += 1
+            generateBatchActiveCount += 1
+            generateBatchMaxObservedConcurrency = max(generateBatchMaxObservedConcurrency, generateBatchActiveCount)
+        }
+
+        let streams = requests.indices.map { index in Self.makeCompletedStream(content: "mock-row-\(index)") }
+        let delay = generateBatchCompletionDelay
+        let completion = Task { [self] in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            withBatchConcurrencyLock { generateBatchActiveCount -= 1 }
+        }
+        return Qwen38BatchGenerationResult(streams: streams, completion: completion)
+    }
+
     /// P6.1: a deterministic stand-in for the real tokenizer — one Int32
     /// "token" per whitespace-separated word (plus a role marker), stable
     /// across calls (`String.hashValue` is process-stable, not persisted).
@@ -939,9 +995,9 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     /// `completeSession`/`rememberConversation` — the empty-and-finish
     /// stream above was enough for the H3.1/PM4.3 dispatch tests, which
     /// never drain it.
-    private static func makeCompletedStream() -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+    private static func makeCompletedStream(content: String = "mock") -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         AsyncThrowingStream { continuation in
-            continuation.yield(.chunk("mock"))
+            continuation.yield(.chunk(content))
             continuation.yield(
                 .metrics(
                     Qwen38RunMetrics(
@@ -3732,4 +3788,435 @@ func qwen4ExpQSACausalMaskWithLeftPaddingSurvivesDecodeStep() {
     #expect(!isNaN(batchedOutput).any().item(Bool.self))
     let row0Output = batchedOutput[0..<1, 0..., 0...]
     #expect(allClose(row0Output, referenceOutput, atol: 1e-4).item(Bool.self))
+}
+
+// MARK: - P12.3 : ordonnanceur de lot du serveur (sans checkpoint)
+
+@Test("P12.3 : qwen38FormBatch retient l'ancre la plus ancienne et ses voisins de longueur")
+func formBatchPicksNearestNeighborsOfOldestAnchor() {
+    let waiting = [
+        Qwen38BatchCandidate(id: UUID(), promptTokenCount: 100, arrivalIndex: 0),  // ancre
+        Qwen38BatchCandidate(id: UUID(), promptTokenCount: 500, arrivalIndex: 1),  // loin
+        Qwen38BatchCandidate(id: UUID(), promptTokenCount: 110, arrivalIndex: 2),  // proche
+        Qwen38BatchCandidate(id: UUID(), promptTokenCount: 900, arrivalIndex: 3),  // très loin
+    ]
+    let chosen = qwen38FormBatch(waiting: waiting, batchSize: 2)
+    #expect(chosen.map(\.arrivalIndex) == [0, 2])
+}
+
+@Test("P12.3 : qwen38FormBatch départage les égalités de distance par ancienneté")
+func formBatchTiesBrokenByArrivalOrder() {
+    let anchor = Qwen38BatchCandidate(id: UUID(), promptTokenCount: 100, arrivalIndex: 0)
+    let older = Qwen38BatchCandidate(id: UUID(), promptTokenCount: 90, arrivalIndex: 1)  // distance 10
+    let newer = Qwen38BatchCandidate(id: UUID(), promptTokenCount: 110, arrivalIndex: 2)  // distance 10
+    let chosen = qwen38FormBatch(waiting: [anchor, newer, older], batchSize: 2)
+    #expect(chosen.map(\.arrivalIndex) == [0, 1])
+}
+
+@Test("P12.3 : qwen38FormBatch plafonne à batchSize et rend vide sur une file vide")
+func formBatchCapsAtBatchSizeAndHandlesEmptyQueue() {
+    let waiting = (0 ..< 5).map {
+        Qwen38BatchCandidate(id: UUID(), promptTokenCount: 100 + $0, arrivalIndex: $0)
+    }
+    #expect(qwen38FormBatch(waiting: waiting, batchSize: 3).count == 3)
+    #expect(qwen38FormBatch(waiting: [], batchSize: 3).isEmpty)
+}
+
+@Test("P12.3 : une requête froide seule, sans compagnie dans la fenêtre, est renvoyée .solo")
+func batchCoordinatorReturnsSoloWhenAlone() async throws {
+    let coordinator = Qwen38BatchCoordinator(batchSize: 4, window: .milliseconds(20)) { _ in
+        Issue.record("runBatch ne doit jamais être appelé pour une requête solo")
+        return []
+    }
+    let result = try await coordinator.join(
+        promptTokenCount: 10,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "solo")], options: .init()))
+    guard case .solo = result else {
+        Issue.record("attendu .solo, obtenu un résultat groupé")
+        return
+    }
+}
+
+@Test("P12.3 : deux requêtes froides proches en longueur rejoignent le même lot, sans contamination")
+func batchCoordinatorGroupsCloseRequestsWithoutContamination() async throws {
+    let coordinator = Qwen38BatchCoordinator(batchSize: 2, window: .milliseconds(200)) { requests in
+        requests.indices.map { index in
+            AsyncThrowingStream<Qwen38GenerationEvent, Error> { continuation in
+                continuation.yield(.chunk("row-\(index)"))
+                continuation.finish()
+            }
+        }
+    }
+    async let first = coordinator.join(
+        promptTokenCount: 10,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "A")], options: .init()))
+    async let second = coordinator.join(
+        promptTokenCount: 12,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "B")], options: .init()))
+    let (resultA, resultB) = try await (first, second)
+
+    func content(_ result: Qwen38BatchJoinResult) async throws -> String {
+        guard case .batched(let stream, let batchSizeServed) = result else {
+            Issue.record("attendu .batched")
+            return ""
+        }
+        #expect(batchSizeServed == 2)
+        var text = ""
+        for try await event in stream {
+            if case .chunk(let chunk) = event { text += chunk }
+        }
+        return text
+    }
+    let contentA = try await content(resultA)
+    let contentB = try await content(resultB)
+    // Non-contamination : chaque flux ne porte que le contenu de SA PROPRE
+    // ligne — jamais les deux le même, jamais un mélange.
+    #expect(Set([contentA, contentB]) == Set(["row-0", "row-1"]))
+    #expect(contentA != contentB)
+}
+
+@Test("P12.3 : le lot part dès que batchSize est atteint, sans attendre la fenêtre de regroupement")
+func batchCoordinatorDispatchesImmediatelyWhenBatchSizeReached() async throws {
+    let coordinator = Qwen38BatchCoordinator(batchSize: 2, window: .seconds(5)) { requests in
+        requests.indices.map { index in
+            AsyncThrowingStream<Qwen38GenerationEvent, Error> { continuation in
+                continuation.yield(.chunk("row-\(index)"))
+                continuation.finish()
+            }
+        }
+    }
+    let start = ContinuousClock.now
+    async let first = coordinator.join(
+        promptTokenCount: 10,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "A")], options: .init()))
+    async let second = coordinator.join(
+        promptTokenCount: 10,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "B")], options: .init()))
+    _ = try await (first, second)
+    // Si le lot avait attendu la fenêtre de 5 s, ce test dépasserait
+    // largement toute limite de temps raisonnable.
+    #expect(ContinuousClock.now - start < .seconds(2))
+}
+
+@Test("P12.3 : drain() résout immédiatement toute requête encore en attente (arrêt du serveur)")
+func batchCoordinatorDrainResolvesPendingRequestsAsSolo() async throws {
+    let coordinator = Qwen38BatchCoordinator(batchSize: 8, window: .seconds(5)) { _ in
+        Issue.record("runBatch ne doit pas être appelé après drain()")
+        return []
+    }
+    async let pending: Qwen38BatchJoinResult = coordinator.join(
+        promptTokenCount: 10,
+        request: .init(messages: [Qwen38ChatMessage(role: .user, content: "A")], options: .init()))
+    // Laisse le temps à `join` d'enregistrer sa candidature avant `drain()`.
+    try await Task.sleep(for: .milliseconds(20))
+    await coordinator.drain()
+    guard case .solo = try await pending else {
+        Issue.record("attendu .solo après drain()")
+        return
+    }
+}
+
+@Test("P12.3 : flashConversationCacheWouldHit est false sans engin Flash-Next résident")
+func flashConversationCacheWouldHitFalseWithoutEngine() async throws {
+    let runtime = Qwen38Runtime()
+    let hit = await runtime.flashConversationCacheWouldHit(
+        id: nil, model: "m", messages: [Qwen38ChatMessage(role: .user, content: "salut")],
+        options: .init())
+    #expect(hit == false)
+}
+
+@Test("P12.3 : flashConversationCacheWouldHit est false pour un premier tour tout frais")
+func flashConversationCacheWouldHitFalseForFreshFirstTurn() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-wouldhit-fresh-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let flashDirectory = root.appendingPathComponent("Qwen3.8-Flash-Next-4bit", isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+
+    let hit = await runtime.flashConversationCacheWouldHit(
+        id: nil, model: "m", messages: [Qwen38ChatMessage(role: .user, content: "bonjour")],
+        options: Qwen38GenerationOptions())
+    #expect(hit == false)
+}
+
+@Test("P12.3 : flashConversationCacheWouldHit reconnaît une conversation active, sans la muter")
+func flashConversationCacheWouldHitDetectsActiveConversationReadOnly() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-wouldhit-active-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let flashDirectory = root.appendingPathComponent("Qwen3.8-Flash-Next-4bit", isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+
+    let options = Qwen38GenerationOptions()
+    let user1 = Qwen38ChatMessage(role: .user, content: "premier tour")
+    _ = try await runtime.prepareFlashConversation(
+        id: "conv", model: "m", messages: [user1], options: options)
+    await runtime.rememberFlashConversation(
+        id: "conv", model: "m", requestMessages: [user1], assistantContent: "réponse", options: options)
+
+    let ledger = [user1, Qwen38ChatMessage(role: .assistant, content: "réponse")]
+    let user2 = Qwen38ChatMessage(role: .user, content: "second tour")
+    // Appelée deux fois : une sonde en lecture seule doit rendre le même
+    // résultat à chaque appel, sans effet de bord qui la ferait basculer.
+    let hit1 = await runtime.flashConversationCacheWouldHit(
+        id: "conv", model: "m", messages: ledger + [user2], options: options)
+    let hit2 = await runtime.flashConversationCacheWouldHit(
+        id: "conv", model: "m", messages: ledger + [user2], options: options)
+    #expect(hit1 == true)
+    #expect(hit2 == true)
+
+    // Toujours en attente derrière la sonde : un vrai prepareFlashConversation
+    // doit encore trouver la conversation active, comme si la sonde n'avait
+    // jamais été appelée.
+    let real = try await runtime.prepareFlashConversation(
+        id: "conv", model: "m", messages: ledger + [user2], options: options)
+    #expect(real.usePersistentCache == true)
+    #expect(real.cacheRestored == false)
+}
+
+@Test("P12.3 : /healthz publie batch_size_configured — 1 par défaut, N si serve --batch-size N")
+func healthzPublishesBatchSizeConfigured() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-healthz-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    _ = try #require(factory.lastEngine)
+
+    let defaultServer = Qwen38InferenceServer(runtime: runtime)
+    try await defaultServer.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    let defaultSnapshot = await defaultServer.snapshot()
+    #expect(defaultSnapshot.batchSizeConfigured == 1)
+    let (defaultData, defaultResponse) = try await URLSession.shared.data(
+        from: URL(string: "http://127.0.0.1:\(defaultSnapshot.port)/healthz")!)
+    #expect((defaultResponse as? HTTPURLResponse)?.statusCode == 200)
+    let defaultDecoded = try #require(try JSONSerialization.jsonObject(with: defaultData) as? [String: Any])
+    #expect(defaultDecoded["batch_size_configured"] as? Int == 1)
+    await defaultServer.stop()
+
+    let batchedServer = Qwen38InferenceServer(runtime: runtime)
+    try await batchedServer.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 4)
+    defer { Task { await batchedServer.stop() } }
+    let batchedSnapshot = await batchedServer.snapshot()
+    #expect(batchedSnapshot.batchSizeConfigured == 4)
+    let (batchedData, batchedResponse) = try await URLSession.shared.data(
+        from: URL(string: "http://127.0.0.1:\(batchedSnapshot.port)/healthz")!)
+    #expect((batchedResponse as? HTTPURLResponse)?.statusCode == 200)
+    let batchedDecoded = try #require(try JSONSerialization.jsonObject(with: batchedData) as? [String: Any])
+    #expect(batchedDecoded["batch_size_configured"] as? Int == 4)
+}
+
+@Test("P12.3 : deux requêtes froides identiques envoyées ensemble sont groupées sans contamination")
+func serverGroupsColdConcurrentRequestsWithoutContamination() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-cold-group-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 2)
+    defer { Task { await server.stop() } }
+    let snapshot = await server.snapshot()
+
+    func makeColdRequest() -> URLRequest {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try! JSONSerialization.data(withJSONObject: [
+            "model": modelID,
+            "messages": [["role": "user", "content": "requête froide identique"]],
+        ])
+        return request
+    }
+
+    async let responseA = URLSession.shared.data(for: makeColdRequest())
+    async let responseB = URLSession.shared.data(for: makeColdRequest())
+    let ((dataA, respA), (dataB, respB)) = try await (responseA, responseB)
+    #expect((respA as? HTTPURLResponse)?.statusCode == 200)
+    #expect((respB as? HTTPURLResponse)?.statusCode == 200)
+
+    struct JSONChoiceMessage: Decodable { let content: String }
+    struct JSONChoice: Decodable { let message: JSONChoiceMessage }
+    struct JSONCompletion: Decodable { let choices: [JSONChoice] }
+    let contentA = try JSONDecoder().decode(JSONCompletion.self, from: dataA).choices[0].message.content
+    let contentB = try JSONDecoder().decode(JSONCompletion.self, from: dataB).choices[0].message.content
+
+    // Critère de non-contamination (PLAN.md P12.3) : chaque réponse ne porte
+    // que le contenu de SA PROPRE ligne du lot — jamais les deux la même,
+    // jamais un mélange.
+    #expect(Set([contentA, contentB]) == Set(["mock-row-0", "mock-row-1"]))
+    #expect(mock.lastGenerateBatchRequests?.count == 2)
+
+    let finalSnapshot = await server.snapshot()
+    let served = finalSnapshot.sessions.compactMap(\.batchSizeServed).sorted()
+    #expect(served == [2, 2])
+}
+
+@Test("P12.3 : deux exécutions de lot successives ne se recouvrent jamais (régression du crash mémoire du 2026-09-13)")
+func serverNeverOverlapsTwoSuccessiveBatchExecutions() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-no-overlap-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    // Reproduit précisément l'écart qui a causé le crash du 2026-09-13 :
+    // les flux d'un lot sont livrés (et peuvent être entièrement consommés
+    // par leurs clients) bien avant que l'exécution elle-même ne soit
+    // considérée terminée (le nettoyage de fin de lot, dans la vraie
+    // implémentation). Sans le correctif — verrou relâché sur la
+    // consommation des flux plutôt que sur `Qwen38BatchGenerationResult.
+    // completion` — un second lot pouvait démarrer sa propre exécution
+    // pendant que celle-ci tournait encore.
+    mock.generateBatchCompletionDelay = .milliseconds(150)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    // Taille de lot 2, 4 requêtes froides concurrentes : reproduction
+    // exacte du rapport (« plus de clients simultanés que la taille de
+    // lot » — au moins deux exécutions de lot successives).
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 2)
+    defer { Task { await server.stop() } }
+    let snapshot = await server.snapshot()
+
+    func makeColdRequest(_ text: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try! JSONSerialization.data(withJSONObject: [
+            "model": modelID,
+            "messages": [["role": "user", "content": text]],
+            "max_tokens": 96,
+        ])
+        return request
+    }
+
+    async let r1 = URLSession.shared.data(for: makeColdRequest("A"))
+    async let r2 = URLSession.shared.data(for: makeColdRequest("B"))
+    async let r3 = URLSession.shared.data(for: makeColdRequest("C"))
+    async let r4 = URLSession.shared.data(for: makeColdRequest("D"))
+    let responses = try await [r1, r2, r3, r4]
+    for (_, response) in responses {
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    }
+
+    // Les 4 réponses HTTP peuvent revenir avant même que la seconde
+    // exécution de lot n'ait démarré — chaque client n'attend que la
+    // consommation de SA PROPRE ligne, pas la fin de `completion`. On
+    // attend explicitement que les deux exécutions attendues aient eu lieu
+    // et se soient réellement terminées avant de vérifier qu'elles ne se
+    // sont jamais recouvertes.
+    let deadline = ContinuousClock.now + .seconds(5)
+    while (mock.generateBatchCallCount < 2 || mock.generateBatchActiveCount > 0),
+          ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+
+    #expect(mock.generateBatchCallCount == 2)
+    #expect(mock.generateBatchActiveCount == 0)
+    // Le critère de non-régression : jamais plus d'une exécution de lot
+    // active en même temps. Sans le correctif, ce test observe 2.
+    #expect(mock.generateBatchMaxObservedConcurrency == 1)
+}
+
+@Test("P12.3 : une conversation active reste sur le chemin mono-séquence même avec --batch-size > 1")
+func serverKeepsHotConversationOffTheBatchPath() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-hot-conv-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 4)
+    defer { Task { await server.stop() } }
+    let snapshot = await server.snapshot()
+
+    // Tour 1, en HTTP réel, avec un `conversation_id` explicite : cold-start
+    // sur le chemin persistant (un seul message system/user).
+    var turn1 = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    turn1.httpMethod = "POST"
+    turn1.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    turn1.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "conversation_id": "conv",
+        "messages": [["role": "user", "content": "tour 1"]],
+    ])
+    let (_, turn1Response) = try await URLSession.shared.data(for: turn1)
+    #expect((turn1Response as? HTTPURLResponse)?.statusCode == 200)
+
+    // Tour 2, même conversation_id, historique complet (le mock répond
+    // toujours "mock" — voir `MockFlashNextEngine.makeCompletedStream`) :
+    // doit rester chaud (`prepareConversation`), jamais rejoindre le lot.
+    var turn2 = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    turn2.httpMethod = "POST"
+    turn2.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    turn2.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "conversation_id": "conv",
+        "messages": [
+            ["role": "user", "content": "tour 1"],
+            ["role": "assistant", "content": "mock"],
+            ["role": "user", "content": "tour 2"],
+        ],
+    ])
+    let (_, turn2Response) = try await URLSession.shared.data(for: turn2)
+    #expect((turn2Response as? HTTPURLResponse)?.statusCode == 200)
+
+    // Aucun des deux tours n'a jamais dû atteindre `generateBatch`.
+    #expect(mock.lastGenerateBatchRequests == nil)
+    let finalSnapshot = await server.snapshot()
+    #expect(finalSnapshot.sessions.allSatisfy { $0.batchSizeServed == 1 })
 }

@@ -84,6 +84,23 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error>
+    /// P12.3 : décodage en lot de B requêtes indépendantes pour
+    /// l'ordonnanceur du serveur (`serve --batch-size N > 1`) — voir
+    /// `Qwen4ExpBatchStreamingGenerator`'s doc comment pour le contrat
+    /// complet (toujours stateless, jamais de MTP, gâchis assumé sur une
+    /// ligne finie). Un flux par requête, dans le même ordre que
+    /// `requests` ; chaque flux ne porte jamais que les événements de sa
+    /// propre ligne (critère de non-contamination, PLAN.md P12.3).
+    ///
+    /// `Qwen38BatchGenerationResult.completion` (correctif du 2026-09-13,
+    /// crash mémoire) est le seul signal sûr pour savoir que cette
+    /// exécution a fini de toucher le modèle résident — un appelant qui
+    /// libère un verrou d'exclusion mutuelle envers une autre exécution
+    /// DOIT attendre `completion`, jamais seulement la consommation des
+    /// flux. Voir le commentaire de `Qwen38BatchGenerationResult`.
+    func generateBatch(
+        requests: [Qwen38BatchGenerationRequest]
+    ) throws -> Qwen38BatchGenerationResult
     /// P6.1: pure rendering, no generation side effect — the exact token
     /// IDs `generateFromMessages` would feed the model for this message
     /// list, via the same `Qwen4ExpPromptBuilder.buildFromMessages` path.
@@ -496,6 +513,126 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         return try runGenerationStream(
             built: built, options: options, continueConversation: false,
             inputDescription: "Texte")
+    }
+
+    /// P12.3 : voir le contrat complet sur `Qwen38FlashNextEngineProtocol.
+    /// generateBatch` et `Qwen4ExpBatchStreamingGenerator`'s doc comment.
+    /// Refuse toute image (le rendu ChatML manuel de Flash-Next n'a qu'une
+    /// forme mono-tour/mono-image, jamais branchée sur un lot) — le serveur
+    /// n'est de toute façon censé router une requête avec image que par le
+    /// chemin chaud/mono-séquence, jamais vers ce lot (PLAN.md P12.3).
+    public func generateBatch(
+        requests: [Qwen38BatchGenerationRequest]
+    ) throws -> Qwen38BatchGenerationResult {
+        guard !requests.isEmpty else { return Qwen38BatchGenerationResult(streams: [], completion: Task {}) }
+        guard requests.allSatisfy({ $0.messages.allSatisfy { $0.imageURLs.isEmpty } }) else {
+            throw Qwen38FlashNextEngineError.statelessImagesUnsupported
+        }
+        // Toujours stateless (voir Qwen4ExpBatchStreamingGenerator) : ce lot
+        // ne doit ni hériter d'une conversation active, ni empiéter sur la
+        // bibliothèque de tours (turnIndex) des conversations persistantes.
+        resetConversation()
+
+        let built = try requests.map { request -> Qwen4ExpBuiltPrompt in
+            let hfMessages: [Tokenizers.Message] = request.messages.map {
+                ["role": $0.role.rawValue, "content": $0.content]
+            }
+            return try Qwen4ExpPromptBuilder.buildFromMessages(
+                tokenizer: tokenizer, messages: hfMessages,
+                thinking: request.options.enableThinking,
+                reasoningEffort: request.options.reasoningEffort)
+        }
+
+        let padTokenID = configuration.textConfiguration.eosTokenID ?? 0
+        let rows = zip(built, requests).map { builtPrompt, request in
+            Qwen4ExpBatchStreamingGenerator.Row(
+                tokenIDs: builtPrompt.tokenIDs,
+                maxNewTokens: max(request.options.maxTokens, 1),
+                stopTokenIDs: stopTokenIDs,
+                preset: .custom(
+                    temperature: request.options.temperature, topP: request.options.topP,
+                    topK: request.options.topK),
+                presencePenalty: request.options.presencePenalty,
+                repetitionPenalty: request.options.repetitionPenalty)
+        }
+
+        let batchGenerator = Qwen4ExpBatchStreamingGenerator(model: model)
+        let inner = try batchGenerator.generate(rows: rows, padTokenID: padTokenID)
+        let mappedStreams = zip(inner.streams, requests).map { innerStream, request in
+            mapBatchRowStream(innerStream, ablationLabel: model.ablation.rawValue, options: request.options)
+        }
+        // `inner.completion` — pas un flux quelconque — est propagée telle
+        // quelle : c'est la tâche `Qwen4ExpBatchStreamingGenerator.run()`
+        // elle-même, indépendante de tout habillage ultérieur
+        // (`mapBatchRowStream` relaie dans SA PROPRE tâche, qui ne touche
+        // jamais `model`). Voir le commentaire de `Qwen38BatchGenerationResult`.
+        return Qwen38BatchGenerationResult(streams: mappedStreams, completion: inner.completion)
+    }
+
+    /// P12.3 : convertit le flux `Qwen4ExpGenerationEvent` d'une ligne de
+    /// lot vers le même `Qwen38GenerationEvent` que le chemin mono-séquence
+    /// — pas de branchement MTP (jamais actif ici), `cacheReused`/
+    /// `conversationReplayed` toujours `false` (toujours stateless),
+    /// `turnIndex` fixé à 1 (une ligne de lot ne fait jamais partie d'une
+    /// conversation continuée, ce compteur n'a pas de sens pour elle).
+    private func mapBatchRowStream(
+        _ inner: AsyncThrowingStream<Qwen4ExpGenerationEvent, Error>,
+        ablationLabel: String, options: Qwen38GenerationOptions
+    ) -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await event in inner {
+                        if Task.isCancelled { break }
+                        switch event {
+                        case .token(let token):
+                            guard self.visibleTokenFilter.shouldEmit(Int(token)) else { continue }
+                            let piece = Qwen38VisibleText.sanitize(
+                                self.tokenizer.decode(tokens: [Int(token)], skipSpecialTokens: false))
+                            if !piece.isEmpty {
+                                continuation.yield(.chunk(piece))
+                            }
+                        case .finished(let summary):
+                            let stopReason: GenerateStopReason
+                            if let last = summary.tokenIDs.last, self.stopTokenIDs.contains(last) {
+                                stopReason = .stop
+                            } else if summary.tokenIDs.count >= max(options.maxTokens, 1) {
+                                stopReason = .length
+                            } else {
+                                stopReason = .cancelled
+                            }
+                            let llmMetrics = LLMMetrics(
+                                prefillTime: summary.prefillTime,
+                                generationTime: summary.decodeTime,
+                                promptTokens: summary.promptTokenCount,
+                                generatedTokens: summary.tokenIDs.count)
+                            continuation.yield(
+                                .metrics(
+                                    Qwen38RunMetrics(
+                                        metrics: llmMetrics,
+                                        stopReason: stopReason,
+                                        report: "",
+                                        chromeTrace: Data(),
+                                        activeMemoryBytes: summary.activeMemoryBytes,
+                                        peakMemoryBytes: summary.peakMemoryBytes,
+                                        acceptRate: nil,
+                                        timeToFirstToken: summary.timeToFirstToken,
+                                        turnIndex: 1,
+                                        cacheReused: false,
+                                        conversationReplayed: false,
+                                        inputDescription: "Texte",
+                                        mtpStatus: Qwen38MTPRunStatus(availability: .unavailable),
+                                        routedExpertCount: self.model.routedExpertCount,
+                                        ablation: ablationLabel)))
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     private func runGenerationStream(
