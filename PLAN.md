@@ -4300,11 +4300,24 @@ correction de dtype F7** qui a déplacé l'optimum. Remesuré à séquence forc�
 identifiants greedy identiques, pic MLX inchangé. Combiné à F9 : **+8,2 %**,
 23,11 tok/s.
 
-**Prochain chantier, et c'est le dernier gros** : les 17,4 ms d'inactivité ne
-disparaissent pas avec N=48, qui ne touche que les `eval` bloquants (6 par
-forward à N=8, 1 à N=48) et non les 197 tampons. Les 46 trous par pas viennent
-d'ailleurs — soumission de tampons, dépendances entre encodeurs, ou
-synchronisations internes à MLX. La trace donne enfin de quoi les viser.
+**Les 17,4 ms d'inactivité ont été attaqués, et le verdict est tombé le
+2026-09-13 : ils sont structurels.** MLX plafonne chaque tampon à 50 ops et
+50 Mo sur M3 Max (`MLX_MAX_OPS_PER_BUFFER`, `MLX_MAX_MB_PER_BUFFER`) ;
+desserrer ces plafonds **dégrade** le débit (−2,2 % à 200 ops, −3,1 % à 1 000),
+parce que les tampons se chevauchent ×2,7 et que les grossir réduit la
+profondeur du pipeline. L'inactivité n'est donc pas du surcoût de soumission
+mais de **l'attente de dépendances** : à lot de taille 1, une chaîne
+autorégressive n'a pas assez de travail indépendant pour remplir 40 cœurs.
+
+**Dernier chantier de la campagne : le traitement par lots continu côté
+serveur.** La courbe « jetons par forward » chiffre la place disponible —
+doubler le travail ne coûte que +30 %, et 8 jetons rendent **2,40× le débit**.
+Cette place ne se remplit pas avec des jetons du même flux (P11.4 : la
+spéculation plafonne à 1,14×), mais avec des **requêtes indépendantes**.
+`Qwen38Server` les sérialise aujourd'hui (`FIFORequestQueue`). Gain attendu :
+**~2,4× de débit agrégé à 8 séquences**. C'est un gain de **capacité**, pas de
+latence mono-utilisateur — celle-ci est désormais bornée par la sérialité du
+modèle, qu'aucune des douze pistes de §P11 n'a contournée.
 
 *Note d'outillage : tracer un process qui se termine tout seul
 (`xctrace record --launch -- …`), jamais attacher puis tuer la cible — un

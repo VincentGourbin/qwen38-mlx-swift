@@ -1598,9 +1598,9 @@ struct FlashDecodeBench: AsyncParsableCommand {
     @Option(
         name: .long,
         help:
-            "Nombre de couches entre deux eval() bloquants (défaut 8 = défaut de production, choisi en P4.1 AVANT la correction de dtype F7). La trace Metal montre 197 tampons de commandes et 33 % de GPU inactif par pas : ce réglage est le levier direct sur ce découpage."
+            "Nombre de couches entre deux eval() bloquants (défaut 48 = défaut de production depuis le 2026-09-13 ; le 8 de P4.1 datait d'avant la correction de dtype F7). La trace Metal montre 197 tampons de commandes et 33 % de GPU inactif par pas : ce réglage est le levier direct sur ce découpage."
     )
-    var residentAsyncInterval: Int = 8
+    var residentAsyncInterval: Int = 48
 
     /// Décode `count` jetons en greedy (température 0 ⇒ `ArgMaxSampler`,
     /// comme `Qwen4ExpStreamingGenerator`) avec l'ablation forcée à `.none`
