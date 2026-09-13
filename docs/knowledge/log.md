@@ -5535,3 +5535,71 @@ touche que les `eval` **bloquants** (6 par forward à N=8, 1 à N=48), pas les
 197 tampons. Les 46 trous par pas viennent d'ailleurs — soumission de tampons,
 dépendances entre encodeurs, ou synchronisations internes à MLX. **C'est le
 prochain chantier, et la trace donne enfin de quoi le viser.**
+
+---
+
+## 2026-09-13 — Les 33 % d'inactivité GPU ne viennent pas de la soumission : ils sont structurels
+
+Suite directe de la trace. MLX plafonne chaque tampon de commandes à un
+nombre d'opérations **et** à un volume, avec des défauts par puce
+(`mlx/backend/metal/device.cpp:348-356` : sur M3 Max, architecture `…s`,
+**50 opérations et 50 Mo**), tous deux surchargés par
+`MLX_MAX_OPS_PER_BUFFER` et `MLX_MAX_MB_PER_BUFFER`
+(`mlx/utils.h:146-156`). Avec 197 tampons par pas mesurés, c'était le levier
+évident sur les trous.
+
+### Mesure — et le levier joue à l'envers
+
+Séquence forcée, deux tours alternés, 96 pas mesurés :
+
+| configuration | ms par pas | écart |
+|---|---:|---:|
+| défaut (50 ops / 50 Mo) | 46,52 | — |
+| `MLX_MAX_OPS_PER_BUFFER=200` | 47,56 | **−2,2 %** |
+| `…=1000` + `MLX_MAX_MB_PER_BUFFER=1000` | 48,02 | **−3,1 %** |
+| `MLX_MAX_MB_PER_BUFFER=1000` seul | 46,20 | +0,7 % |
+
+**Des tampons plus gros dégradent le débit.** Le seul réglage qui gagne
+(+0,7 % sur le volume seul) est sous le seuil de décision du projet.
+
+### Pourquoi, et ce que ça enterre
+
+La trace montrait déjà que les tampons **se chevauchent ×2,7** : MLX
+pipeline, la construction du tampon N+1 recouvre l'exécution du N. Grossir
+les tampons réduit la profondeur de ce pipeline, d'où la régression.
+
+**Les 33 % d'inactivité ne sont donc pas du surcoût de soumission.** Ce sont
+des attentes de **dépendances** : le décodage autorégressif est une chaîne
+sérielle — la couche N+1 a besoin de la sortie de N, le jeton t+1 a besoin de
+t — et à lot de taille 1 il n'y a tout simplement pas assez de travail
+indépendant pour remplir un GPU à 40 cœurs. **C'est structurel, pas
+corrigeable par un réglage.**
+
+### Le corollaire, lui, est exploitable : le GPU a de la place
+
+La courbe « jetons par forward » déjà mesurée le chiffre exactement :
+
+| jetons par forward | ms | coût relatif | **débit relatif** |
+|---:|---:|---:|---:|
+| 1 | 49,24 | 1,00× | 1,00× |
+| 2 | 64,06 | 1,30× | **1,54×** |
+| 4 | 96,76 | 1,96× | **2,04×** |
+| 8 | 164,36 | 3,34× | **2,40×** |
+
+Doubler le travail par forward ne coûte que **+30 %** : la place vide mesurée
+par la trace est bien là, et on peut la remplir. Mais **pas avec des jetons du
+même flux** — P11.4 a montré que la spéculation plafonne à 1,14× parce que
+l'acceptation retombe. Il faut du travail **indépendant**, c'est-à-dire
+**plusieurs requêtes servies ensemble**.
+
+### Ce qui reste, et c'est le dernier chantier de la campagne
+
+**Le traitement par lots continu côté serveur.** Aujourd'hui
+`Qwen38Server` sérialise les requêtes (`FIFORequestQueue`). Les chiffres
+ci-dessus disent qu'en décodant 8 séquences ensemble, le **débit agrégé**
+atteindrait ~2,4× celui d'une seule — sans toucher à la latence perçue par
+chaque client au-delà de +234 % sur un pas qui sert 8 clients au lieu d'un.
+
+C'est un gain de **capacité**, pas de latence mono-utilisateur : cette
+dernière est désormais bornée par la sérialité du modèle, qu'aucune des
+douze pistes de §P11 n'a pu contourner.
