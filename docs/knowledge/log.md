@@ -5920,3 +5920,65 @@ pas, essentiellement le préfill.
 
 Avant, une question courte posée pendant que d'autres demandaient un essai
 coûtait **sept minutes**. Elle coûte maintenant **deux secondes et demie**.
+
+---
+
+## 2026-09-14 — Le préfill ne doit pas être mis en lot : une garde, et ce qu'elle règle
+
+### Le défaut, mesuré
+
+Sur un prompt long (~1 200 jetons), rejoindre un lot de 4 faisait passer le
+TTFT du **premier** tour de 7,53 s à **37,20 s**, et celui du **second** de
+0,40 s à 9,91 s (×24,5, la requête groupée n'étant jamais mémorisée comme
+conversation).
+
+**La cause est structurelle** : le lot aide le **décodage**, qui traite un
+seul jeton par séquence et laisse le GPU aux deux tiers occupé seulement. Le
+**préfill**, lui, traite déjà des centaines de jetons d'un coup — il est
+dense, il n'a aucune capacité libre à remplir. Le grouper ne fait
+qu'**additionner** le travail de chaque ligne, et y ajouter le gâchis du
+remplissage à la longueur du plus long prompt.
+
+### La garde
+
+`serve --batch-max-prompt-tokens` (défaut **256**, publié dans `/healthz`) :
+une requête froide dont le prompt rendu dépasse le seuil ne rejoint jamais le
+lot et garde le chemin sérialisé. Le seuil est un ordre de grandeur au-dessus
+du point sain mesuré (~25 jetons, aucune dégradation) et un ordre de grandeur
+en dessous du point catastrophique (~1 200 jetons, ×4,9) ; **il n'est pas
+dérivé d'une courbe fine**, qui reste à mesurer. Exposé aussi :
+`serve --batch-window-ms` (défaut 30), jusqu'ici codé en dur.
+
+### Résultat
+
+| | avant la garde | après |
+|---|---:|---:|
+| TTFT tour 1, prompt long, 4 clients | 37,20 s | **8,40 s** (dont file d'attente ; 4,85 s seul) |
+| TTFT tour 2, prompt long | 9,91 s | **0,36 s** — cache réutilisé |
+| TTFT tour 2, prompt court groupé | — | 1,74 s contre 0,33 s seul, soit **+1,41 s** |
+| Débit agrégé, prompts courts, 4 clients | 37,25 t/s | **37,37 t/s** — intact |
+
+**La garde règle aussi le second défaut, sans le corriger.** Les prompts longs
+et conversationnels — exactement ceux qui profitent du cache de conversations
+— sortent du lot et retrouvent leur TTFT plat. Il ne reste que le cas d'une
+conversation **démarrée par un prompt court**, dont le second tour paie
+**+1,41 s** au lieu de +9,50 : une pénalité désormais **bornée par le seuil**.
+
+### L'adoption de conversation reste bloquée, et c'est documenté
+
+Faire d'une ligne de lot une conversation active suppose d'**extraire sa
+tranche de cache**. Le vendor expose `filter(batchIndices:)`/`extend(other:)`
+mais **seulement sur `ArraysCache`** (et `MambaCache`), pas sur le protocole
+`KVCache`. Or un modèle Flash-Next mélange deux familles de couches : les
+36 couches GDN utilisent `ArraysCache(size: 4)` — **supporté** — et les
+12 couches d'attention pleine utilisent `Qwen4ExpQSAKVCache`, une classe
+maison qui implémente `KVCache` directement — **non supporté**.
+
+Écrire un `filter` maison pour cette dernière est techniquement faisable mais
+n'a été validé par personne, sur un chemin non testé, avec un risque réel de
+**réponses fausses au second tour**. Rien n'a été écrit. La limitation est
+préférable au demi-mécanisme.
+
+**Le préfill séparé du décodage** — la vraie solution au défaut A — bute sur
+le même mur : il faudrait assembler un cache de lot à partir de caches
+individuels, c'est-à-dire exactement la primitive qui manque. Écarté aussi.

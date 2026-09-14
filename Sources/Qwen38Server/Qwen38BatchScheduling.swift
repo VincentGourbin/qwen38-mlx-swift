@@ -88,7 +88,9 @@ public enum Qwen38BatchJoinResult: Sendable {
 /// TTFT d'un client isolé (qui attend la fenêtre entière avant de partir
 /// seul) reste marginal, tout en étant assez large pour absorber des
 /// requêtes qui arrivent à quelques dizaines de millisecondes d'écart sur
-/// un LAN. Non exposée en option pour l'instant — voir le rapport P12.3.
+/// un LAN. Exposée depuis le 2026-09-14 via `serve --batch-window-ms`
+/// (défaut 30, ce même choix non mesuré finement) — voir le rapport du
+/// défaut A/B de cette date.
 public actor Qwen38BatchCoordinator {
     public struct Request: Sendable {
         public let messages: [Qwen38ChatMessage]

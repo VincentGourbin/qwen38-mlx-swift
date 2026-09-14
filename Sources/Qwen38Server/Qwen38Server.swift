@@ -98,7 +98,13 @@ public struct Qwen38ServerSnapshot: Sendable, Equatable, Codable {
     /// crois qu'il l'est » (même contrat que `routedExpertCount`/`ablation`
     /// sur `/healthz`, PLAN.md P11/P12.3).
     public let batchSizeConfigured: Int
-    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil, cacheMisses: Int = 0, cachedConversations: Int = 0, cacheBytes: Int64 = 0, cacheBudgetBytes: Int64 = 0, prefixHits: Int = 0, prefixMisses: Int = 0, batchSizeConfigured: Int = 1) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError; self.cacheMisses = cacheMisses; self.cachedConversations = cachedConversations; self.cacheBytes = cacheBytes; self.cacheBudgetBytes = cacheBudgetBytes; self.prefixHits = prefixHits; self.prefixMisses = prefixMisses; self.batchSizeConfigured = batchSizeConfigured }
+    /// Défaut 2026-09-14 : seuil de longueur de prompt (`serve
+    /// --batch-max-prompt-tokens`, défaut 256) au-delà duquel une requête
+    /// froide n'est jamais proposée au lot — voir `chatCompletionsResponseBatched`
+    /// et le rapport du défaut A. Même garde de publication que
+    /// `batchSizeConfigured` : toujours publiée, jamais devinée.
+    public let batchMaxPromptTokensConfigured: Int
+    public init(status: Qwen38ServerStatus, port: Int, url: String, activeSessions: Int, queuedSessions: Int, sessions: [Qwen38ServerSession], availableModels: [String] = [], loadedModel: String? = nil, lastError: String? = nil, cacheMisses: Int = 0, cachedConversations: Int = 0, cacheBytes: Int64 = 0, cacheBudgetBytes: Int64 = 0, prefixHits: Int = 0, prefixMisses: Int = 0, batchSizeConfigured: Int = 1, batchMaxPromptTokensConfigured: Int = 256) { self.status = status; self.port = port; self.url = url; self.activeSessions = activeSessions; self.queuedSessions = queuedSessions; self.sessions = sessions; self.availableModels = availableModels; self.loadedModel = loadedModel; self.lastError = lastError; self.cacheMisses = cacheMisses; self.cachedConversations = cachedConversations; self.cacheBytes = cacheBytes; self.cacheBudgetBytes = cacheBudgetBytes; self.prefixHits = prefixHits; self.prefixMisses = prefixMisses; self.batchSizeConfigured = batchSizeConfigured; self.batchMaxPromptTokensConfigured = batchMaxPromptTokensConfigured }
 }
 
 public enum Qwen38ServerError: LocalizedError, Equatable {
@@ -211,7 +217,7 @@ private struct ChatCompletionDelta: Codable, Sendable {
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
-private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation, batchSizeConfigured = "batch_size_configured" } }
+private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; let batchMaxPromptTokensConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation, batchSizeConfigured = "batch_size_configured", batchMaxPromptTokensConfigured = "batch_max_prompt_tokens_configured" } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
 
@@ -307,6 +313,32 @@ public actor Qwen38InferenceServer {
     /// commentaire. `> 1` construit `batchCoordinator` et enregistre
     /// `chatCompletionsResponseBatched` à la place.
     private var batchSize = 1
+    /// Défaut A (2026-09-14) : `serve --batch-max-prompt-tokens` (défaut
+    /// 256). Une requête froide dont le prompt RENDU dépasse ce seuil ne
+    /// rejoint jamais `batchCoordinator` — elle garde le chemin
+    /// chaud/mono-séquence de `chatCompletionsResponseBatched`, avec son
+    /// TTFT d'aujourd'hui. Voir `chatCompletionsResponseBatched` pour
+    /// l'endroit exact du test, et le rapport du défaut A pour la
+    /// justification du défaut :
+    ///
+    /// Le préfill est un calcul DENSE (contrairement au décodage, qui a de
+    /// la capacité GPU libre à remplir) : le regrouper ne fait qu'additionner
+    /// le travail de chaque ligne (plus le gâchis du remplissage à la
+    /// longueur du plus long prompt du lot), sans aucun recouvrement
+    /// possible. Le TTFT d'une requête groupée croît donc à peu près
+    /// linéairement avec la taille du lot — mesuré : un lot de 4 sur des
+    /// prompts d'environ 1 200 jetons porte le TTFT de 7,53 s (seul) à
+    /// 37,20 s (×4,9). Sur les prompts courts (~25 jetons) qui ont mesuré le
+    /// ×2,28 de P12.3/P12.4, ce même facteur reste sous la seconde et n'est
+    /// pas perceptible. 256 est choisi comme un ordre de grandeur sous le
+    /// point mesuré catastrophique (1 200) et un ordre de grandeur au-dessus
+    /// du point mesuré sans dégradation (~25), donc avec de la marge des
+    /// deux côtés ; c'est aussi une longueur qui couvre un tour de
+    /// conversation ordinaire (quelques phrases, un petit historique) sans
+    /// couvrir un prompt qui colle un document. Non mesuré finement au-delà
+    /// de ces deux points — un opérateur qui connaît son trafic doit
+    /// recalibrer avec `--batch-max-prompt-tokens`.
+    private var batchMaxPromptTokens = 256
     /// P12.3 : verrou d'exécution du chemin batché — séparé de `queue`
     /// (utilisé uniquement par le chemin `batchSize == 1` inchangé) pour ne
     /// jamais toucher son comportement. Tenu depuis `ensureModelLoaded`
@@ -329,13 +361,15 @@ public actor Qwen38InferenceServer {
     // call sites and tests are unaffected.
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1) async throws {
+    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1, batchMaxPromptTokens: Int = 256, batchWindowMs: Int = 30) async throws {
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
         // P12.3 : mémorisé pour toute la durée de vie du serveur — voir
         // `batchSize`'s doc comment. `<= 1` désactive le regroupement,
         // exactement comme avant P12.3 (aucun `Qwen38BatchCoordinator`
         // construit, route `chatCompletionsResponse` inchangée ci-dessous).
         self.batchSize = max(batchSize, 1)
+        // Défaut A (2026-09-14) : voir `batchMaxPromptTokens`'s doc comment.
+        self.batchMaxPromptTokens = max(batchMaxPromptTokens, 0)
         if self.batchSize > 1 {
             // P12.3 : `batchExecutionLock` doit être tenu pour TOUTE
             // exécution qui touche réellement le modèle résident, lot
@@ -359,7 +393,9 @@ public actor Qwen38InferenceServer {
             // que le premier exécutait encore la sienne, après avoir déjà
             // refermé ses flux — deux `resetConversation()` concurrents sur
             // le même modèle résident, cause vérifiée du crash.
-            batchCoordinator = Qwen38BatchCoordinator(batchSize: self.batchSize) {
+            batchCoordinator = Qwen38BatchCoordinator(
+                batchSize: self.batchSize, window: .milliseconds(max(batchWindowMs, 0))
+            ) {
                 [runtime, batchExecutionLock] requests in
                 await batchExecutionLock.acquire()
                 do {
@@ -440,7 +476,8 @@ public actor Qwen38InferenceServer {
             lastError: lastError, cacheMisses: cache.cacheMisses,
             cachedConversations: cache.cachedConversations, cacheBytes: cache.cacheBytes,
             cacheBudgetBytes: cache.cacheBudgetBytes, prefixHits: cache.prefixHits,
-            prefixMisses: cache.prefixMisses, batchSizeConfigured: batchSize)
+            prefixMisses: cache.prefixMisses, batchSizeConfigured: batchSize,
+            batchMaxPromptTokensConfigured: batchMaxPromptTokens)
     }
     private func serverDidStop() { if serverStatus != .stopping { serverStatus = .stopped } }
     private func serverDidFail(_ error: String) { lastError = error; serverStatus = .failed }
@@ -452,7 +489,7 @@ public actor Qwen38InferenceServer {
     // P11.2 : `ablation` publié systématiquement, `"none"` quand il n'y en a
     // pas (aucun engin Flash-Next chargé, ou aucune ablation demandée) —
     // même garde de publication que `routed_expert_count`, PLAN.md P11.2.
-    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize)) }
+    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize, batchMaxPromptTokensConfigured: batchMaxPromptTokens)) }
     private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
     private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
 
@@ -626,7 +663,17 @@ public actor Qwen38InferenceServer {
             if isEligibleForBatching, let batchCoordinator {
                 let promptTokenCount = ((try? await runtime.renderedFlashTokenIDs(
                     messages: prepared.messages, options: options)).flatMap { $0 })?.count
-                if let promptTokenCount {
+                // Défaut A (2026-09-14) : le préfill est dense — le
+                // regrouper additionne le travail de chaque ligne (plus le
+                // remplissage) sans aucun recouvrement, contrairement au
+                // décodage. Une requête dont le prompt rendu dépasse
+                // `batchMaxPromptTokens` (`serve --batch-max-prompt-tokens`,
+                // défaut 256, voir sa doc comment) n'est donc JAMAIS
+                // proposée au coordinateur : elle garde le chemin
+                // chaud/mono-séquence ci-dessous (`.solo`), avec son TTFT
+                // d'aujourd'hui — mesuré : 37,20 s en lot de 4 contre
+                // 7,53 s seul sur des prompts d'environ 1 200 jetons.
+                if let promptTokenCount, promptTokenCount <= batchMaxPromptTokens {
                     joinResult = try await batchCoordinator.join(
                         promptTokenCount: promptTokenCount,
                         request: .init(messages: prepared.messages, options: options))

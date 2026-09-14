@@ -3159,12 +3159,32 @@ struct Serve: AsyncParsableCommand {
     )
     var batchSize: Int = 1
 
+    @Option(
+        name: .long,
+        help:
+            "Défaut A (2026-09-14) : une requête froide dont le prompt RENDU dépasse ce nombre de jetons n'est jamais proposée au lot — elle garde le chemin mono-séquence, quel que soit --batch-size (défaut 256). Le préfill est un calcul dense, sans capacité GPU libre à remplir contrairement au décodage : le regrouper additionne le travail de chaque ligne au lieu de le recouvrir, et le TTFT d'une requête groupée croît alors à peu près linéairement avec la taille du lot (mesuré : ×4,9 sur des prompts d'environ 1 200 jetons, sans effet perceptible sous une centaine de jetons). Sans effet à --batch-size 1."
+    )
+    var batchMaxPromptTokens: Int = 256
+
+    @Option(
+        name: .long,
+        help:
+            "P12.3 : fenêtre de regroupement des requêtes froides, en millisecondes (défaut 30, choisi comme un ordre de grandeur sous le TTFT du chemin froid observé en LAN). Sans effet à --batch-size 1."
+    )
+    var batchWindowMs: Int = 30
+
     func run() async throws {
         if let routedExperts, routedExperts < 1 {
             throw ValidationError("--routed-experts doit être un entier positif (borne haute : num_experts du checkpoint, vérifiée au chargement)")
         }
         guard batchSize >= 1 else {
             throw ValidationError("--batch-size doit être un entier positif (1 = comportement actuel)")
+        }
+        guard batchMaxPromptTokens >= 0 else {
+            throw ValidationError("--batch-max-prompt-tokens doit être un entier positif ou nul (0 = aucune requête froide n'est jamais mise en lot)")
+        }
+        guard batchWindowMs >= 0 else {
+            throw ValidationError("--batch-window-ms doit être un entier positif ou nul")
         }
         let runtime = Qwen38Runtime()
         var session: ProfilingSession?
@@ -3213,11 +3233,14 @@ struct Serve: AsyncParsableCommand {
             conversationCacheGB: conversationCacheGb,
             routedExpertCount: routedExperts,
             allowAblation: allowAblation,
-            batchSize: batchSize)
+            batchSize: batchSize,
+            batchMaxPromptTokens: batchMaxPromptTokens,
+            batchWindowMs: batchWindowMs)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
         if batchSize > 1 {
             print("P12.3 : regroupement actif, taille de lot \(batchSize) (voir /healthz · batch_size_configured)")
+            print("Défaut A : prompts > \(batchMaxPromptTokens) jetons jamais mis en lot, fenêtre \(batchWindowMs) ms (voir /healthz · batch_max_prompt_tokens_configured)")
         }
 
         var recorder: MetalSystemTrace.Recorder?

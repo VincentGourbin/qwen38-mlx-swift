@@ -4009,24 +4009,30 @@ func healthzPublishesBatchSizeConfigured() async throws {
     try await defaultServer.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
     let defaultSnapshot = await defaultServer.snapshot()
     #expect(defaultSnapshot.batchSizeConfigured == 1)
+    // Défaut A (2026-09-14) : défaut publié même à --batch-size 1.
+    #expect(defaultSnapshot.batchMaxPromptTokensConfigured == 256)
     let (defaultData, defaultResponse) = try await URLSession.shared.data(
         from: URL(string: "http://127.0.0.1:\(defaultSnapshot.port)/healthz")!)
     #expect((defaultResponse as? HTTPURLResponse)?.statusCode == 200)
     let defaultDecoded = try #require(try JSONSerialization.jsonObject(with: defaultData) as? [String: Any])
     #expect(defaultDecoded["batch_size_configured"] as? Int == 1)
+    #expect(defaultDecoded["batch_max_prompt_tokens_configured"] as? Int == 256)
     await defaultServer.stop()
 
     let batchedServer = Qwen38InferenceServer(runtime: runtime)
     try await batchedServer.start(
-        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 4)
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 4,
+        batchMaxPromptTokens: 64, batchWindowMs: 15)
     defer { Task { await batchedServer.stop() } }
     let batchedSnapshot = await batchedServer.snapshot()
     #expect(batchedSnapshot.batchSizeConfigured == 4)
+    #expect(batchedSnapshot.batchMaxPromptTokensConfigured == 64)
     let (batchedData, batchedResponse) = try await URLSession.shared.data(
         from: URL(string: "http://127.0.0.1:\(batchedSnapshot.port)/healthz")!)
     #expect((batchedResponse as? HTTPURLResponse)?.statusCode == 200)
     let batchedDecoded = try #require(try JSONSerialization.jsonObject(with: batchedData) as? [String: Any])
     #expect(batchedDecoded["batch_size_configured"] as? Int == 4)
+    #expect(batchedDecoded["batch_max_prompt_tokens_configured"] as? Int == 64)
 }
 
 @Test("P12.3 : deux requêtes froides identiques envoyées ensemble sont groupées sans contamination")
@@ -4216,6 +4222,62 @@ func serverKeepsHotConversationOffTheBatchPath() async throws {
     #expect((turn2Response as? HTTPURLResponse)?.statusCode == 200)
 
     // Aucun des deux tours n'a jamais dû atteindre `generateBatch`.
+    #expect(mock.lastGenerateBatchRequests == nil)
+    let finalSnapshot = await server.snapshot()
+    #expect(finalSnapshot.sessions.allSatisfy { $0.batchSizeServed == 1 })
+}
+
+@Test("Défaut A (2026-09-14) : un prompt qui dépasse --batch-max-prompt-tokens ne rejoint jamais le lot, même à plusieurs concurrents")
+func serverNeverBatchesPromptsOverTheLengthGuard() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-batch-length-guard-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    // `MockFlashNextEngine.renderedTokenIDs` compte un jeton de rôle plus un
+    // jeton par mot séparé par un espace (voir son commentaire) : un seuil
+    // de 5 jetons est franchi par tout message de plus de 4 mots, ce qui
+    // rend le test lisible sans avoir à construire un très long prompt.
+    try await server.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 2,
+        batchMaxPromptTokens: 5)
+    defer { Task { await server.stop() } }
+    let snapshot = await server.snapshot()
+
+    func makeLongColdRequest(_ label: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let longContent = (["\(label):"] + Array(repeating: "mot", count: 20)).joined(separator: " ")
+        request.httpBody = try! JSONSerialization.data(withJSONObject: [
+            "model": modelID,
+            "messages": [["role": "user", "content": longContent]],
+        ])
+        return request
+    }
+
+    // Deux requêtes froides concurrentes, chacune largement au-dessus du
+    // seuil : sans la garde, `batchSize: 2` les regrouperait exactement
+    // comme `serverGroupsColdConcurrentRequestsWithoutContamination`
+    // ci-dessus. Avec la garde, aucune des deux ne doit jamais atteindre
+    // `batchCoordinator.join`.
+    async let responseA = URLSession.shared.data(for: makeLongColdRequest("A"))
+    async let responseB = URLSession.shared.data(for: makeLongColdRequest("B"))
+    let ((_, respA), (_, respB)) = try await (responseA, responseB)
+    #expect((respA as? HTTPURLResponse)?.statusCode == 200)
+    #expect((respB as? HTTPURLResponse)?.statusCode == 200)
+
     #expect(mock.lastGenerateBatchRequests == nil)
     let finalSnapshot = await server.snapshot()
     #expect(finalSnapshot.sessions.allSatisfy { $0.batchSizeServed == 1 })
