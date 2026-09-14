@@ -5850,3 +5850,73 @@ voisines (`Scripts/bench-concurrent.py`).
 - L'entrée et la sortie de séquences **en cours** de lot ne sont pas
   implémentées : une ligne finie occupe sa place jusqu'au bout. C'est le
   gâchis mesurable dans l'écart entre ×2,16 et ×2,94.
+
+---
+
+## 2026-09-14 — Deux défauts du lot trouvés par la mesure d'expérience, et corrigés
+
+Le ×2,16 de P12.3 avait été mesuré avec des prompts **homogènes** et le même
+`max_tokens` partout. En testant un cas réaliste — un client pressé derrière
+trois bavards — deux défauts sont apparus, dont un catastrophique.
+
+### Défaut 1 : le client était retenu par le lot
+
+Quatre clients simultanés, trois demandant 512 jetons, **un seul en demandant
+16** :
+
+| | avant | après |
+|---|---:|---:|
+| client à 16 jetons | **442,41 s** | **2,52 s** |
+| dernier client à 512 jetons | 442,41 s | 60,10 s |
+
+Sa réponse était prête au 16ᵉ pas ; il attendait les 512 autres. Cause : la
+continuation d'une ligne n'était refermée qu'**après** la boucle de décodage,
+donc à la fin de tout le lot. Correctif : refermer dès que la ligne est finie,
+par une fonction idempotente, la réinitialisation finale du modèle restant à
+sa place — la garantie du correctif de crash du 2026-09-13 est préservée,
+puisque le verrou serveur se relâche sur la tâche `completion` et jamais sur
+la consommation d'un flux.
+
+La ligne finie continue d'occuper sa place dans le `forward` partagé : c'est
+assumé. Seule sa **livraison** est devenue immédiate.
+
+### Défaut 2 : une synchronisation GPU par ligne et par pas
+
+Le générateur faisait, par ligne et par pas, `sampled.item(Int32.self)` — une
+**synchronisation GPU bloquante**. À B lignes, B allers-retours par pas au lieu
+d'un. La sonde `flash-batch-probe`, elle, évalue tout le lot en un `eval` et
+lit les B identifiants d'un coup.
+
+Correctif : les B graphes d'échantillonnage restent construits **ligne par
+ligne** (chaque ligne garde sa température, son top-p, ses pénalités), mais
+ils sont matérialisés par **un seul `eval` et une seule lecture** par pas. Le
+chemin « tous réglages identiques → une op sur `[B,V]` » a été délibérément
+écarté : sous température > 0, un tirage conjoint consomme le flux aléatoire
+autrement qu'un tirage par ligne, ce qui casserait la parité lot ⟺ solo à
+graine fixée. Une synchronisation par pas, quel que soit `batchSize`.
+
+**Le coût de ces synchronisations croît avec la profondeur du pipeline**, d'où
+un effet massif sur les générations longues (864 → 117 ms par pas à 512
+jetons) et quasi nul à 96 jetons, où le pipeline est peu rempli. C'est ce qui
+explique que la matrice homogène de P12.3 n'en souffrait presque pas.
+
+### La matrice, après correction et à serveur chaud
+
+| clients | sérialisé | lot de 8 | gain |
+|---:|---:|---:|---:|
+| 1 | 20,45 | 20,42 | ×1,00 |
+| 2 | 20,06 | 28,60 | ×1,43 |
+| 4 | 19,68 | 37,25 | ×1,89 |
+| 8 | 19,29 | **44,05** (46,90 au mieux) | **×2,28** |
+
+*Attention* : le premier passage après démarrage du serveur donne 40,37 au lieu
+de 44,05 — **toujours écarter le premier run**, comme pour le reste du projet.
+
+Générations longues, 4 clients × 384 jetons : **37-38 jetons/s agrégés**,
+104 ms par pas contre 86 pour la sonde — il reste ~18 ms de coût serveur par
+pas, essentiellement le préfill.
+
+### Ce que ça change, en une phrase
+
+Avant, une question courte posée pendant que d'autres demandaient un essai
+coûtait **sept minutes**. Elle coûte maintenant **deux secondes et demie**.

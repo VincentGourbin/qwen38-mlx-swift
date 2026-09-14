@@ -4220,3 +4220,209 @@ func serverKeepsHotConversationOffTheBatchPath() async throws {
     let finalSnapshot = await server.snapshot()
     #expect(finalSnapshot.sessions.allSatisfy { $0.batchSizeServed == 1 })
 }
+
+// MARK: - P12.3 : Qwen4ExpBatchStreamingGenerator, défauts 1 et 2 (2026-09-14, sans checkpoint)
+//
+// Aucun test ci-dessus n'exerçait `Qwen4ExpBatchStreamingGenerator.run()`
+// lui-même : `MockFlashNextEngine.generateBatch`, utilisé partout au-dessus,
+// simule directement `Qwen38BatchGenerationResult` sans jamais construire de
+// lot MLX réel. Le seam de test `Qwen4ExpBatchStreamingGenerator.init(
+// forwardModel:)` (voir son commentaire et celui de `Qwen4ExpBatchForwardModel`
+// dans Qwen4ExpBatchStreamingGenerator.swift) comble ce trou : il exerce le
+// VRAI `run()` — sa boucle de pas, son échantillonnage, sa fermeture de
+// continuations — avec un modèle factice, sans checkpoint ni device Metal
+// réel au-delà des `MLXArray` que ce modèle construit lui-même.
+
+/// Modèle factice à jeton constant : l'argmax de ses logits vaut toujours
+/// `alwaysSampledToken`, quelle que soit la ligne ou le contenu de son
+/// entrée. Sert le test de timing du défaut 1, où seul un jeton stable et
+/// prévisible compte — `stepDelay` (facultatif) ralentit chaque appel pour
+/// donner à un test concurrent une fenêtre d'observation fiable, le même
+/// principe que `MockFlashNextEngine.generateBatchCompletionDelay` plus
+/// haut dans ce fichier, à un niveau en dessous (le générateur, pas
+/// l'engin).
+private final class FakeConstantBatchForwardModel: Qwen4ExpBatchForwardModel, @unchecked Sendable {
+    let vocabSize: Int
+    let alwaysSampledToken: Int32
+    let stepDelay: TimeInterval
+    private let lock = NSLock()
+    private(set) var forwardCallCount = 0
+
+    init(vocabSize: Int = 6, alwaysSampledToken: Int32 = 3, stepDelay: TimeInterval = 0) {
+        self.vocabSize = vocabSize
+        self.alwaysSampledToken = alwaysSampledToken
+        self.stepDelay = stepDelay
+    }
+
+    func batchForward(
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+    ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
+        lock.lock(); forwardCallCount += 1; lock.unlock()
+        if stepDelay > 0 { Thread.sleep(forTimeInterval: stepDelay) }
+        let batchSize = inputIDs.dim(0)
+        let sequenceLength = inputIDs.dim(1)
+        var values = [Float](repeating: 0, count: batchSize * sequenceLength * vocabSize)
+        for index in stride(from: 0, to: values.count, by: vocabSize) {
+            values[index + Int(alwaysSampledToken)] = 10
+        }
+        let logits = MLXArray(values).reshaped([batchSize, sequenceLength, vocabSize])
+        return (logits, logits, [])
+    }
+
+    func resetConversation() {}
+    func resetNGramCacheStats() {}
+    func ngramCacheStats() -> Qwen4ExpNGramCacheStats {
+        Qwen4ExpNGramCacheStats(hits: 0, misses: 0, entries: 0)
+    }
+}
+
+/// Modèle factice « adressé par contenu » : le jeton choisi pour la ligne
+/// `row` au pas courant est une fonction pure de SES PROPRES identifiants
+/// d'entrée à ce pas (`inputIDs[row, ...]`) — jamais d'une autre ligne.
+/// Sert le test de non-contamination du défaut 2 : si le nouveau chemin de
+/// lecture groupée (`activeRows`/`sampledPerRow` dans `run()`) mélangeait
+/// deux lignes par erreur, deux lignes à contenu différent produiraient la
+/// même sortie, ou deux lignes à contenu identique divergeraient — les deux
+/// seraient détectés ci-dessous.
+private final class FakeContentAddressedForwardModel: Qwen4ExpBatchForwardModel, @unchecked Sendable {
+    let vocabSize: Int
+    init(vocabSize: Int = 6) { self.vocabSize = vocabSize }
+
+    func batchForward(
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+    ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
+        let batchSize = inputIDs.dim(0)
+        let sequenceLength = inputIDs.dim(1)
+        let flatInputs = inputIDs.asArray(Int32.self)
+        var values = [Float](repeating: 0, count: batchSize * sequenceLength * vocabSize)
+        for row in 0 ..< batchSize {
+            var sum: Int32 = 0
+            for col in 0 ..< sequenceLength { sum &+= flatInputs[row * sequenceLength + col] }
+            let peak = Int(((sum % Int32(vocabSize)) + Int32(vocabSize)) % Int32(vocabSize))
+            for col in 0 ..< sequenceLength {
+                values[(row * sequenceLength + col) * vocabSize + peak] = 10
+            }
+        }
+        let logits = MLXArray(values).reshaped([batchSize, sequenceLength, vocabSize])
+        return (logits, logits, [])
+    }
+
+    func resetConversation() {}
+    func resetNGramCacheStats() {}
+    func ngramCacheStats() -> Qwen4ExpNGramCacheStats {
+        Qwen4ExpNGramCacheStats(hits: 0, misses: 0, entries: 0)
+    }
+}
+
+/// Horodate la fin de chaque flux d'un lot, depuis des tâches concurrentes
+/// — un tableau protégé par verrou, sans autre rôle.
+private final class BatchDrainRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var finishedAt: [Date?]
+    init(count: Int) { finishedAt = Array(repeating: nil, count: count) }
+    func record(_ index: Int) {
+        lock.lock(); finishedAt[index] = Date(); lock.unlock()
+    }
+}
+
+@Test(
+    "P12.3 (défaut 1, régression 2026-09-14) : une ligne courte referme sa continuation bien avant que les lignes longues ne terminent"
+)
+func batchGeneratorClosesShortRowBeforeLongRowsFinish() async throws {
+    // Délai synchrone par pas de décodage, assez large pour que l'écart
+    // entre la fin de la ligne courte (pas 0) et celle des lignes longues
+    // (~39 pas plus tard) soit très largement supérieur au bruit
+    // d'ordonnancement des tâches — un modèle factice instantané remplirait
+    // sinon les 4 flux avant qu'aucun lecteur n'ait la moindre chance de les
+    // distinguer, et le test ne mesurerait plus rien.
+    let model = FakeConstantBatchForwardModel(stepDelay: 0.02)
+    let generator = Qwen4ExpBatchStreamingGenerator(forwardModel: model)
+
+    let shortRow = Qwen4ExpBatchStreamingGenerator.Row(
+        tokenIDs: [10, 11, 12], maxNewTokens: 1, stopTokenIDs: [],
+        preset: .custom(temperature: 0, topP: 1, topK: 0))
+    let longRow = Qwen4ExpBatchStreamingGenerator.Row(
+        tokenIDs: [10, 11, 12], maxNewTokens: 40, stopTokenIDs: [],
+        preset: .custom(temperature: 0, topP: 1, topK: 0))
+    let rows = [shortRow, longRow, longRow, longRow]
+
+    let result = try generator.generate(rows: rows, padTokenID: 0)
+    let recorder = BatchDrainRecorder(count: rows.count)
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for (index, stream) in result.streams.enumerated() {
+            group.addTask {
+                for try await _ in stream {}
+                recorder.record(index)
+            }
+        }
+        try await group.waitForAll()
+    }
+    _ = await result.completion.value
+
+    let shortFinish = try #require(recorder.finishedAt[0])
+    for row in 1 ..< rows.count {
+        let longFinish = try #require(recorder.finishedAt[row])
+        // Le critère du défaut 1 : la ligne courte est livrée bien avant les
+        // lignes longues, pas seulement « avant » au sens large. La marge
+        // attendue est de l'ordre de 39 pas × 20 ms ≈ 0,78 s ; 0,3 s laisse
+        // une confortable marge de bruit tout en excluant sans ambiguïté un
+        // retour au comportement d'avant correctif (les 4 flux se
+        // refermaient tous ensemble, à quelques millisecondes près, le bogue
+        // mesuré sur le serveur réel : 442 s au lieu de 2-3 s).
+        #expect(longFinish.timeIntervalSince(shortFinish) > 0.3)
+    }
+    // Un préremplissage puis 39 pas de décodage partagés (la ligne courte
+    // n'en a besoin d'aucun — elle finit dès le premier jeton — mais reste
+    // assumée dans le calcul du lot jusqu'au bout, voir le commentaire de
+    // fichier « Gâchis de calcul assumé, livraison immédiate »).
+    #expect(model.forwardCallCount == 40)
+}
+
+@Test(
+    "P12.3 (défaut 2, régression 2026-09-14) : une ligne du lot rend les mêmes identifiants que la même ligne seule malgré l'échantillonnage groupé"
+)
+func batchGeneratorRowIsolationSurvivesGroupedSampling() async throws {
+    func makeRow(_ tokenIDs: [Int32]) -> Qwen4ExpBatchStreamingGenerator.Row {
+        .init(
+            tokenIDs: tokenIDs, maxNewTokens: 6, stopTokenIDs: [],
+            preset: .custom(temperature: 0, topP: 1, topK: 0))
+    }
+    let promptA: [Int32] = [1, 2, 3]
+    let promptB: [Int32] = [1, 2, 4]
+
+    // A au rang 0 ET au rang 2, B (contenu différent) au rang 1 entre les
+    // deux — si le regroupement en un seul `eval`/`asArray` par pas
+    // (défaut 2) réordonnait ou mélangeait les lignes, ce placement le
+    // révélerait.
+    let batchGenerator = Qwen4ExpBatchStreamingGenerator(forwardModel: FakeContentAddressedForwardModel())
+    let batchResult = try batchGenerator.generate(
+        rows: [makeRow(promptA), makeRow(promptB), makeRow(promptA)], padTokenID: 0)
+    var batchTokens: [[Int32]] = Array(repeating: [], count: 3)
+    for (index, stream) in batchResult.streams.enumerated() {
+        for try await event in stream {
+            if case .token(let token) = event { batchTokens[index].append(token) }
+        }
+    }
+    _ = await batchResult.completion.value
+
+    // La même ligne A, seule dans un lot de taille 1 — même modèle factice
+    // (une instance neuve, pour ne rien partager avec le lot ci-dessus),
+    // toujours sans checkpoint.
+    let soloGenerator = Qwen4ExpBatchStreamingGenerator(forwardModel: FakeContentAddressedForwardModel())
+    let soloResult = try soloGenerator.generate(rows: [makeRow(promptA)], padTokenID: 0)
+    var soloTokens: [Int32] = []
+    for try await event in soloResult.streams[0] {
+        if case .token(let token) = event { soloTokens.append(token) }
+    }
+    _ = await soloResult.completion.value
+
+    #expect(!batchTokens[0].isEmpty)
+    // Critère de non-contamination (PLAN.md P12.3) : la ligne A, à deux
+    // rangs différents du même lot, et la même ligne A seule, rendent
+    // exactement les mêmes identifiants.
+    #expect(batchTokens[0] == batchTokens[2])
+    #expect(batchTokens[0] == soloTokens)
+    // Et B (contenu différent) ne dérive pas vers la sortie de A.
+    #expect(batchTokens[1] != batchTokens[0])
+}
