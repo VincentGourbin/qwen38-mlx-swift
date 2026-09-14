@@ -4551,11 +4551,22 @@ qu'avec plusieurs clients simultanés sur le LAN.
 | ~~**P12.2**~~ | **Longueurs inégales.** **FAIT le 2026-09-13.** Remplissage **à gauche**, avec l'**EOS comme jeton de remplissage** — l'historique n-gramme le traite déjà comme frontière de segment dure, donc il reste identique quelle que soit la longueur du remplissage, sans masque supplémentaire. Comme en P12.1, l'ossature existait : `Qwen4ExpGatedDeltaNet` et `Qwen4ExpPLELayer` acceptaient déjà un `mask: [B,S]` documenté « reserved for padded/ragged batches » et jamais alimenté. Trois modifications additives (`causalMask(…, leftPadding:)` + relais). **Critère dépassé** : le prompt de référence rend les identifiants du dépôt en tête, au milieu et en queue d'un lot mêlé — et *chaque* autre séquence est elle aussi indifférente à sa position. P2-code (e) tombe au passage : le masque causal ne peut plus être sauté en décodage à un jeton quand le cache porte des colonnes de remplissage. | ✅ parité exacte |
 | ~~**P12.3**~~ | **Ordonnanceur côté serveur, derrière un drapeau.** **FAIT le 2026-09-13.** `serve --batch-size N`, défaut 1 = chemin d'aujourd'hui strictement inchangé. **Mesuré : ×2,16 de débit agrégé à 8 clients** (19,91 → 43,07 jetons/s), dernier servi de **38,57 s → 17,83 s**, et en lot **toutes les latences sont égales**. **Aucune régression à un seul client** (20,38 contre 20,48 jetons/s). Un crash trouvé par la mesure et non par les tests — le verrou d'exécution se libérait à la consommation des flux SSE et non à la fin réelle du lot, laissant deux réinitialisations concurrentes du modèle résident ; corrigé, avec un test vérifié comme échouant sans le correctif. **Arbitrage à connaître** : à 8 clients, un lot de 4 donne une meilleure médiane (15,59 s) mais un dernier servi plus tardif (20,94 s) qu'un lot de 8. | ✅ ×2,16 |
 
-**Reste, si on veut aller chercher l'écart entre ×2,16 et le ×2,94 de la
-sonde** : l'entrée et la sortie de séquences **en cours** de lot (une ligne
-finie occupe sa place jusqu'au bout), la fenêtre de regroupement de 30 ms
-codée en dur, et le fait qu'une requête servie en lot ne devient jamais une
-conversation active — elle perd l'opportunité d'un tour 2 rapide.
+#### Ce qui restait sur la table, traité le 2026-09-14
+
+| point | état |
+|---|---|
+| **Le client était retenu par le lot** | ✅ **corrigé.** Un client demandant 16 jetons derrière trois en demandant 512 passe de **442,41 s à 2,52 s** ; les longs passent de 442 à 60,10 s. Le flux d'une ligne est refermé dès qu'elle a fini, au lieu de l'être à la fin du lot. |
+| **Une synchronisation GPU par ligne et par pas** | ✅ **corrigé.** `.item()` par ligne remplacé par un `eval` unique. Effet **864 → 117 ms par pas** sur les générations longues, quasi nul à 96 jetons — le coût d'une synchronisation croît avec la profondeur du pipeline. Débit agrégé à 8 clients, serveur chaud : **44,05 t/s contre 19,29 sérialisé, ×2,28**. |
+| **Le préfill en lot ruine le TTFT** *(défaut trouvé en mesurant, pas prévu)* | ✅ **gardé.** Sur ~1 200 jetons, rejoindre un lot faisait passer le TTFT de 7,53 à **37,20 s**. Le préfill est **dense**, il n'a pas de capacité libre à remplir : le grouper additionne le travail. `serve --batch-max-prompt-tokens` (défaut 256) exclut ces requêtes du lot. |
+| **Fenêtre de regroupement codée en dur** | ✅ `serve --batch-window-ms` (défaut 30). |
+| **Une requête en lot ne devient jamais une conversation active** | ⛔ **bloqué, et documenté.** Extraire la tranche de cache d'une ligne exige `filter(batchIndices:)`, que le vendor n'expose que sur `ArraysCache` : les 36 couches GDN l'ont, les 12 couches d'attention pleine (`Qwen4ExpQSAKVCache`, classe maison) ne l'ont pas. Écrire ce `filter` était faisable mais non validé, avec un risque de **réponses fausses au tour 2** — rien n'a été écrit. **La garde de longueur neutralise le problème en pratique** : les prompts longs et conversationnels sortent du lot et gardent leur TTFT plat (0,36 s). Reste la conversation démarrée par un prompt court, dont le tour 2 paie **+1,41 s** au lieu de +9,50 — pénalité **bornée par le seuil**. |
+| **Entrée/sortie de séquences en cours de lot** | Non fait. Une ligne finie occupe toujours sa place dans le `forward`. C'est le gâchis résiduel, et il suppose la même primitive manquante. |
+
+**Le mur commun aux trois points restants** — adoption de conversation,
+préfill séparé du décodage, lot continu — est le même : il manque un moyen
+validé d'**assembler et de découper un lot de caches**, et
+`Qwen4ExpQSAKVCache` ne le supporte pas. C'est le prérequis de tout ce qui
+suit.
 
 **Ordre imposé** : P12.1 seule décide de la suite. Tant que sa mesure n'est pas
 rendue, ni P12.2 ni P12.3 ne sont engagées — l'ordonnanceur est la plus grosse
