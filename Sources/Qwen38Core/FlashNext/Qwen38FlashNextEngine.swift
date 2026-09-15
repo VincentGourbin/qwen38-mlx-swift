@@ -8,6 +8,14 @@ public enum Qwen38FlashNextEngineError: LocalizedError, Equatable {
     case multipleImagesUnsupported
     case imageOnContinuationUnsupported
     case statelessImagesUnsupported
+    /// P13.3 : `continueConversationTurn` n'a pas pu calculer sûrement le
+    /// suffixe de jetons à préfiller (voir `Qwen4ExpPromptBuilder.
+    /// continuationSuffix`) — historique divergent, options incompatibles,
+    /// ou rien de nouveau à préfiller. Jamais fatal en soi : le seul
+    /// appelant prévu (`Qwen38Runtime.generateFlashConversationTurn`, via le
+    /// serveur) doit le rattraper et retomber sur un rejeu complet
+    /// (`generateFromMessages`).
+    case continuationSuffixUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -18,6 +26,9 @@ public enum Qwen38FlashNextEngineError: LocalizedError, Equatable {
         case .statelessImagesUnsupported:
             return
                 "Flash-Next (LAN) : une image n'est acceptée que sur le dernier message utilisateur, sans tour assistant précédent."
+        case .continuationSuffixUnavailable:
+            return
+                "Flash-Next : le suffixe de continuation n'a pas pu être calculé sûrement — rejeu complet requis."
         }
     }
 }
@@ -112,6 +123,27 @@ public protocol Qwen38FlashNextEngineProtocol: AnyObject, Sendable {
     func renderedTokenIDs(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> [Int32]
+    /// P13.3 : point d'entrée orienté message pour un tour de conversation
+    /// à cache persistant, en remplacement de l'usage de `generate(prompt:
+    /// ...)` fait par le serveur (`Qwen38Runtime.generateFlashConversationTurn`)
+    /// — voir le rapport à Vincent (PLAN.md P13.3). Au premier tour (aucune
+    /// conversation active dans CET engin), se comporte exactement comme
+    /// `generate(prompt:...)` (`buildFirstTurn`, images et outils compris).
+    /// À un tour suivant, calcule le nouveau suffixe de jetons par
+    /// différence entre le rendu complet de `messages` et celui de
+    /// `messages.dropLast()` (voir `Qwen4ExpPromptBuilder.continuationSuffix`)
+    /// plutôt que de reconstruire le tour à la main — ce qui couvre
+    /// n'importe quel rôle de dernier message, `tool` compris, contrairement
+    /// à `buildContinuationTurn`. Une image sur le dernier message d'une
+    /// continuation reste refusée, comme `generate(prompt:...)`. Lève
+    /// `Qwen38FlashNextEngineError.continuationSuffixUnavailable` quand le
+    /// suffixe ne peut pas être calculé sûrement (garde de cohérence, voir
+    /// `continuationSuffix`) : l'appelant doit alors retomber sur un rejeu
+    /// complet (`generateFromMessages`), jamais continuer dans un état
+    /// incohérent.
+    func continueConversationTurn(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error>
     /// H4.2: forces every decoder layer to be loaded from disk once, up
     /// front, instead of paying that cost inside the first real turn's
     /// TTFT. Yields the index of each layer as it finishes loading (0-based,
@@ -442,10 +474,18 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             built = Qwen4ExpPromptBuilder.buildContinuationTurn(
                 tokenizer: tokenizer, prompt: prompt, thinking: options.enableThinking)
         } else {
+            // P13.2 : le premier tour d'une conversation à cache persistant
+            // doit rendre le même bloc d'outils que le chemin stateless
+            // (`generateFromMessages`/`renderedTokenIDs`, tous deux déjà
+            // tools-aware depuis P13.1) — sans cela, une boucle d'agent dont
+            // le tour 0 démarre à froid ici (système + un seul message
+            // utilisateur, voir `Qwen38Runtime.coldStartConversation`)
+            // perdait silencieusement la déclaration des outils.
             built = try Qwen4ExpPromptBuilder.buildFirstTurn(
                 tokenizer: tokenizer, configuration: configuration, directory: directory,
                 prompt: prompt, imageURL: imageURLs.first, thinking: options.enableThinking,
-                reasoningEffort: options.reasoningEffort, systemPrompt: systemPrompt)
+                reasoningEffort: options.reasoningEffort, systemPrompt: systemPrompt,
+                tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
         }
         hasConversationHistory = true
 
@@ -477,6 +517,43 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             reasoningEffort: options.reasoningEffort,
             tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
         return built.tokenIDs
+    }
+
+    /// P13.3 : voir le contrat complet sur
+    /// `Qwen38FlashNextEngineProtocol.continueConversationTurn`.
+    public func continueConversationTurn(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        guard let last = messages.last else {
+            throw Qwen4ExpStreamingGenerationError.emptyPrompt
+        }
+        guard hasConversationHistory else {
+            // Premier tour : identique à `generate(prompt:...)`, y compris
+            // l'image et les outils — aucune logique dupliquée.
+            let systemPrompt = messages.first(where: { $0.role == .system })?.content
+            return try generate(
+                prompt: last.content, systemPrompt: systemPrompt, imageURLs: last.imageURLs,
+                options: options)
+        }
+        guard last.imageURLs.isEmpty else {
+            throw Qwen38FlashNextEngineError.imageOnContinuationUnsupported
+        }
+        let priorMessages = Array(messages.dropLast())
+        let priorRendered = try renderedTokenIDs(messages: priorMessages, options: options)
+        let fullRendered = try renderedTokenIDs(messages: messages, options: options)
+        let generationPrompt = Qwen4ExpPromptBuilder.assistantGenerationPromptTokenIDs(
+            tokenizer: tokenizer, thinking: options.enableThinking)
+        guard
+            let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+                priorRenderedTokenIDs: priorRendered, fullRenderedTokenIDs: fullRendered,
+                generationPromptTokenIDs: generationPrompt)
+        else {
+            throw Qwen38FlashNextEngineError.continuationSuffixUnavailable
+        }
+        let built = Qwen4ExpBuiltPrompt(tokenIDs: suffix)
+        return try runGenerationStream(
+            built: built, options: options, continueConversation: true,
+            inputDescription: "Texte")
     }
 
     public func generateFromMessages(

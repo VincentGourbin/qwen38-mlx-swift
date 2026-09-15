@@ -39,6 +39,15 @@ public enum Qwen4ExpPromptBuilder {
     /// or the manual ChatML assembly around the vision markers when an
     /// image is attached — identical to `flash-generate-probe`'s image
     /// branch, including the thinking prefix (V51).
+    /// P13.2 : `tools` s'ajoute pour que le premier tour d'une conversation
+    /// à cache persistant (`Qwen38FlashNextEngine.generate`, démarré à froid
+    /// par `Qwen38Runtime.coldStartConversation`) rende exactement le même
+    /// bloc d'outils que `buildFromMessages` — sans ce paramètre, le premier
+    /// tour d'une boucle d'agent perdait silencieusement la déclaration des
+    /// outils (le modèle ne savait même pas qu'ils existaient) dès que la
+    /// requête empruntait ce chemin plutôt que le chemin stateless. Reste
+    /// `nil` sur la branche image : le rendu manuel ChatML ci-dessous n'a
+    /// aucune notion d'outils (limitation préexistante, non couverte ici).
     public static func buildFirstTurn(
         tokenizer: any Tokenizer,
         configuration: Qwen4ExpConfiguration,
@@ -47,7 +56,8 @@ public enum Qwen4ExpPromptBuilder {
         imageURL: URL?,
         thinking: Bool,
         reasoningEffort: String = "low",
-        systemPrompt: String? = nil
+        systemPrompt: String? = nil,
+        tools: [ToolSpec]? = nil
     ) throws -> Qwen4ExpBuiltPrompt {
         guard let imageURL else {
             var messages: [Message] = []
@@ -57,7 +67,7 @@ public enum Qwen4ExpPromptBuilder {
             messages.append(["role": "user", "content": prompt])
             let tokenIDs = try tokenizer.applyChatTemplate(
                 messages: messages,
-                tools: nil,
+                tools: tools,
                 additionalContext: [
                     "enable_thinking": thinking,
                     "reasoning_effort": reasoningEffort,
@@ -191,5 +201,80 @@ public enum Qwen4ExpPromptBuilder {
         _ thinking: Bool, encode: (String) -> [Int32]
     ) -> [Int32] {
         thinking ? encode("<think>\n") : encode("<think>\n\n</think>\n\n")
+    }
+
+    /// P13.3 : le bloc de jetons que `applyChatTemplate(..., addGenerationPrompt: true)`
+    /// ajoute après le dernier tour réel pour amorcer une réponse assistant
+    /// — littéralement le même appel que `buildContinuationTurn` utilise
+    /// déjà pour ce même bloc, exposé ici pour que
+    /// `Qwen38FlashNextEngine.continueConversationTurn` (P13.3) puisse le
+    /// retirer de la fin d'un rendu complet (`renderedTokenIDs`) et
+    /// retrouver ainsi le contenu littéral déjà présent dans le cache — sans
+    /// deviner le gabarit : c'est la brique déjà validée qui construit ce
+    /// bloc, pas une nouvelle reconstruction.
+    public static func assistantGenerationPromptTokenIDs(
+        tokenizer: any Tokenizer, thinking: Bool
+    ) -> [Int32] {
+        func encode(_ value: String) -> [Int32] {
+            tokenizer.encode(text: value, addSpecialTokens: false).map(Int32.init)
+        }
+        return encode("<|im_start|>assistant\n") + thinkingPrefix(thinking, encode: encode)
+    }
+
+    /// P13.3 : calcule le suffixe de jetons à préfiller pour continuer une
+    /// conversation à cache persistant, par DIFFÉRENCE entre deux rendus
+    /// complets — jamais en reconstruisant le tour à la main — afin de
+    /// couvrir n'importe quel rôle de dernier message (`user` comme `tool`),
+    /// contrairement à `buildContinuationTurn` qui encadre systématiquement
+    /// le nouveau message comme un tour `user` nu. Voir le rapport à Vincent
+    /// (PLAN.md P13.3) pour le contexte complet.
+    ///
+    /// `priorRenderedTokenIDs` est le rendu complet (`renderedTokenIDs`,
+    /// donc avec `addGenerationPrompt: true`) des messages déjà dans le
+    /// cache ; `fullRenderedTokenIDs` est le même rendu pour la
+    /// conversation actuelle, un message de plus. Les deux se terminent par
+    /// le même bloc d'amorçage (`generationPromptTokenIDs`, voir
+    /// `assistantGenerationPromptTokenIDs`) puisque `applyChatTemplate`
+    /// l'ajoute inconditionnellement — le retirer de la fin de
+    /// `priorRenderedTokenIDs` retrouve donc exactement le contenu littéral
+    /// déjà écrit dans le cache du moteur.
+    ///
+    /// Retourne `nil` — jamais un état incohérent — dans chacun des cas
+    /// dégradés :
+    ///  - `priorRenderedTokenIDs` ne se termine pas par le bloc d'amorçage
+    ///    attendu (garde de cohérence : ne devrait jamais arriver si l'appelant
+    ///    a bien rendu les deux côtés avec les mêmes options) ;
+    ///  - le contenu littéral qui en résulte n'est PAS un préfixe exact de
+    ///    `fullRenderedTokenIDs` (historique divergent : un message plus tôt
+    ///    dans la conversation a été édité, tronqué, ou la liste d'outils a
+    ///    changé) ;
+    ///  - rien de nouveau à préfiller au-delà du bloc d'amorçage lui-même
+    ///    (le rendu complet actuel est identique au rendu déjà en cache).
+    /// Dans les trois cas, l'appelant doit retomber sur un rejeu complet.
+    public static func continuationSuffix(
+        priorRenderedTokenIDs: [Int32],
+        fullRenderedTokenIDs: [Int32],
+        generationPromptTokenIDs: [Int32]
+    ) -> [Int32]? {
+        guard priorRenderedTokenIDs.count >= generationPromptTokenIDs.count,
+              Array(priorRenderedTokenIDs.suffix(generationPromptTokenIDs.count))
+                == generationPromptTokenIDs
+        else { return nil }
+        let cachedLength = priorRenderedTokenIDs.count - generationPromptTokenIDs.count
+        // `fullRenderedTokenIDs` ends in the SAME priming block (both sides
+        // are rendered with `addGenerationPrompt: true`, and the compared
+        // conversations share `options.enableThinking` — `cacheOptionsCompatible`
+        // guarantees that upstream) — so a genuine "nothing new" case (the
+        // full render is identical to the prior one) would otherwise slip
+        // through as a one-token-shorter-than-expected "suffix" containing
+        // only the priming block itself, never actually empty. The `>`
+        // below (rather than `>=`) rejects that case explicitly: a real
+        // continuation must add at least one token of new message content
+        // beyond the priming block.
+        guard fullRenderedTokenIDs.count > cachedLength + generationPromptTokenIDs.count,
+              Array(fullRenderedTokenIDs.prefix(cachedLength))
+                == Array(priorRenderedTokenIDs.prefix(cachedLength))
+        else { return nil }
+        return Array(fullRenderedTokenIDs[cachedLength...])
     }
 }

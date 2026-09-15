@@ -620,48 +620,39 @@ public actor Qwen38InferenceServer {
             }
             let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
-            let usePersistentCache: Bool
-            let cacheRestored: Bool
-            let trackingID: String?
-            if requestedTools.isEmpty {
-                (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
-                    id: conversationID,
-                    model: selectedModel,
-                    messages: prepared.messages,
-                    options: options)
-            } else {
-                // P13.1 : une requête porteuse d'outils ne touche jamais le
-                // cache de conversation Flash-Next (LRU/préfixe implicite) —
-                // elle est toujours rejouée en entier via
-                // `generateStateless`, exactement comme un client OpenAI
-                // classique qui renvoie tout l'historique à chaque tour (ce
-                // qu'un client outillé comme OpenCode fait de toute façon).
-                // Choix délibérément simple : il garantit qu'ajouter `tools`
-                // ne peut jamais interagir avec la comparaison de préfixe du
-                // cache — voir le rapport à Vincent (PLAN.md P13.1).
-                usePersistentCache = false
-                cacheRestored = false
-                trackingID = nil
-            }
+            // P13.2 : une requête outillée touche désormais le cache de
+            // conversation Flash-Next (LRU/préfixe implicite) exactement
+            // comme une requête ordinaire — `cacheOptionsCompatible` compare
+            // déjà `options.tools`, donc un changement de la liste d'outils
+            // invalide proprement la comparaison (voir le test dédié). C'est
+            // un renversement délibéré de la décision de P13.1 : une boucle
+            // d'agent renvoie tout l'historique à chaque tour et n'ajoute
+            // que quelques centaines de jetons à la fin d'un prompt par
+            // ailleurs identique — le cas idéal du cache de préfixe, mesuré
+            // à 86 % du temps d'une boucle perdu en préfill sans lui (PLAN.md
+            // P13.2).
+            let (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
+                id: conversationID,
+                model: selectedModel,
+                messages: prepared.messages,
+                options: options)
+            // P13.3 : la garde P13.2 (un tour se terminant par `role: tool`
+            // repartait toujours en rejeu complet) n'est plus nécessaire —
+            // `dispatchConversationTurn` continue maintenant n'importe quel
+            // rôle de dernier message par différence de jetons plutôt qu'en
+            // reconstruisant le tour à la main (voir le rapport PLAN.md
+            // P13.3) et retombe elle-même sur un rejeu complet si le
+            // suffixe ne peut pas être calculé sûrement.
+            let (stream, dispatchedViaPersistentCache) = try await dispatchConversationTurn(
+                usePersistentCache: usePersistentCache, messages: prepared.messages, options: options)
             // Ground truth for the GUI's "Cache" tri-state (P5.2): a request
             // that named a conversation with prior turns but still fell back
             // to a full stateless replay. Computed here, not from engine
             // metrics — see `cacheReplayed`'s doc comment. P6.1: `trackingID`
             // covers both an explicit `conversation_id` and the synthetic id
             // the implicit-prefix path hands out when there is none.
-            let cacheReplayed = !usePersistentCache && trackingID != nil && prepared.messages.count > 1
-            updateSession(id) { $0.cacheRestored = cacheRestored; $0.cacheReplayed = cacheReplayed }
-            let stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>
-            if usePersistentCache, let last = prepared.messages.last {
-                let systemPrompt = prepared.messages.first(where: { $0.role == .system })?.content
-                stream = try await runtime.generate(
-                    prompt: last.content,
-                    systemPrompt: systemPrompt,
-                    imageURLs: last.imageURLs,
-                    options: options)
-            } else {
-                stream = try await runtime.generateStateless(messages: prepared.messages, options: options)
-            }
+            let cacheReplayed = !dispatchedViaPersistentCache && trackingID != nil && prepared.messages.count > 1
+            updateSession(id) { $0.cacheRestored = cacheRestored && dispatchedViaPersistentCache; $0.cacheReplayed = cacheReplayed }
             for url in prepared.temporaryFiles { try? FileManager.default.removeItem(at: url) }
             // Must mirror `options.enableThinking` exactly: the parser assumes the
             // prompt ends inside `<think>` only when thinking was rendered.
@@ -828,37 +819,31 @@ public actor Qwen38InferenceServer {
                 let usePersistentCache: Bool
                 let cacheRestored: Bool
                 let trackingID: String?
-                if requestedTools.isEmpty {
-                    do {
-                        (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
-                            id: conversationID, model: selectedModel, messages: prepared.messages, options: options)
-                    } catch {
-                        await batchExecutionLock.release()
-                        throw error
-                    }
-                } else {
-                    // P13.1 : voir le même commentaire dans
-                    // `chatCompletionsResponse` — une requête outillée ne
-                    // touche jamais le cache de conversation.
-                    usePersistentCache = false
-                    cacheRestored = false
-                    trackingID = nil
-                }
-                let cacheReplayed = !usePersistentCache && trackingID != nil && prepared.messages.count > 1
-                updateSession(id) { $0.cacheRestored = cacheRestored; $0.cacheReplayed = cacheReplayed; $0.batchSizeServed = 1 }
-                let rawStream: AsyncThrowingStream<Qwen38GenerationEvent, Error>
                 do {
-                    if usePersistentCache, let last = prepared.messages.last {
-                        let systemPrompt = prepared.messages.first(where: { $0.role == .system })?.content
-                        rawStream = try await runtime.generate(
-                            prompt: last.content, systemPrompt: systemPrompt, imageURLs: last.imageURLs, options: options)
-                    } else {
-                        rawStream = try await runtime.generateStateless(messages: prepared.messages, options: options)
-                    }
+                    // P13.2 : voir le même commentaire dans
+                    // `chatCompletionsResponse` — une requête outillée
+                    // touche désormais le cache de conversation comme
+                    // n'importe quelle autre.
+                    (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
+                        id: conversationID, model: selectedModel, messages: prepared.messages, options: options)
                 } catch {
                     await batchExecutionLock.release()
                     throw error
                 }
+                // P13.3 : même dispatch que `chatCompletionsResponse` — la
+                // garde P13.2 sur un tour se terminant par `role: tool`
+                // n'est plus nécessaire, voir son commentaire.
+                let rawStream: AsyncThrowingStream<Qwen38GenerationEvent, Error>
+                let dispatchedViaPersistentCache: Bool
+                do {
+                    (rawStream, dispatchedViaPersistentCache) = try await dispatchConversationTurn(
+                        usePersistentCache: usePersistentCache, messages: prepared.messages, options: options)
+                } catch {
+                    await batchExecutionLock.release()
+                    throw error
+                }
+                let cacheReplayed = !dispatchedViaPersistentCache && trackingID != nil && prepared.messages.count > 1
+                updateSession(id) { $0.cacheRestored = cacheRestored && dispatchedViaPersistentCache; $0.cacheReplayed = cacheReplayed; $0.batchSizeServed = 1 }
                 for url in prepared.temporaryFiles { try? FileManager.default.removeItem(at: url) }
                 // Sûr ici (contrairement au lot, voir le commentaire de
                 // `Qwen38BatchCompletionGate`) : `Qwen4ExpStreamingGenerator.
@@ -902,17 +887,67 @@ public actor Qwen38InferenceServer {
         try await runtime.prepareFlashConversation(id: id, model: model, messages: messages, options: options)
     }
 
-    /// P6.4: thin forwarder — see `prepareConversation` above.
+    /// P6.4: thin forwarder — see `prepareConversation` above. P13.2:
+    /// `assistantToolCalls` threads through to `Qwen38Runtime.
+    /// rememberFlashConversation` — see its doc comment.
     func rememberConversation(
         id: String,
         model: String,
         requestMessages: [Qwen38ChatMessage],
         assistantContent: String,
+        assistantToolCalls: [Qwen38ToolCall] = [],
         options: Qwen38GenerationOptions
     ) async {
         await runtime.rememberFlashConversation(
             id: id, model: model, requestMessages: requestMessages,
-            assistantContent: assistantContent, options: options)
+            assistantContent: assistantContent, assistantToolCalls: assistantToolCalls, options: options)
+    }
+
+    /// P13.3 : dispatch commun aux deux chemins serveur
+    /// (`chatCompletionsResponse`, `chatCompletionsResponseBatched`) pour un
+    /// tour dont `prepareConversation` a déjà décidé qu'il PEUT emprunter le
+    /// cache persistant (`usePersistentCache`). Remplace l'ancienne garde
+    /// « un tour se terminant par `role: tool` repart toujours en rejeu
+    /// complet » (P13.2) : elle n'est plus nécessaire —
+    /// `runtime.generateFlashConversationTurn` continue maintenant n'importe
+    /// quel rôle de dernier message par différence de jetons plutôt qu'en
+    /// reconstruisant le tour à la main (voir le rapport PLAN.md P13.3), et
+    /// retombe elle-même sur un rejeu complet si le suffixe ne peut pas être
+    /// calculé sûrement (`Qwen38FlashNextEngineError.
+    /// continuationSuffixUnavailable` — historique divergent, options
+    /// incompatibles, ou rien de nouveau à préfiller).
+    ///
+    /// La famille 27B (`chatSession`) n'a pas d'équivalent à
+    /// `generateFlashConversationTurn` — elle garde `generate(prompt:...)`,
+    /// inchangé.
+    ///
+    /// Le second membre du résultat dit ce qui a RÉELLEMENT été utilisé
+    /// (jamais `usePersistentCache` tel quel) pour que l'appelant reporte
+    /// une télémétrie de cache honnête même après un tel repli.
+    private func dispatchConversationTurn(
+        usePersistentCache: Bool,
+        messages: [Qwen38ChatMessage],
+        options: Qwen38GenerationOptions
+    ) async throws -> (
+        stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, usedPersistentCache: Bool
+    ) {
+        guard usePersistentCache, let last = messages.last else {
+            return (try await runtime.generateStateless(messages: messages, options: options), false)
+        }
+        guard await runtime.isFlashNextLoaded else {
+            let systemPrompt = messages.first(where: { $0.role == .system })?.content
+            let stream = try await runtime.generate(
+                prompt: last.content, systemPrompt: systemPrompt, imageURLs: last.imageURLs,
+                options: options)
+            return (stream, true)
+        }
+        do {
+            let stream = try await runtime.generateFlashConversationTurn(
+                messages: messages, options: options)
+            return (stream, true)
+        } catch Qwen38FlashNextEngineError.continuationSuffixUnavailable {
+            return (try await runtime.generateStateless(messages: messages, options: options), false)
+        }
     }
 
     private func ensureModelLoaded(_ requestedModel: String?) async throws -> String {
@@ -998,27 +1033,37 @@ public actor Qwen38InferenceServer {
                 completeSession(sessionID, metrics: value)
             }
         }
-        if let trackingID {
-            await rememberConversation(id: trackingID, model: model, requestMessages: requestMessages, assistantContent: text, options: options)
-        }
         // P13.1 : n'analyse les `<tool_call>` que si CETTE requête a déclaré
         // des outils — sans quoi une réponse ordinaire qui contiendrait par
         // hasard ce texte (hallucination) resterait un `content` brut,
         // comportement strictement inchangé sans `tools` (critère PLAN.md
         // P13.1).
+        // P13.2 : ce parsing doit avoir lieu AVANT de mémoriser le tour dans
+        // le ledger (déplacé plus bas, cf. avant P13.2 il avait lieu après)
+        // — sinon le tour assistant mémorisé aurait gardé le XML
+        // `<tool_call>` brut comme `content`, alors que le PROCHAIN tour
+        // reconstruit ce même tour assistant depuis les `tool_calls[]`
+        // structurés que le client renvoie (voir `Qwen38Server.prepare`) :
+        // deux représentations différentes du même tour ne rendent pas les
+        // mêmes jetons, ce qui aurait fait manquer à tort la comparaison de
+        // préfixe P6.1 sur le tour suivant.
         var finishReason = Self.finishReason(metrics?.stopReason)
         var toolCallsOut: [ChatCompletionToolCallOut]? = nil
+        var rememberedToolCalls: [Qwen38ToolCall] = []
         if !options.tools.isEmpty {
             let parsed = Qwen38ToolCallParser.parse(text)
             if !parsed.calls.isEmpty {
                 text = parsed.content
-                toolCallsOut = parsed.calls.map { call in
+                let built = parsed.calls.map { call -> (out: ChatCompletionToolCallOut, remembered: Qwen38ToolCall) in
                     let schema = options.tools.first(where: { $0.name == call.name })?.parameters
                     let argumentsJSON = Qwen38ToolArgumentTyper.typedArguments(call.parameters, schema: schema).toJSONString()
-                    return ChatCompletionToolCallOut(
-                        index: nil, id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))",
-                        type: "function", function: .init(name: call.name, arguments: argumentsJSON))
+                    let callID = "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
+                    return (
+                        ChatCompletionToolCallOut(index: nil, id: callID, type: "function", function: .init(name: call.name, arguments: argumentsJSON)),
+                        Qwen38ToolCall(id: callID, name: call.name, argumentsJSON: argumentsJSON))
                 }
+                toolCallsOut = built.map(\.out)
+                rememberedToolCalls = built.map(\.remembered)
                 // Un appel tronqué par max_tokens ne devient jamais un appel
                 // malformé (voir `Qwen38ToolCallParser`) ; symétriquement,
                 // un finish_reason "length" reste "length" même si un ou
@@ -1026,6 +1071,9 @@ public actor Qwen38InferenceServer {
                 // coupure — jamais "tool_calls" dans ce cas.
                 if finishReason != "length" { finishReason = "tool_calls" }
             }
+        }
+        if let trackingID {
+            await rememberConversation(id: trackingID, model: model, requestMessages: requestMessages, assistantContent: text, assistantToolCalls: rememberedToolCalls, options: options)
         }
         return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty, toolCalls: toolCallsOut), delta: nil, finishReason: finishReason)]))
     }
@@ -1076,17 +1124,24 @@ public actor Qwen38InferenceServer {
                         if !hasTools, !tail.content.isEmpty { try await writeDelta(content: tail.content) }
 
                         var finishReason = Self.finishReason(metrics.stopReason)
+                        // P13.2 : mêmes calls que `makeJSONResponse` — voir
+                        // son commentaire sur pourquoi le ledger doit garder
+                        // les `tool_calls` structurés plutôt que le XML brut.
+                        var rememberedToolCalls: [Qwen38ToolCall] = []
                         if hasTools {
                             let parsed = Qwen38ToolCallParser.parse(responseContent)
                             if !parsed.content.isEmpty { try await writeDelta(content: parsed.content) }
                             if !parsed.calls.isEmpty {
-                                let toolCallDeltas = parsed.calls.enumerated().map { index, call -> ChatCompletionToolCallOut in
+                                let built = parsed.calls.enumerated().map { index, call -> (out: ChatCompletionToolCallOut, remembered: Qwen38ToolCall) in
                                     let schema = options.tools.first(where: { $0.name == call.name })?.parameters
                                     let argumentsJSON = Qwen38ToolArgumentTyper.typedArguments(call.parameters, schema: schema).toJSONString()
-                                    return ChatCompletionToolCallOut(
-                                        index: index, id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))",
-                                        type: "function", function: .init(name: call.name, arguments: argumentsJSON))
+                                    let callID = "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))"
+                                    return (
+                                        ChatCompletionToolCallOut(index: index, id: callID, type: "function", function: .init(name: call.name, arguments: argumentsJSON)),
+                                        Qwen38ToolCall(id: callID, name: call.name, argumentsJSON: argumentsJSON))
                                 }
+                                let toolCallDeltas = built.map(\.out)
+                                rememberedToolCalls = built.map(\.remembered)
                                 // Livré en un seul fragment complet plutôt
                                 // que morceau par morceau — voir le
                                 // commentaire de fonction et le rapport à
@@ -1101,7 +1156,7 @@ public actor Qwen38InferenceServer {
                             await self.rememberConversation(
                                 id: trackingID, model: model,
                                 requestMessages: requestMessages,
-                                assistantContent: responseContent, options: options)
+                                assistantContent: responseContent, assistantToolCalls: rememberedToolCalls, options: options)
                         }
                     }
                 }

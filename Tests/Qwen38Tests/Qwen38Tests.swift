@@ -896,7 +896,17 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
         ablation = new
     }
 
-    func resetConversation() { resetConversationCount += 1 }
+    /// P13.3 : imite `Qwen38FlashNextEngine.hasConversationHistory` — assez
+    /// pour que le mock reproduise fidèlement la délégation vers
+    /// `generate(prompt:...)` au premier tour (`continueConversationTurn`
+    /// ci-dessous), sans quoi un test ne pourrait pas distinguer "premier
+    /// tour" de "continuation" à travers le mock.
+    private var mockHasConversationHistory = false
+
+    func resetConversation() {
+        resetConversationCount += 1
+        mockHasConversationHistory = false
+    }
     func unload() { unloadCount += 1 }
     func decode(tokenIDs: [Int32]) -> String { "mock" }
     func warmUp() -> AsyncStream<Int> { AsyncStream { $0.finish() } }
@@ -914,6 +924,7 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
         prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateOptions = options
+        mockHasConversationHistory = true
         return Self.makeCompletedStream(content: scriptedContent ?? "mock")
     }
 
@@ -922,6 +933,39 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateFromMessagesOptions = options
         lastGenerateFromMessages = messages
+        mockHasConversationHistory = true
+        return Self.makeCompletedStream(content: scriptedContent ?? "mock")
+    }
+
+    /// P13.3 : imite `Qwen38FlashNextEngine.continueConversationTurn` — au
+    /// premier tour (`mockHasConversationHistory == false`), délègue à
+    /// `generate(prompt:...)` exactement comme le moteur réel (même
+    /// enregistrement `lastGenerateOptions`, aucune duplication de logique) ;
+    /// à un tour suivant, enregistre l'appel sous son propre nom, pour
+    /// qu'un test puisse vérifier que le serveur dispatche vers CETTE
+    /// méthode (plutôt que `generateFromMessages`, un rejeu complet) pour un
+    /// tour se terminant par n'importe quel rôle, `tool` compris. Scripter
+    /// `continueConversationTurnError` exerce le repli du serveur sur un
+    /// rejeu complet quand le suffixe ne peut pas être calculé sûrement.
+    private(set) var lastContinueConversationTurnMessages: [Qwen38ChatMessage]?
+    private(set) var lastContinueConversationTurnOptions: Qwen38GenerationOptions?
+    private(set) var continueConversationTurnCallCount = 0
+    var continueConversationTurnError: Error?
+
+    func continueConversationTurn(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        guard mockHasConversationHistory else {
+            let last = messages.last
+            let systemPrompt = messages.first(where: { $0.role == .system })?.content
+            return try generate(
+                prompt: last?.content ?? "", systemPrompt: systemPrompt,
+                imageURLs: last?.imageURLs ?? [], options: options)
+        }
+        continueConversationTurnCallCount += 1
+        lastContinueConversationTurnMessages = messages
+        lastContinueConversationTurnOptions = options
+        if let continueConversationTurnError { throw continueConversationTurnError }
         return Self.makeCompletedStream(content: scriptedContent ?? "mock")
     }
 
@@ -988,6 +1032,12 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     /// real checkpoint: identical message lists render identical IDs,
     /// differing content (system edit, truncated history) renders
     /// different IDs.
+    /// P13.2 : folds `Qwen38ChatMessage.toolCalls` into the render too (name
+    /// + raw arguments text) — a tool-call assistant turn now affects the
+    /// rendered IDs exactly like a content edit would, so a test can catch a
+    /// regression where the remembered ledger drops the structured
+    /// `tool_calls` (e.g. stores the model's raw `<tool_call>` XML text
+    /// instead) even when `content` alone happens to still match.
     func renderedTokenIDs(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> [Int32] {
@@ -996,7 +1046,11 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
             let wordTokens = message.content.split(separator: " ").map {
                 Int32($0.hashValue % 1_000_000)
             }
-            return [roleToken] + wordTokens
+            let toolTokens = message.toolCalls.flatMap { call -> [Int32] in
+                [Int32(call.name.hashValue % 1_000_000)]
+                    + call.argumentsJSON.split(separator: " ").map { Int32($0.hashValue % 1_000_000) }
+            }
+            return [roleToken] + wordTokens + toolTokens
         }
     }
 
@@ -1039,6 +1093,10 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func restoreConversationState(_ state: any Qwen38FlashConversationStateProtocol) {
         restoreCount += 1
         lastRestoredLedger = state.ledger
+        // P13.3 : comme le moteur réel (`hasConversationHistory = state.
+        // hasConversationHistory`) — une conversation restaurée a forcément
+        // déjà un historique, jamais un cold start.
+        mockHasConversationHistory = true
     }
 }
 
@@ -4786,8 +4844,11 @@ func serverExtractsToolCallsWhenToolsFieldIsPresent() async throws {
     // Le point qui compte : "timeout" doit sortir en nombre, pas en chaîne.
     #expect(arguments["timeout"] as? Int == 30)
 
-    // Cette requête outillée n'a jamais dû toucher le cache de conversation
-    // Flash-Next (voir le rapport à Vincent) : aucune restauration.
+    // P13.2 : depuis le renversement de la décision de P13.1, cette requête
+    // outillée touche bien le cache de conversation (un seul tour
+    // système+utilisateur démarre normalement un cache à froid) — mais
+    // aucune RESTAURATION LRU n'a de raison de se produire ici (pas de
+    // conversation précédente à restaurer).
     #expect(mock.restoreCount == 0)
 }
 
@@ -4847,4 +4908,336 @@ func serverAcceptsToolRoleAsLastMessage() async throws {
     #expect(lastMessages.last?.role == .tool)
     #expect(lastMessages.last?.content == "42 fichiers")
     _ = data
+}
+
+/// P13.2 : reproduit la forme exacte de `Scripts/agent-loop.py` — deux tours
+/// HTTP successifs, sans `conversation_id`, le second renvoyant tout
+/// l'historique plus le résultat d'un outil (`role: "tool"`) — et vérifie
+/// que le cache de préfixe implicite (P6.1) reconnaît le second tour comme
+/// le prolongement exact du premier, alors que P13.1 excluait purement et
+/// simplement toute requête outillée de ce mécanisme.
+@Test("P13.2 : le second tour d'une boucle d'agent outillée réutilise le préfixe implicite du premier")
+func serverReusesImplicitPrefixAcrossAgentLoopTurns() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-tools-prefix-reuse-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+    let baseline = await server.snapshot()
+
+    let tools: [[String: Any]] = [
+        ["type": "function", "function": ["name": "run_command", "parameters": ["type": "object"]]]
+    ]
+
+    func post(_ body: [String: Any]) async throws -> [String: Any] {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(baseline.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    // Pas 0 : système + question, exactement comme `agent-loop.py`. Le
+    // modèle "génère" un appel d'outil, sans texte avant.
+    mock.scriptedContent =
+        "<tool_call>\n<function=run_command>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+    let turn0 = try await post([
+        "model": modelID,
+        "messages": [
+            ["role": "system", "content": "Tu es un agent avec accès à des outils."],
+            ["role": "user", "content": "Combien de fichiers dans le dépôt ?"],
+        ],
+        "tools": tools,
+    ])
+    let choice0 = try #require((turn0["choices"] as? [[String: Any]])?.first)
+    #expect(choice0["finish_reason"] as? String == "tool_calls")
+    let message0 = try #require(choice0["message"] as? [String: Any])
+    let toolCalls0 = try #require(message0["tool_calls"] as? [[String: Any]])
+    let content0 = message0["content"] as? String ?? ""
+
+    // Pas 1 : le client (l'agent) renvoie tout l'historique, plus le
+    // résultat de l'outil en dernière position (`role: "tool"`) — jamais de
+    // `conversation_id`, exactement le cas visé par P6.1/P13.2.
+    mock.scriptedContent = "Il y a 2 fichiers."
+    let turn1 = try await post([
+        "model": modelID,
+        "messages": [
+            ["role": "system", "content": "Tu es un agent avec accès à des outils."],
+            ["role": "user", "content": "Combien de fichiers dans le dépôt ?"],
+            ["role": "assistant", "content": content0, "tool_calls": toolCalls0],
+            [
+                "role": "tool",
+                "tool_call_id": toolCalls0.first?["id"] as? String ?? "",
+                "content": "2 fichiers",
+            ],
+        ],
+        "tools": tools,
+    ])
+    let choice1 = try #require((turn1["choices"] as? [[String: Any]])?.first)
+    #expect(choice1["finish_reason"] as? String == "stop")
+    #expect((choice1["message"] as? [String: Any])?["content"] as? String == "Il y a 2 fichiers.")
+
+    // Le point qui compte : le second tour a été reconnu comme le
+    // prolongement exact du premier par le cache de préfixe implicite —
+    // jamais par une restauration LRU (une seule conversation active de
+    // bout en bout, jamais évincée).
+    let after = await server.snapshot()
+    #expect(after.prefixHits - baseline.prefixHits == 1)
+    #expect(mock.restoreCount == 0)
+    // P13.3 : ce tour se termine par un message "tool" — la garde P13.2 qui
+    // le faisait repartir en rejeu complet n'est plus nécessaire.
+    // `dispatchConversationTurn` calcule maintenant le suffixe par
+    // différence de jetons (`Qwen4ExpPromptBuilder.continuationSuffix`,
+    // voir le rapport PLAN.md P13.3) : il continue via
+    // `continueConversationTurn`, jamais via `generateFromMessages`.
+    #expect(mock.continueConversationTurnCallCount == 1)
+    #expect(mock.lastContinueConversationTurnMessages?.count == 4)
+    #expect(mock.lastGenerateFromMessages == nil)
+}
+
+/// P13.2 : critère explicite de la tâche — un changement de la liste
+/// d'outils entre deux tours doit invalider la comparaison de préfixe,
+/// jamais produire une fausse réutilisation. `cacheOptionsCompatible`
+/// compare déjà `options.tools` ; ce test vérifie l'effet observable côté
+/// serveur (un manque, pas un succès, et aucune restauration).
+@Test("P13.2 : changer la liste d'outils entre deux tours invalide le cache de préfixe")
+func serverInvalidatesImplicitPrefixWhenToolsChange() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-tools-prefix-invalidate-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+    let baseline = await server.snapshot()
+
+    func post(_ body: [String: Any]) async throws -> [String: Any] {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(baseline.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    // Pas 0 : une conversation ordinaire (pas d'appel d'outil) avec un
+    // premier jeu d'outils déclarés.
+    mock.scriptedContent = "Bonjour !"
+    _ = try await post([
+        "model": modelID,
+        "messages": [
+            ["role": "system", "content": "Tu es un agent avec accès à des outils."],
+            ["role": "user", "content": "Salut"],
+        ],
+        "tools": [
+            ["type": "function", "function": ["name": "run_command", "parameters": ["type": "object"]]]
+        ],
+    ])
+
+    // Pas 1 : même transcript exact, mais une liste d'outils DIFFÉRENTE —
+    // le prolongement doit être un manque, jamais une réutilisation à tort
+    // de l'état d'une conversation qui ne connaissait pas cet outil.
+    mock.scriptedContent = "Toujours là."
+    _ = try await post([
+        "model": modelID,
+        "messages": [
+            ["role": "system", "content": "Tu es un agent avec accès à des outils."],
+            ["role": "user", "content": "Salut"],
+            ["role": "assistant", "content": "Bonjour !"],
+            ["role": "user", "content": "Tu es toujours là ?"],
+        ],
+        "tools": [
+            ["type": "function", "function": ["name": "read_file", "parameters": ["type": "object"]]]
+        ],
+    ])
+
+    let after = await server.snapshot()
+    #expect(after.prefixHits == baseline.prefixHits)
+    #expect(after.prefixMisses - baseline.prefixMisses == 2)
+    #expect(mock.restoreCount == 0)
+}
+
+// MARK: - P13.3 : suffixe de continuation par différence de jetons (logique pure, sans checkpoint)
+
+/// P13.3 : cas nominal — le contenu littéral déjà en cache
+/// (`priorRenderedTokenIDs` moins le bloc d'amorçage) est bien un préfixe de
+/// `fullRenderedTokenIDs`, donc le nouveau suffixe (le reste) est retourné
+/// tel quel — nouveau contenu ET bloc d'amorçage inclus, puisque c'est
+/// exactement ce qu'il faut donner au modèle pour qu'il continue à générer
+/// (le bloc d'amorçage n'était PAS encore dans le cache : seul le contenu
+/// avant lui l'était).
+@Test("P13.3 : continuationSuffix calcule le nouveau suffixe quand l'historique correspond")
+func continuationSuffixReturnsNewTokensWhenHistoryMatches() {
+    let generationPrompt: [Int32] = [900, 901]
+    let cached: [Int32] = [1, 2, 3, 4]
+    let newTokens: [Int32] = [5, 6, 7]
+    let prior = cached + generationPrompt
+    let full = cached + newTokens + generationPrompt
+    let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+        priorRenderedTokenIDs: prior, fullRenderedTokenIDs: full,
+        generationPromptTokenIDs: generationPrompt)
+    #expect(suffix == newTokens + generationPrompt)
+}
+
+/// P13.3 : critère explicite de la tâche — un historique divergent (un
+/// message plus tôt dans la conversation édité, ou une liste d'outils
+/// changée, qui affecte le rendu avant même le nouveau message) ne doit
+/// jamais produire une fausse réutilisation : `continuationSuffix` doit
+/// retourner `nil` dès que le contenu littéral du cache n'est plus un
+/// préfixe exact du rendu complet actuel.
+@Test("P13.3 : continuationSuffix refuse un historique divergent (rejeu complet requis)")
+func continuationSuffixRejectsDivergentHistory() {
+    let generationPrompt: [Int32] = [900, 901]
+    let cached: [Int32] = [1, 2, 3, 4]
+    let prior = cached + generationPrompt
+    // Le deuxième jeton du préfixe partagé a changé (message édité) : ce
+    // n'est plus le même historique, même si les deux rendus ont la même
+    // longueur de préfixe apparente.
+    let full: [Int32] = [1, 99, 3, 4, 5, 6, 7] + generationPrompt
+    let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+        priorRenderedTokenIDs: prior, fullRenderedTokenIDs: full,
+        generationPromptTokenIDs: generationPrompt)
+    #expect(suffix == nil)
+}
+
+/// P13.3 : garde de cohérence — si `priorRenderedTokenIDs` ne se termine
+/// même pas par le bloc d'amorçage attendu (options de rendu
+/// incompatibles entre les deux appels, ou bug amont), le calcul ne doit
+/// pas deviner un contenu de cache erroné : `nil`, jamais une longueur de
+/// préfixe inventée.
+@Test("P13.3 : continuationSuffix refuse quand le bloc d'amorçage attendu est absent")
+func continuationSuffixRejectsMissingGenerationPrompt() {
+    let generationPrompt: [Int32] = [900, 901]
+    // Se termine par un bloc différent de `generationPrompt`.
+    let prior: [Int32] = [1, 2, 3, 4, 111, 112]
+    let full: [Int32] = [1, 2, 3, 4, 5, 6, 7] + generationPrompt
+    let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+        priorRenderedTokenIDs: prior, fullRenderedTokenIDs: full,
+        generationPromptTokenIDs: generationPrompt)
+    #expect(suffix == nil)
+}
+
+/// P13.3 : rien de nouveau à préfiller (le rendu complet actuel est
+/// identique au rendu déjà en cache) doit retomber sur un rejeu complet
+/// plutôt que de lancer une continuation vide.
+@Test("P13.3 : continuationSuffix refuse un suffixe vide")
+func continuationSuffixRejectsEmptySuffix() {
+    let generationPrompt: [Int32] = [900, 901]
+    let cached: [Int32] = [1, 2, 3, 4]
+    let prior = cached + generationPrompt
+    let full = prior  // rien n'a été ajouté
+    let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+        priorRenderedTokenIDs: prior, fullRenderedTokenIDs: full,
+        generationPromptTokenIDs: generationPrompt)
+    #expect(suffix == nil)
+}
+
+/// P13.3 : `priorRenderedTokenIDs` plus court que le bloc d'amorçage lui-même
+/// (déjà couvert conceptuellement par le cas "bloc absent" ci-dessus, mais
+/// vérifié séparément : la garde de longueur doit se déclencher avant toute
+/// comparaison de suffixe, jamais un crash par index hors bornes).
+@Test("P13.3 : continuationSuffix refuse un rendu antérieur plus court que le bloc d'amorçage")
+func continuationSuffixRejectsPriorShorterThanGenerationPrompt() {
+    let generationPrompt: [Int32] = [900, 901, 902]
+    let prior: [Int32] = [900, 901]  // trop court pour contenir generationPrompt
+    let full: [Int32] = [1, 2, 3] + generationPrompt
+    let suffix = Qwen4ExpPromptBuilder.continuationSuffix(
+        priorRenderedTokenIDs: prior, fullRenderedTokenIDs: full,
+        generationPromptTokenIDs: generationPrompt)
+    #expect(suffix == nil)
+}
+
+/// P13.3 : quand le suffixe ne peut pas être calculé sûrement (ici simulé
+/// directement au niveau du moteur, `continuationSuffixUnavailable`), le
+/// serveur doit retomber PROPREMENT sur un rejeu complet
+/// (`generateFromMessages`) plutôt que de laisser la requête échouer ou
+/// produire un état incohérent — la requête reste un succès HTTP 200.
+@Test("P13.3 : le serveur retombe sur un rejeu complet quand le suffixe de continuation est indisponible")
+func serverFallsBackToStatelessReplayWhenContinuationSuffixUnavailable() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-continuation-fallback-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+    let baseline = await server.snapshot()
+
+    func post(_ body: [String: Any]) async throws -> [String: Any] {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(baseline.port)/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        #expect((response as? HTTPURLResponse)?.statusCode == 200)
+        return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    // Pas 0 : premier tour, cold start ordinaire.
+    mock.scriptedContent = "Bonjour !"
+    _ = try await post([
+        "model": modelID,
+        "messages": [["role": "user", "content": "Salut"]],
+    ])
+
+    // Pas 1 : le moteur (mock) simule un suffixe de continuation
+    // impossible à calculer sûrement — le serveur doit rattraper
+    // exactement cette erreur et rejouer la conversation en entier, jamais
+    // laisser la requête échouer ni continuer dans un état incohérent.
+    mock.continueConversationTurnError = Qwen38FlashNextEngineError.continuationSuffixUnavailable
+    mock.scriptedContent = "Toujours là."
+    let turn1 = try await post([
+        "model": modelID,
+        "messages": [
+            ["role": "user", "content": "Salut"],
+            ["role": "assistant", "content": "Bonjour !"],
+            ["role": "user", "content": "Tu es toujours là ?"],
+        ],
+    ])
+    let choice1 = try #require((turn1["choices"] as? [[String: Any]])?.first)
+    #expect((choice1["message"] as? [String: Any])?["content"] as? String == "Toujours là.")
+    // Le repli a bien eu lieu via `generateFromMessages` (rejeu complet),
+    // jamais une continuation devinée dans un état incohérent.
+    #expect(mock.lastGenerateFromMessages?.count == 3)
+
+    let after = await server.snapshot()
+    #expect(after.prefixHits - baseline.prefixHits == 1)
 }

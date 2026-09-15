@@ -559,6 +559,48 @@ public actor Qwen38Runtime {
         try flashEngine?.renderedTokenIDs(messages: messages, options: options)
     }
 
+    /// P13.3 : point d'entrée du serveur pour un tour de conversation
+    /// Flash-Next à cache persistant, une fois `prepareFlashConversation`
+    /// (via `Qwen38Server.prepareConversation`) déjà appelé pour CETTE
+    /// requête — l'engin résident est donc déjà dans l'état qu'il a établi
+    /// (conversation active confirmée, restaurée depuis le LRU, ou démarrée
+    /// à froid). Délibérément distinct de `generate(prompt:...)` : celui-ci
+    /// refait sa PROPRE préparation sous l'id interne partagé avec la GUI
+    /// ("gui", voir son commentaire) et reconstruit `messages` à partir de
+    /// son propre ledger interne — qui garde le XML brut d'un tour outillé,
+    /// jamais reparsé en `tool_calls` structurés. Cette méthode-ci prend
+    /// directement les `messages` du serveur (`Qwen38Server.prepare`, déjà
+    /// reconstruits avec les `tool_calls` structurés — voir
+    /// `rememberFlashConversation`'s commentaire P13.2), sans toucher au LRU
+    /// ni à aucun ledger : elle se contente de faire avancer l'engin résident
+    /// d'un tour. Le serveur reste seul responsable de mémoriser le résultat
+    /// après coup (`rememberFlashConversation`, avec le vrai `trackingID`).
+    ///
+    /// À la continuation, le nouveau suffixe de jetons est calculé par
+    /// différence entre deux rendus complets plutôt que reconstruit à la
+    /// main (`Qwen4ExpPromptBuilder.continuationSuffix`, via
+    /// `Qwen38FlashNextEngine.continueConversationTurn`) — ce qui couvre
+    /// n'importe quel rôle de dernier message, `tool` compris (voir le
+    /// rapport PLAN.md P13.3). Peut lever
+    /// `Qwen38FlashNextEngineError.continuationSuffixUnavailable` : c'est au
+    /// serveur de rattraper cette erreur précise et de retomber sur
+    /// `generateStateless` (rejeu complet), jamais de la laisser échouer la
+    /// requête.
+    public func generateFlashConversationTurn(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
+    ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        guard let flashEngine else { throw Qwen38RuntimeError.modelNotLoaded }
+        // P11.1/P11.2 : même contrat que `generate(prompt:...)` — appliqué
+        // avant de générer, jamais après.
+        if let requestedRoutedExpertCount = options.routedExpertCount {
+            try flashEngine.setRoutedExpertCount(requestedRoutedExpertCount)
+        }
+        if let requestedAblation = options.ablation {
+            flashEngine.setAblation(requestedAblation)
+        }
+        return try flashEngine.continueConversationTurn(messages: messages, options: options)
+    }
+
     /// P5.2: releases MLX's allocator cache after the server's LRU drops
     /// evicted conversation snapshots, so the device memory those
     /// `MLXArray`s held is actually returned to the system instead of
@@ -985,17 +1027,30 @@ public actor Qwen38Runtime {
     /// *next* turn for that id — explicit or, via P6.1's matching, implicit
     /// — can restore/continue instead of replaying again. See PLAN.md P5.2:
     /// "sinon rejeu et nouvel état après la réponse".
+    /// P13.2 : `assistantToolCalls` (par défaut vide, donc sans effet sur les
+    /// appelants existants) préserve la structure `tool_calls` du tour
+    /// assistant dans le ledger mémorisé — sans cela, un tour outillé était
+    /// mémorisé comme un simple `content` texte (le XML `<tool_call>` brut),
+    /// alors que le PROCHAIN tour reconstruit ce même tour depuis ce que le
+    /// client renvoie (`tool_calls[]` structuré, voir `Qwen38Server.prepare`
+    /// et `Qwen4ExpPromptBuilder.hfMessage`) : les deux représentations ne
+    /// rendent pas les mêmes jetons, ce qui aurait fait manquer à tort la
+    /// comparaison de préfixe (P6.1) sur le tour suivant — jamais une
+    /// mauvaise restauration (la comparaison se fait sur les jetons rendus,
+    /// jamais sur les structs), seulement un manque évitable. Voir le
+    /// rapport à Vincent (PLAN.md P13.2).
     public func rememberFlashConversation(
         id: String,
         model: String,
         requestMessages: [Qwen38ChatMessage],
         assistantContent: String,
+        assistantToolCalls: [Qwen38ToolCall] = [],
         options: Qwen38GenerationOptions
     ) {
+        let assistantMessage = Qwen38ChatMessage(
+            role: .assistant, content: assistantContent, toolCalls: assistantToolCalls)
         if activeConversationID == id, activeConversationModel == model {
-            activeConversationMessages = requestMessages + [
-                Qwen38ChatMessage(role: .assistant, content: assistantContent)
-            ]
+            activeConversationMessages = requestMessages + [assistantMessage]
             return
         }
         guard activeConversationID == nil,
@@ -1004,9 +1059,7 @@ public actor Qwen38Runtime {
         activeConversationID = id
         activeConversationModel = model
         activeConversationOptions = options
-        activeConversationMessages = requestMessages + [
-            Qwen38ChatMessage(role: .assistant, content: assistantContent)
-        ]
+        activeConversationMessages = requestMessages + [assistantMessage]
     }
 
     /// P6.4: write-through variant for the GUI. Unlike the LAN path (which

@@ -6104,3 +6104,69 @@ Le modèle **n'a pas conclu** dans les dix pas, alors qu'il avait lu au pas 3
 le fichier contenant la réponse. Ce n'est pas un problème de plomberie mais de
 conduite de tâche. À réexaminer une fois la lenteur corrigée, parce qu'un
 budget de pas coûtant 54 s chacun ne permet pas d'itérer sur la consigne.
+
+---
+
+## 2026-09-15 — P13.3 : le suffixe par différence, et la boucle d'agent devient ×5,6 plus rapide
+
+### Le déblocage tenait à une ligne de documentation
+
+`Qwen4ExpStreamingGenerationOptions.continueConversation` dit que
+`promptTokenIDs` **n'a besoin de porter que le nouveau suffixe** : le moteur
+ne connaît rien de la structure d'un tour, seulement des jetons bruts et un
+drapeau « garde le cache ». `buildContinuationTurn` n'était donc qu'une
+*façon* de produire ce suffixe, pas une exigence.
+
+D'où la méthode retenue, qui ne devine jamais le gabarit :
+`continuationSuffix` rend la conversation complète **avant** et **après** le
+nouveau message, retire le bloc d'amorçage de l'assistant du rendu antérieur
+(il n'est pas un préfixe du suivant, il est remplacé), vérifie que le reste
+est un préfixe **exact**, et renvoie la différence. Elle marche pour
+n'importe quel rôle, pas seulement `tool`.
+
+Cela a permis de **supprimer** la garde de P13.2 plutôt que d'ajouter du code :
+le chemin serveur n'utilise plus `buildContinuationTurn` du tout.
+
+### Cas dégradés
+
+`continuationSuffix` renvoie `nil` — jamais un état incohérent — si le bloc
+d'amorçage manque, si le préfixe littéral ne correspond plus (historique
+édité, outils changés), ou si rien n'est nouveau. Le serveur rattrape ce cas
+précis et retombe sur le rejeu complet, chemin déjà validé. La requête HTTP
+n'échoue jamais pour cette raison.
+
+### La mesure, même tâche, mêmes dix pas
+
+| pas | jetons à préfiller | TTFT | cache |
+|---:|---:|---:|---|
+| 0 | 565 | 5,22 s | non |
+| 1 | 3 193 | 22,83 s | non |
+| 2 | **22** | **0,65 s** | **oui** |
+| 4 | 1 304 | 10,18 s | oui |
+| 7 | **22** | **0,70 s** | **oui** |
+| 9 | 491 | 4,23 s | oui |
+
+| | avant | après | gain |
+|---|---:|---:|---:|
+| durée de la boucle | 683,7 s | **122,0 s** | **×5,6** |
+| préfill cumulé | 593 s | **74 s** | **×8,0** |
+| par pas | 68,4 s | **12,2 s** | |
+
+À partir du troisième pas, seul le nouveau contenu est préfillé — quelques
+dizaines de jetons quand le résultat d'outil est court, un millier quand
+c'est un fichier lu. C'est exactement le comportement attendu.
+
+### Ce qui reste
+
+**Le modèle ne conclut toujours pas** : onze appels, tous bien formés et
+valides, aucune réponse finale en dix pas, alors qu'il a lu le fichier
+contenant la réponse. Ce n'est pas de la plomberie, c'est de la conduite de
+tâche. Avec des pas à 12 s au lieu de 68, on peut désormais itérer sur la
+consigne et sur le budget de pas, ce qui était impossible avant.
+
+*Incident de méthode à noter* : deux agents ont édité l'arbre de travail en
+même temps, le premier ayant rendu son rapport mais continuant de tourner en
+tâche de fond. Le premier s'en est aperçu, a jugé l'approche du second
+meilleure, a retiré sa propre tentative et l'a signalé. Vérifié après coup :
+aucune trace résiduelle, compilation et 195 tests verts. **Arrêter un agent
+avant d'en lancer un second sur les mêmes fichiers.**
