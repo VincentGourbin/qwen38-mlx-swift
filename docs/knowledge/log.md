@@ -6271,3 +6271,53 @@ et il conclut correctement quand la question a une réponse. Les deux
 conditions à respecter sont désormais connues et mesurées — **la réflexion
 doit être active**, et le cache de préfixe doit fonctionner, sans quoi un pas
 coûte 68 s au lieu de 12.
+
+---
+
+## 2026-09-15 — Claude Code envoie 31 700 jetons d'outils, et notre préfill met 12 minutes
+
+### Ce que Claude Code envoie vraiment
+
+Capturé en pointant `ANTHROPIC_BASE_URL` vers un serveur d'enregistrement
+(détail structurel dans `docs/reference/claude-code-wire-format.md`) :
+`POST /v1/messages?beta=true`, `stream: true` **toujours**, `system` en liste
+de blocs, et **59 outils déclarés**, soit **126 775 caractères ≈ 31 700
+jetons de schémas dans chaque requête**.
+
+### Le coût, mesuré
+
+| jetons de prompt | TTFT | préfill | nature du contenu |
+|---:|---:|---:|---|
+| 636 | 5,5 s | 115 t/s | texte **répété** |
+| 3 084 | 23,1 s | 133 t/s | répété |
+| 16 855 | 135,3 s | 125 t/s | répété |
+| 3 159 | 36,6 s | **86 t/s** | **varié** (code source réel) |
+| 9 979 | 116,2 s | **86 t/s** | varié |
+| 29 541 | 668,0 s | **44 t/s** | varié |
+| 29 290 | 717,3 s | 41 t/s | schémas d'outils réels |
+
+**Deux effets, tous deux réels.**
+
+1. **Le contenu varié coûte ~35 % de plus** que du texte répété (86 contre
+   115-138 t/s). C'est le prix des lectures de la table n-gram, que le projet
+   avait déjà identifié — et je suis tombé dans le même piège en construisant
+   ma première courbe par **répétition d'un paragraphe**, ce qui rendait ces
+   lectures gratuites et donnait une courbe plate, flatteuse et fausse. Le
+   journal notait déjà que « les 87-190 t/s d'avant venaient de prompts
+   répétitifs ». **À ne plus jamais refaire : un corpus de mesure de préfill
+   doit être varié.**
+2. **Au-delà de ~10 000 jetons, le débit est divisé par deux** (86 → 44 t/s
+   entre 10 k et 30 k). Ce n'est pas le budget de 2 048 jetons de la sélection
+   éparse QSA, puisque les points à 3 k et 10 k sont déjà au-dessus et restent
+   plats. Cause non identifiée.
+
+### Conséquence pour Claude Code
+
+**Environ 12 minutes avant le premier jeton**, au premier tour d'une session.
+Le cache de préfixe amortit ensuite, tant que la liste d'outils ne change pas
+— mais elle change dès qu'un serveur MCP est branché ou débranché.
+
+Et ce n'est pas notre plomberie qui est en cause : même à 138 t/s, le
+meilleur débit jamais mesuré ici, 31 700 jetons coûteraient encore
+**3,8 minutes**. **La charge d'outils de Claude Code est la contrainte, pas le
+serveur.**
