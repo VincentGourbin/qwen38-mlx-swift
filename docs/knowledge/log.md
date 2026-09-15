@@ -6236,3 +6236,38 @@ reproduit exactement le symptôme.
 | la séquence qui donnait 500 | **200**, réponse cohérente |
 | `messages: []` | **400** avec `{"error":{"type":"invalid_request_error","message":"La requête doit contenir au moins un message."}}` |
 | clé d'API invalide sur `/v1/models` | non concluant — le serveur tournait sans `--api-key`, il n'y avait rien à refuser |
+
+---
+
+## 2026-09-15 — P13.2 conclue : deux tâches sur trois, et la troisième était mal posée
+
+Trois tâches d'exploration du dépôt, réflexion active, budget de 16 pas.
+
+| tâche | pas | appels | bien formés | aboutie | réponse |
+|---|---:|---:|---:|---|---|
+| 1 — nom du type du cache K/V de l'attention pleine | 4 | 5 | 5/5 | ✅ | **`Qwen4ExpQSAKVCache`** — exacte |
+| 2 — nombre de niveaux de fusion et défaut de production | 6 | 5 | 5/5 | ✅ | **10 cas, dont 9 niveaux F1-F9 plus `.none`** — exacte, et il relève de lui-même que F3 était réservé et jamais implémenté |
+| 3 — option de réglage des experts routés et son défaut | 16 | 19 | 19/19 | ❌ | aucune |
+
+**Format : 29 appels sur 29 bien formés et valides, sur les trois tâches.**
+Zéro appel malformé depuis le début de §P13, toutes exécutions confondues.
+
+### La tâche 3 était mal posée, et c'est moi qui l'ai écrite
+
+Elle demande « quelle est sa valeur par défaut ». Or `--routed-experts` est
+déclarée `var routedExperts: Int?` : **son défaut n'est pas un littéral**,
+c'est `nil`, qui signifie « prendre la valeur du checkpoint ». Le modèle a
+donc cherché seize pas durant un nombre qui n'existe pas dans le code. Ce
+n'est pas un échec de raisonnement mais une question sans réponse littérale.
+
+À retenir pour toute évaluation future : **une tâche d'évaluation doit avoir
+une réponse vérifiable dans le code**, sinon on mesure la ténacité du modèle
+face à une impasse, pas sa compétence.
+
+### Verdict de P13.2
+
+Le modèle local **peut** piloter une boucle d'outils : format irréprochable,
+et il conclut correctement quand la question a une réponse. Les deux
+conditions à respecter sont désormais connues et mesurées — **la réflexion
+doit être active**, et le cache de préfixe doit fonctionner, sans quoi un pas
+coûte 68 s au lieu de 12.
