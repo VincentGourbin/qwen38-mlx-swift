@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "Qwen38Core", targets: ["Qwen38Core"]),
         .library(name: "Qwen38Server", targets: ["Qwen38Server"]),
+        .library(name: "Qwen38Agent", targets: ["Qwen38Agent"]),
         .executable(name: "qwen38", targets: ["Qwen38CLI"]),
         .executable(name: "qwen38-bench-ui", targets: ["Qwen38BenchUI"]),
     ],
@@ -51,13 +52,22 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
+        // Panneau Agent (GUI) : garde de chemin, troncature des sorties
+        // d'outils et machine à états de la boucle, en Foundation pur — sans
+        // AppKit/SwiftUI ni MLX — pour rester testable sans checkpoint ni
+        // réseau (Tests/Qwen38Tests). Le client HTTP qui parle au serveur
+        // vit dans Qwen38BenchUI, pas ici : ce module ne fait aucun appel
+        // réseau lui-même.
+        .target(
+            name: "Qwen38Agent"
+        ),
         .executableTarget(
             name: "Qwen38BenchUI",
-            dependencies: ["Qwen38Core", "Qwen38Server"]
+            dependencies: ["Qwen38Core", "Qwen38Server", "Qwen38Agent"]
         ),
         .testTarget(
             name: "Qwen38Tests",
-            dependencies: ["Qwen38Core", "Qwen38Server"]
+            dependencies: ["Qwen38Core", "Qwen38Server", "Qwen38Agent"]
         ),
     ]
 )

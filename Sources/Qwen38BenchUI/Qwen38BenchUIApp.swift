@@ -582,11 +582,18 @@ struct ContentView: View {
             Picker("Vue", selection: $selectedTab) {
                 Label("Chat", systemImage: "bubble.left.and.bubble.right").tag(0)
                 Label("Serveur", systemImage: "network").tag(1)
+                Label("Agent", systemImage: "wand.and.stars").tag(2)
             }
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 320)
             .padding(.vertical, 9)
-            if selectedTab == 0 { chatLayout } else { ServerView(model: model) }
+            if selectedTab == 0 {
+                chatLayout
+            } else if selectedTab == 1 {
+                ServerView(model: model)
+            } else {
+                AgentPanelView(model: model)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .frame(minWidth: 980, minHeight: 680, alignment: .top)
