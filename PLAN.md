@@ -4571,3 +4571,56 @@ suit.
 **Ordre imposé** : P12.1 seule décide de la suite. Tant que sa mesure n'est pas
 rendue, ni P12.2 ni P12.3 ne sont engagées — l'ordonnanceur est la plus grosse
 pièce de code du projet et il ne se justifie que si la physique suit.
+
+---
+
+### P13 — Coder depuis Claude Code et OpenCode avec le modèle local — plan du 2026-09-15
+
+**L'objectif.** Que Flash-Next serve d'assistant de code dans Claude Code et
+OpenCode, comme le fait `ollama launch claude --model …`.
+
+**Le mécanisme, vérifié le 2026-09-15.** Il n'existe aucun système de greffons :
+le fournisseur **se fait passer pour l'API du client**. Ollama écrit
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` et
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` puis lance `claude` — les six
+variables sont littéralement dans son binaire. Claude Code, pointé vers un
+serveur espion, envoie alors ses requêtes sur **`/v1/messages?beta=true`**,
+en-tête `anthropic-version: 2023-06-01`, corps au format Messages avec blocs de
+contenu typés. Ollama sert cette route en plus de `/v1/chat/completions`, avec
+des erreurs au format Anthropic. Pour Codex et OpenCode c'est `OPENAI_BASE_URL`,
+pour Copilot `COPILOT_PROVIDER_BASE_URL` et son `_WIRE_API`.
+
+**Notre point de départ.** `Qwen38Server` n'expose que `/v1/chat/completions`
+et **ignore complètement les outils** : `tools: nil` est codé en dur dans
+`Qwen4ExpPromptBuilder`, et `ChatCompletionRequest` n'a pas de champ `tools`.
+
+**La bonne nouvelle, mesurée.** Le gabarit du checkpoint gère les outils, et le
+modèle sait s'en servir. Format **XML, pas JSON** — piège à ne pas manquer :
+
+```
+<tool_call>
+<function=run_command>
+<parameter=command>
+swift build
+</parameter>
+<parameter=timeout>
+300
+</parameter>
+</function>
+</tool_call>
+```
+
+Testé sur quatre cas (lecture de fichier, commande shell, deux paramètres dont
+un entier, et une question sans outil) : **4/4 bien formés**, et sur le
+quatrième il répond normalement au lieu de forcer un appel. Le modèle n'est
+donc pas le facteur limitant.
+
+| # | Étape | Porte de sortie |
+|---|---|---|
+| **P13.1** | **Outils au format OpenAI**, puisque le serveur parle déjà cette API. Accepter `tools` dans la requête et le passer à `applyChatTemplate(tools:)` ; analyser la sortie XML `<tool_call>` du modèle en `tool_calls` OpenAI ; accepter en retour les messages `role: "tool"`. Diffusion comprise. | Un aller-retour complet outil → résultat → réponse finale, en non-stream **et** en stream. |
+| **P13.2** | **Brancher OpenCode** sur le serveur via `OPENAI_BASE_URL`, et mesurer sur une vraie tâche du dépôt. | **Taux d'appels d'outils bien formés** sur une tâche réelle, et la tâche aboutit-elle. C'est le seul critère qui compte. |
+| **P13.3** | **Route `/v1/messages`** pour Claude Code : traduction Messages ↔ interne (prompt système en champ racine, `max_tokens` obligatoire, réponse en blocs, flux à événements nommés, blocs `tool_use`/`tool_result`), plus les en-têtes attendus. | Claude Code mène une tâche de bout en bout contre le serveur local. |
+| **P13.4** | Confort : un script qui pose les variables d'environnement et lance le client, à la manière d'`ollama launch`. | `Scripts/launch-with-local.sh claude` et `… opencode`. |
+
+**Ordre imposé** : P13.1 puis P13.2. Si le taux d'appels bien formés sur une
+tâche réelle s'effondre, inutile d'écrire la route Anthropic — on l'écrit.
