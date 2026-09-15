@@ -6052,3 +6052,55 @@ restitue exactement — c'était donc son choix, pas un défaut de plomberie.
   `tool`, sans quoi tout second tour outillé partait en 400.
 - `tool_choice` est accepté, mais seul `"none"` a un effet réel : le gabarit
   n'a aucune notion de forçage d'un outil précis.
+
+---
+
+## 2026-09-15 — P13.2 : le format est parfait, le cache de préfixe est le vrai problème
+
+Boucle d'agent minimale (`Scripts/agent-loop.py`) : quatre outils en lecture
+seule sur le dépôt, une question dont la réponse est dans le code, budget de
+dix pas.
+
+### Ce qui marche : le format, sans une seule faute
+
+| | |
+|---|---|
+| appels émis | 11 |
+| **bien formés** | **11 / 11** |
+| **valides** (outil connu, paramètres requis présents) | **11 / 11** |
+| tours sans appel d'outil | 0 |
+
+Le modèle a enchaîné `grep`, `read_file` et `list_files` sans jamais produire
+un appel malformé, avec des motifs de recherche pertinents. **Le format n'est
+pas le facteur limitant.**
+
+### Ce qui ne marche pas : 86 % du temps part en préfill
+
+| pas | jetons de prompt | TTFT | cache réutilisé |
+|---:|---:|---:|---|
+| 0 | 21 | 0,58 s | non |
+| 2 | 3 181 | 23,91 s | non |
+| 5 | 5 836 | 47,81 s | non |
+| 8 | 7 625 | 71,51 s | non |
+| 10 | 9 059 | **81,95 s** | non |
+
+**466 s de préfill sur 541 s de boucle.** Le transcript est réintégralement
+reprocessé à chaque tour, et le coût croît linéairement avec sa taille.
+
+**La cause est un choix de conception de P13.1** : une requête portant `tools`
+court-circuite le cache de préfixe et le LRU de conversations. C'était
+défendable pour la simplicité, mais c'est exactement à l'envers pour une
+boucle d'agent — le cas d'usage même de ces outils. Chaque pas n'ajoute que
+quelques centaines de jetons **à la fin** d'un prompt par ailleurs identique :
+c'est le cas idéal du cache de préfixe implicite (P6.1), qui compare les
+identifiants de jetons rendus.
+
+Ordre de grandeur du gain attendu : la boucle passerait de 541 s à environ
+75 s, soit **×7**.
+
+### L'autre limite, à ne pas confondre
+
+Le modèle **n'a pas conclu** dans les dix pas, alors qu'il avait lu au pas 3
+le fichier contenant la réponse. Ce n'est pas un problème de plomberie mais de
+conduite de tâche. À réexaminer une fois la lenteur corrigée, parce qu'un
+budget de pas coûtant 54 s chacun ne permet pas d'itérer sur la consigne.
