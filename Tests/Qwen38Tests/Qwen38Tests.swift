@@ -901,18 +901,28 @@ private final class MockFlashNextEngine: Qwen38FlashNextEngineProtocol, @uncheck
     func decode(tokenIDs: [Int32]) -> String { "mock" }
     func warmUp() -> AsyncStream<Int> { AsyncStream { $0.finish() } }
 
+    /// P13.1 : un test bout-en-bout du serveur peut scripter le texte que
+    /// le moteur "génère" — que la requête ait pris le chemin chaud
+    /// (`generate`, cache de conversation) ou le chemin stateless
+    /// (`generateFromMessages`, toujours emprunté par une requête outillée,
+    /// voir `Qwen38InferenceServer`) — pour vérifier l'extraction des
+    /// `<tool_call>` côté serveur sans checkpoint réel.
+    var scriptedContent: String?
+    private(set) var lastGenerateFromMessages: [Qwen38ChatMessage]?
+
     func generate(
         prompt: String, systemPrompt: String?, imageURLs: [URL], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateOptions = options
-        return Self.makeCompletedStream()
+        return Self.makeCompletedStream(content: scriptedContent ?? "mock")
     }
 
     func generateFromMessages(
         messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions
     ) throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         lastGenerateFromMessagesOptions = options
-        return Self.makeCompletedStream()
+        lastGenerateFromMessages = messages
+        return Self.makeCompletedStream(content: scriptedContent ?? "mock")
     }
 
     /// P12.3 : imite `Qwen38FlashNextEngine.generateBatch` sans lot MLX réel
@@ -4487,4 +4497,354 @@ func batchGeneratorRowIsolationSurvivesGroupedSampling() async throws {
     #expect(batchTokens[0] == soloTokens)
     // Et B (contenu différent) ne dérive pas vers la sortie de A.
     #expect(batchTokens[1] != batchTokens[0])
+}
+
+// MARK: - P13.1 : appel d'outils au format OpenAI (logique pure, sans checkpoint)
+
+@Test("P13.1 : un <tool_call> simple à un paramètre est reconnu")
+func toolCallParserRecognizesSimpleCall() {
+    let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nswift build\n</parameter>\n</function>\n</tool_call>"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.content.isEmpty)
+    #expect(parsed.calls.count == 1)
+    #expect(parsed.calls[0].name == "run_command")
+    #expect(parsed.calls[0].parameters == [Qwen38ToolCallParameter(name: "command", rawValue: "swift build")])
+}
+
+@Test("P13.1 : un <tool_call> à plusieurs paramètres, dont un entier, est reconnu dans l'ordre")
+func toolCallParserRecognizesMultipleParameters() {
+    let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nswift build\n</parameter>\n<parameter=timeout>\n300\n</parameter>\n</function>\n</tool_call>"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.calls.count == 1)
+    #expect(parsed.calls[0].parameters.map(\.name) == ["command", "timeout"])
+    #expect(parsed.calls[0].parameters.map(\.rawValue) == ["swift build", "300"])
+}
+
+@Test("P13.1 : plusieurs <tool_call> consécutifs sont tous reconnus")
+func toolCallParserRecognizesMultipleCalls() {
+    let text = """
+        <tool_call>
+        <function=read_file>
+        <parameter=path>
+        PLAN.md
+        </parameter>
+        </function>
+        </tool_call>
+        <tool_call>
+        <function=run_command>
+        <parameter=command>
+        ls
+        </parameter>
+        </function>
+        </tool_call>
+        """
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.calls.count == 2)
+    #expect(parsed.calls[0].name == "read_file")
+    #expect(parsed.calls[1].name == "run_command")
+}
+
+@Test("P13.1 : du texte libre avant l'appel est conservé dans content, jamais perdu")
+func toolCallParserKeepsLeadingText() {
+    let text = "Je vais lancer le build.\n<tool_call>\n<function=run_command>\n<parameter=command>\nswift build\n</parameter>\n</function>\n</tool_call>"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.content == "Je vais lancer le build.\n")
+    #expect(parsed.calls.count == 1)
+}
+
+@Test("P13.1 : un <tool_call> tronqué par max_tokens n'est jamais un appel malformé — il reste du texte")
+func toolCallParserNeverEmitsMalformedCallOnTruncation() {
+    // Coupé en plein milieu d'un paramètre — exactement la forme d'une
+    // génération arrêtée par max_tokens avant la fermeture de </tool_call>.
+    let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nswift bui"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.calls.isEmpty)
+    #expect(parsed.content == text)
+}
+
+@Test("P13.1 : un </function> manquant à l'intérieur d'un <tool_call> fermé reste du texte, jamais un appel deviné")
+func toolCallParserNeverGuessesAMissingFunctionClose() {
+    let text = "<tool_call>\n<function=run_command>\n<parameter=command>\nls\n</parameter>\n</tool_call>"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.calls.isEmpty)
+    #expect(parsed.content == text)
+}
+
+@Test("P13.1 : une valeur de paramètre multi-ligne contenant des chevrons (du code) ne casse pas le parseur")
+func toolCallParserHandlesMultilineValueWithAngleBrackets() {
+    let code = "for i in range(10):\n    if i < 5 and i > 0:\n        print(i)"
+    let text = "<tool_call>\n<function=run_python>\n<parameter=code>\n\(code)\n</parameter>\n</function>\n</tool_call>"
+    let parsed = Qwen38ToolCallParser.parse(text)
+    #expect(parsed.calls.count == 1)
+    #expect(parsed.calls[0].parameters == [Qwen38ToolCallParameter(name: "code", rawValue: code)])
+}
+
+@Test("P13.1 : le typage suit le schéma JSON déclaré — entier, nombre, booléen, tableau, chaîne par défaut")
+func toolArgumentTyperTypesPerSchema() {
+    let schema = Qwen38JSONValue.object([
+        "type": .string("object"),
+        "properties": .object([
+            "timeout": .object(["type": .string("integer")]),
+            "ratio": .object(["type": .string("number")]),
+            "verbose": .object(["type": .string("boolean")]),
+            "files": .object(["type": .string("array")]),
+            "label": .object(["type": .string("string")]),
+        ]),
+    ])
+    let parameters = [
+        Qwen38ToolCallParameter(name: "timeout", rawValue: "300"),
+        Qwen38ToolCallParameter(name: "ratio", rawValue: "0.5"),
+        Qwen38ToolCallParameter(name: "verbose", rawValue: "true"),
+        Qwen38ToolCallParameter(name: "files", rawValue: "[\"a.txt\",\"b.txt\"]"),
+        Qwen38ToolCallParameter(name: "label", rawValue: "release"),
+        Qwen38ToolCallParameter(name: "unknown", rawValue: "whatever"),
+    ]
+    let typed = Qwen38ToolArgumentTyper.typedArguments(parameters, schema: schema)
+    guard case .object(let fields) = typed else { Issue.record("attendu un objet"); return }
+    #expect(fields["timeout"] == .int(300))
+    #expect(fields["ratio"] == .double(0.5))
+    #expect(fields["verbose"] == .bool(true))
+    #expect(fields["files"] == .array([.string("a.txt"), .string("b.txt")]))
+    #expect(fields["label"] == .string("release"))
+    // Pas de schéma pour ce paramètre : repli sur la chaîne, jamais deviné.
+    #expect(fields["unknown"] == .string("whatever"))
+}
+
+@Test("P13.1 : une valeur qui ne respecte pas le type déclaré retombe sur la chaîne plutôt que de planter")
+func toolArgumentTyperFallsBackToStringOnMismatch() {
+    let schema = Qwen38JSONValue.object([
+        "properties": .object(["count": .object(["type": .string("integer")])])
+    ])
+    let typed = Qwen38ToolArgumentTyper.typedArguments(
+        [Qwen38ToolCallParameter(name: "count", rawValue: "beaucoup")], schema: schema)
+    guard case .object(let fields) = typed else { Issue.record("attendu un objet"); return }
+    #expect(fields["count"] == .string("beaucoup"))
+}
+
+@Test("P13.1 : Qwen38JSONValue fait l'aller-retour parse/toJSONString")
+func jsonValueRoundTrips() throws {
+    let text = #"{"a":1,"b":[true,null,"x"],"c":{"d":2.5}}"#
+    let value = try Qwen38JSONValue.parse(text)
+    guard case .object(let fields) = value else { Issue.record("attendu un objet"); return }
+    #expect(fields["a"] == .int(1))
+    #expect(fields["b"] == .array([.bool(true), .null, .string("x")]))
+    // Ré-encodé, ré-analysé : la structure (clés triées) doit être stable.
+    let reparsed = try Qwen38JSONValue.parse(value.toJSONString())
+    #expect(reparsed == value)
+}
+
+@Test("P13.1 : Qwen38ToolSpec.toolSpecDictionary reprend la forme OpenAI tools[]")
+func toolSpecDictionaryMatchesOpenAIShape() throws {
+    let spec = Qwen38ToolSpec(
+        name: "run_command", description: "Exécute une commande shell.",
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object(["command": .object(["type": .string("string")])]),
+        ]))
+    let dict = spec.toolSpecDictionary
+    #expect(dict["type"] as? String == "function")
+    let function = try #require(dict["function"] as? [String: any Sendable])
+    #expect(function["name"] as? String == "run_command")
+    #expect(function["description"] as? String == "Exécute une commande shell.")
+    #expect(function["parameters"] is [String: any Sendable])
+}
+
+@Test("P13.1 : hfMessage rend les tool_calls d'un tour assistant avec des arguments objet, pas une chaîne")
+func hfMessageRendersAssistantToolCallsAsArgumentObject() throws {
+    let message = Qwen38ChatMessage(
+        role: .assistant, content: "",
+        toolCalls: [Qwen38ToolCall(id: "call_1", name: "run_command", argumentsJSON: #"{"command":"ls","timeout":300}"#)])
+    let rendered = Qwen4ExpPromptBuilder.hfMessage(from: message)
+    #expect(rendered["role"] as? String == "assistant")
+    let toolCalls = try #require(rendered["tool_calls"] as? [[String: any Sendable]])
+    #expect(toolCalls.count == 1)
+    #expect(toolCalls[0]["id"] as? String == "call_1")
+    let function = try #require(toolCalls[0]["function"] as? [String: any Sendable])
+    #expect(function["name"] as? String == "run_command")
+    // Le point qui casserait le rendu du gabarit (`|items` sur une chaîne) :
+    // `arguments` doit être un dictionnaire, jamais la chaîne JSON du fil
+    // OpenAI.
+    let arguments = try #require(function["arguments"] as? [String: any Sendable])
+    #expect(arguments["command"] as? String == "ls")
+    #expect(arguments["timeout"] as? Int == 300)
+}
+
+@Test("P13.1 : hfMessage rend un message tool avec son contenu, sans exiger d'identifiant")
+func hfMessageRendersToolRole() {
+    let message = Qwen38ChatMessage(role: .tool, content: "42 fichiers")
+    let rendered = Qwen4ExpPromptBuilder.hfMessage(from: message)
+    #expect(rendered["role"] as? String == "tool")
+    #expect(rendered["content"] as? String == "42 fichiers")
+}
+
+@Test("P13.1 : sans tools, un aller-retour serveur est bit-identique — aucun tool_calls, aucun </tool_call> extrait")
+func serverLeavesResponseUnchangedWithoutToolsField() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-tools-off-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    // Le mock "génère" un texte qui contiendrait, par hasard, un
+    // <tool_call> — sans `tools` dans la requête, il ne doit JAMAIS être
+    // analysé : critère PLAN.md P13.1.
+    mock.scriptedContent =
+        "<tool_call>\n<function=run_command>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "messages": [["role": "user", "content": "salut"]],
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    let decoded = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let choices = try #require(decoded["choices"] as? [[String: Any]])
+    let message = try #require(choices[0]["message"] as? [String: Any])
+    #expect(message["content"] as? String == mock.scriptedContent)
+    #expect(message["tool_calls"] == nil)
+    #expect(choices[0]["finish_reason"] as? String == "stop")
+}
+
+@Test("P13.1 : avec tools, un <tool_call> du modèle devient un tool_calls OpenAI correctement typé")
+func serverExtractsToolCallsWhenToolsFieldIsPresent() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-tools-on-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    mock.scriptedContent =
+        "Je vais lister le répertoire.\n<tool_call>\n<function=run_command>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>"
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "messages": [["role": "user", "content": "liste le répertoire"]],
+        "tools": [
+            [
+                "type": "function",
+                "function": [
+                    "name": "run_command",
+                    "description": "Exécute une commande shell.",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "command": ["type": "string"],
+                            "timeout": ["type": "integer"],
+                        ],
+                    ],
+                ],
+            ]
+        ],
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    let decoded = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let choices = try #require(decoded["choices"] as? [[String: Any]])
+    #expect(choices[0]["finish_reason"] as? String == "tool_calls")
+    let message = try #require(choices[0]["message"] as? [String: Any])
+    #expect(message["content"] as? String == "Je vais lister le répertoire.\n")
+    let toolCalls = try #require(message["tool_calls"] as? [[String: Any]])
+    #expect(toolCalls.count == 1)
+    let function = try #require(toolCalls[0]["function"] as? [String: Any])
+    #expect(function["name"] as? String == "run_command")
+    let argumentsText = try #require(function["arguments"] as? String)
+    let arguments = try #require(
+        try JSONSerialization.jsonObject(with: Data(argumentsText.utf8)) as? [String: Any])
+    #expect(arguments["command"] as? String == "ls -la")
+    // Le point qui compte : "timeout" doit sortir en nombre, pas en chaîne.
+    #expect(arguments["timeout"] as? Int == 30)
+
+    // Cette requête outillée n'a jamais dû toucher le cache de conversation
+    // Flash-Next (voir le rapport à Vincent) : aucune restauration.
+    #expect(mock.restoreCount == 0)
+}
+
+@Test("P13.1 : un message role tool en dernière position est accepté (pas de 400)")
+func serverAcceptsToolRoleAsLastMessage() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-tool-role-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    mock.scriptedContent = "Il y a 42 fichiers."
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID,
+        "tools": [
+            [
+                "type": "function",
+                "function": ["name": "run_command", "parameters": ["type": "object"]],
+            ]
+        ],
+        "messages": [
+            ["role": "user", "content": "combien de fichiers ?"],
+            [
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    [
+                        "id": "call_1", "type": "function",
+                        "function": ["name": "run_command", "arguments": "{\"command\":\"ls\"}"],
+                    ]
+                ],
+            ],
+            ["role": "tool", "tool_call_id": "call_1", "content": "42 fichiers"],
+        ],
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    // Le rendu final atteint bien le moteur (pas de rejet en amont) — la
+    // dernière liste de messages transmise doit porter le tour tool.
+    let lastMessages = try #require(mock.lastGenerateFromMessages)
+    #expect(lastMessages.last?.role == .tool)
+    #expect(lastMessages.last?.content == "42 fichiers")
+    _ = data
 }

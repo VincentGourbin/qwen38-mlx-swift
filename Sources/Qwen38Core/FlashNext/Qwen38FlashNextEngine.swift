@@ -471,12 +471,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         guard messages.allSatisfy({ $0.imageURLs.isEmpty }) else {
             throw Qwen38FlashNextEngineError.statelessImagesUnsupported
         }
-        let hfMessages: [Tokenizers.Message] = messages.map {
-            ["role": $0.role.rawValue, "content": $0.content]
-        }
+        let hfMessages = messages.map(Qwen4ExpPromptBuilder.hfMessage(from:))
         let built = try Qwen4ExpPromptBuilder.buildFromMessages(
             tokenizer: tokenizer, messages: hfMessages, thinking: options.enableThinking,
-            reasoningEffort: options.reasoningEffort)
+            reasoningEffort: options.reasoningEffort,
+            tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
         return built.tokenIDs
     }
 
@@ -503,12 +502,11 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
             throw Qwen38FlashNextEngineError.statelessImagesUnsupported
         }
         resetConversation()
-        let hfMessages: [Tokenizers.Message] = messages.map {
-            ["role": $0.role.rawValue, "content": $0.content]
-        }
+        let hfMessages = messages.map(Qwen4ExpPromptBuilder.hfMessage(from:))
         let built = try Qwen4ExpPromptBuilder.buildFromMessages(
             tokenizer: tokenizer, messages: hfMessages, thinking: options.enableThinking,
-            reasoningEffort: options.reasoningEffort)
+            reasoningEffort: options.reasoningEffort,
+            tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
         hasConversationHistory = true
         return try runGenerationStream(
             built: built, options: options, continueConversation: false,
@@ -534,9 +532,12 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         resetConversation()
 
         let built = try requests.map { request -> Qwen4ExpBuiltPrompt in
-            let hfMessages: [Tokenizers.Message] = request.messages.map {
-                ["role": $0.role.rawValue, "content": $0.content]
-            }
+            let hfMessages = request.messages.map(Qwen4ExpPromptBuilder.hfMessage(from:))
+            // P13.1 : `tools` n'est délibérément jamais transmis ici — le
+            // serveur n'aiguille jamais une requête porteuse d'outils vers
+            // ce chemin de lot (voir `Qwen38InferenceServer.
+            // chatCompletionsResponseBatched`, garde `requestedTools.
+            // isEmpty` sur `isEligibleForBatching`).
             return try Qwen4ExpPromptBuilder.buildFromMessages(
                 tokenizer: tokenizer, messages: hfMessages,
                 thinking: request.options.enableThinking,

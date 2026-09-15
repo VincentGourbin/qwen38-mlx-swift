@@ -155,7 +155,22 @@ public enum Qwen38ModelCatalog {
 
 private struct ChatCompletionRequest: Codable, Sendable {
     let model: String?; let messages: [ChatCompletionMessage]; let stream: Bool?; let maxTokens: Int?; let maxCompletionTokens: Int?; let temperature: Float?; let topP: Float?; let presencePenalty: Float?; let frequencyPenalty: Float?; let reasoningEffort: String?; let reasoning: ChatCompletionReasoning?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let routedExperts: Int?; let ablation: String?; let extra: ChatCompletionExtra?
-    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", routedExperts = "routed_experts", ablation, extra }
+    /// P13.1 : outils au format OpenAI (`{"type":"function","function":{name,description,parameters}}`)
+    /// et le sélecteur associé — voir `effectiveTools`.
+    let tools: [ChatCompletionRequestTool]?
+    let toolChoice: Qwen38JSONValue?
+    enum CodingKeys: String, CodingKey { case model, messages, stream, maxTokens = "max_tokens", maxCompletionTokens = "max_completion_tokens", temperature, topP = "top_p", presencePenalty = "presence_penalty", frequencyPenalty = "frequency_penalty", reasoningEffort = "reasoning_effort", reasoning, enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", routedExperts = "routed_experts", ablation, extra, tools, toolChoice = "tool_choice" }
+
+    /// P13.1 : liste normalisée — vide si `tools` est absent/vide ou si
+    /// `tool_choice` vaut explicitement `"none"`. Le gabarit du checkpoint
+    /// n'a aucune notion de forcer un outil précis : un `tool_choice` objet
+    /// (`{"type":"function","function":{"name":…}}`) est accepté sans
+    /// erreur mais n'a aucun effet au-delà de "les outils sont bien là" —
+    /// voir le rapport à Vincent.
+    var effectiveTools: [ChatCompletionRequestTool] {
+        if case .string("none")? = toolChoice { return [] }
+        return tools ?? []
+    }
 
     var effectiveMaxTokens: Int? { maxCompletionTokens ?? maxTokens }
     var effectiveReasoningEffort: String? { reasoningEffort ?? reasoning?.effort ?? extra?.reasoningEffort }
@@ -193,7 +208,46 @@ private struct ChatCompletionRequest: Codable, Sendable {
 }
 private struct ChatCompletionReasoning: Codable, Sendable { let effort: String? }
 private struct ChatCompletionExtra: Codable, Sendable { let reasoningEffort: String?; let enableThinking: Bool?; let mtp: Bool?; let mtpEngine: String?; let mtpDraftTokens: Int?; let conversationID: String?; let repetitionPenalty: Float?; let penaltyContextTokens: Int?; let routedExperts: Int?; let ablation: String?; enum CodingKeys: String, CodingKey { case reasoningEffort = "reasoning_effort", enableThinking = "enable_thinking", mtp, mtpEngine = "mtp_engine", mtpDraftTokens = "mtp_draft_tokens", conversationID = "conversation_id", repetitionPenalty = "repetition_penalty", penaltyContextTokens = "penalty_context_tokens", routedExperts = "routed_experts", ablation } }
-private struct ChatCompletionMessage: Codable, Sendable { let role: String; let content: ChatCompletionContent? }
+private struct ChatCompletionMessage: Codable, Sendable {
+    let role: String
+    let content: ChatCompletionContent?
+    /// P13.1 : présent sur un tour assistant qui a appelé un outil.
+    let toolCalls: [ChatCompletionRequestToolCall]?
+    /// P13.1 : présent sur un message `role: "tool"` — accepté pour
+    /// compatibilité avec le format OpenAI, mais non utilisé pour le rendu :
+    /// le gabarit du checkpoint apparie les réponses d'outils par ordre,
+    /// jamais par identifiant (voir `chat_template.jinja`).
+    let toolCallID: String?
+    enum CodingKeys: String, CodingKey { case role, content, toolCalls = "tool_calls", toolCallID = "tool_call_id" }
+}
+
+/// P13.1 : un `tools[]` de requête, format OpenAI.
+private struct ChatCompletionRequestToolFunction: Codable, Sendable {
+    let name: String
+    let description: String?
+    let parameters: Qwen38JSONValue?
+}
+private struct ChatCompletionRequestTool: Codable, Sendable {
+    let type: String?
+    let function: ChatCompletionRequestToolFunction
+    func toSpec() -> Qwen38ToolSpec {
+        Qwen38ToolSpec(
+            type: type ?? "function", name: function.name, description: function.description,
+            parameters: function.parameters)
+    }
+}
+/// P13.1 : un `message.tool_calls[]` d'un tour assistant renvoyé par le
+/// client — `arguments` est, comme dans le format OpenAI, une chaîne JSON
+/// (jamais un objet imbriqué).
+private struct ChatCompletionRequestToolCallFunction: Codable, Sendable {
+    let name: String
+    let arguments: String?
+}
+private struct ChatCompletionRequestToolCall: Codable, Sendable {
+    let id: String?
+    let type: String?
+    let function: ChatCompletionRequestToolCallFunction
+}
 private enum ChatCompletionContent: Codable, Sendable {
     case text(String); case parts([ChatCompletionPart])
     init(from decoder: Decoder) throws { if let value = try? decoder.singleValueContainer().decode(String.self) { self = .text(value) } else { self = .parts(try decoder.singleValueContainer().decode([ChatCompletionPart].self)) } }
@@ -206,13 +260,32 @@ private struct ChatCompletionMessageResponse: Codable, Sendable {
     let role: String
     let content: String
     let reasoningContent: String?
-    enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content" }
+    /// P13.1 : `nil` (donc omis, `encodeIfPresent`) sauf si au moins un
+    /// `<tool_call>` a été reconnu dans la réponse — la forme JSON d'une
+    /// réponse sans outils reste bit-identique à avant P13.1.
+    let toolCalls: [ChatCompletionToolCallOut]?
+    enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content", toolCalls = "tool_calls" }
 }
 private struct ChatCompletionDelta: Codable, Sendable {
     let role: String?
     let content: String?
     let reasoningContent: String?
-    enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content" }
+    let toolCalls: [ChatCompletionToolCallOut]?
+    enum CodingKeys: String, CodingKey { case role, content, reasoningContent = "reasoning_content", toolCalls = "tool_calls" }
+}
+/// P13.1 : un `tool_calls[]` de réponse, réutilisé pour le message final
+/// (`index: nil`, omis) et pour un fragment `delta.tool_calls` en diffusion
+/// (`index` renseigné) — voir le rapport à Vincent sur le choix "un seul
+/// fragment une fois complet".
+private struct ChatCompletionToolCallOut: Codable, Sendable {
+    let index: Int?
+    let id: String?
+    let type: String?
+    let function: ChatCompletionToolCallFunctionOut
+}
+private struct ChatCompletionToolCallFunctionOut: Codable, Sendable {
+    let name: String
+    let arguments: String
 }
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
@@ -499,12 +572,27 @@ public actor Qwen38InferenceServer {
         let input: ChatCompletionRequest
         do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
         guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
-        guard input.messages.last?.role == "user" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user.") }
+        // P13.1 : un tour "tool" (le résultat d'un appel, renvoyé au serveur
+        // pour que le modèle produise sa réponse finale) est désormais un
+        // dernier message valide, au même titre que "user" — c'est
+        // exactement la forme d'une requête de suivi OpenAI après un appel
+        // d'outil.
+        guard let lastMessageRole = input.messages.last?.role, lastMessageRole == "user" || lastMessageRole == "tool" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user (ou tool après un appel d'outil).") }
+        let requestedTools = input.effectiveTools.map { $0.toSpec() }
+        guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); await queue.acquire(); updateSession(id) { $0.status = .running }; defer { Task { await queue.release() } }
         do {
             let selectedModel = try await ensureModelLoaded(requestedModel)
             updateSession(id) { $0.model = selectedModel }
+            // P13.1 : l'appel d'outils dépend du gabarit dédié du checkpoint
+            // Flash-Next (chat_template.jinja) — la famille 27B n'a rien
+            // d'équivalent, refus explicite plutôt qu'un silence trompeur.
+            if !requestedTools.isEmpty {
+                guard await runtime.isFlashNextLoaded else {
+                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite un modèle Flash-Next chargé : l'appel d'outils n'est pris en charge que par cette famille (gabarit dédié).")
+                }
+            }
             let prepared = try prepare(input.messages)
             let temperature = input.temperature ?? 0
             // P5.3: server default when a sampling request (temperature > 0)
@@ -530,13 +618,31 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
-            let (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
-                id: conversationID,
-                model: selectedModel,
-                messages: prepared.messages,
-                options: options)
+            let usePersistentCache: Bool
+            let cacheRestored: Bool
+            let trackingID: String?
+            if requestedTools.isEmpty {
+                (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
+                    id: conversationID,
+                    model: selectedModel,
+                    messages: prepared.messages,
+                    options: options)
+            } else {
+                // P13.1 : une requête porteuse d'outils ne touche jamais le
+                // cache de conversation Flash-Next (LRU/préfixe implicite) —
+                // elle est toujours rejouée en entier via
+                // `generateStateless`, exactement comme un client OpenAI
+                // classique qui renvoie tout l'historique à chaque tour (ce
+                // qu'un client outillé comme OpenCode fait de toute façon).
+                // Choix délibérément simple : il garantit qu'ajouter `tools`
+                // ne peut jamais interagir avec la comparaison de préfixe du
+                // cache — voir le rapport à Vincent (PLAN.md P13.1).
+                usePersistentCache = false
+                cacheRestored = false
+                trackingID = nil
+            }
             // Ground truth for the GUI's "Cache" tri-state (P5.2): a request
             // that named a conversation with prior turns but still fell back
             // to a full stateless replay. Computed here, not from engine
@@ -621,7 +727,10 @@ public actor Qwen38InferenceServer {
         let input: ChatCompletionRequest
         do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
         guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
-        guard input.messages.last?.role == "user" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user.") }
+        // P13.1 : voir le même commentaire dans `chatCompletionsResponse`.
+        guard let lastMessageRole = input.messages.last?.role, lastMessageRole == "user" || lastMessageRole == "tool" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user (ou tool après un appel d'outil).") }
+        let requestedTools = input.effectiveTools.map { $0.toSpec() }
+        guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); updateSession(id) { $0.status = .running }
         do {
@@ -631,6 +740,11 @@ public actor Qwen38InferenceServer {
             catch { await batchExecutionLock.release(); throw error }
             await batchExecutionLock.release()
             updateSession(id) { $0.model = selectedModel }
+            if !requestedTools.isEmpty {
+                guard await runtime.isFlashNextLoaded else {
+                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite un modèle Flash-Next chargé : l'appel d'outils n'est pris en charge que par cette famille (gabarit dédié).")
+                }
+            }
             let prepared = try prepare(input.messages)
             let temperature = input.temperature ?? 0
             let presencePenalty = input.explicitPresencePenalty ?? (temperature > 0 ? 1.5 : 0)
@@ -644,7 +758,7 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
 
             // P12.3 : une image, ou une requête qui touche le cache de
@@ -653,7 +767,12 @@ public actor Qwen38InferenceServer {
             // commentaire de fonction.
             let hasImages = prepared.messages.contains { !$0.imageURLs.isEmpty }
             let flashNextLoaded = await runtime.isFlashNextLoaded
-            var isEligibleForBatching = !hasImages && batchCoordinator != nil && flashNextLoaded
+            // P13.1 : une requête porteuse d'outils suit toujours le chemin
+            // chaud/mono-séquence ci-dessous (`.solo`), jamais le
+            // coordinateur de lot — voir le rapport à Vincent : ce choix
+            // simple garantit que `tools` ne peut jamais interagir avec le
+            // regroupement.
+            var isEligibleForBatching = !hasImages && requestedTools.isEmpty && batchCoordinator != nil && flashNextLoaded
             if isEligibleForBatching {
                 isEligibleForBatching = !(await runtime.flashConversationCacheWouldHit(
                     id: conversationID, model: selectedModel, messages: prepared.messages, options: options))
@@ -709,12 +828,21 @@ public actor Qwen38InferenceServer {
                 let usePersistentCache: Bool
                 let cacheRestored: Bool
                 let trackingID: String?
-                do {
-                    (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
-                        id: conversationID, model: selectedModel, messages: prepared.messages, options: options)
-                } catch {
-                    await batchExecutionLock.release()
-                    throw error
+                if requestedTools.isEmpty {
+                    do {
+                        (usePersistentCache, cacheRestored, trackingID) = try await prepareConversation(
+                            id: conversationID, model: selectedModel, messages: prepared.messages, options: options)
+                    } catch {
+                        await batchExecutionLock.release()
+                        throw error
+                    }
+                } else {
+                    // P13.1 : voir le même commentaire dans
+                    // `chatCompletionsResponse` — une requête outillée ne
+                    // touche jamais le cache de conversation.
+                    usePersistentCache = false
+                    cacheRestored = false
+                    trackingID = nil
                 }
                 let cacheReplayed = !usePersistentCache && trackingID != nil && prepared.messages.count > 1
                 updateSession(id) { $0.cacheRestored = cacheRestored; $0.cacheReplayed = cacheReplayed; $0.batchSizeServed = 1 }
@@ -831,8 +959,15 @@ public actor Qwen38InferenceServer {
         for message in messages {
             var text = "", images = [URL]()
             switch message.content { case .text(let value): text = value; case .parts(let parts): for part in parts { if part.type == "text" { text += part.text ?? "" }; if part.type == "image_url", let value = part.imageURL?.url { let materialized = try materializeImage(value); images.append(materialized.url); if materialized.isTemporary { temporaryFiles.append(materialized.url) } } }; case .none: break }
-            let role: Qwen38ChatMessage.Role; switch message.role { case "system": role = .system; case "assistant": role = .assistant; default: role = .user }
-            result.append(.init(role: role, content: text, imageURLs: images))
+            let role: Qwen38ChatMessage.Role; switch message.role { case "system": role = .system; case "assistant": role = .assistant; case "tool": role = .tool; default: role = .user }
+            // P13.1 : un tour assistant qui a appelé un outil — rejoué tel
+            // quel au tour suivant (voir `Qwen4ExpPromptBuilder.hfMessage`).
+            let toolCalls: [Qwen38ToolCall] = (message.toolCalls ?? []).map { raw in
+                Qwen38ToolCall(
+                    id: raw.id ?? "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))",
+                    name: raw.function.name, argumentsJSON: raw.function.arguments ?? "{}")
+            }
+            result.append(.init(role: role, content: text, imageURLs: images, toolCalls: toolCalls))
         }
         return .init(messages: result, temporaryFiles: temporaryFiles)
     }
@@ -866,15 +1001,53 @@ public actor Qwen38InferenceServer {
         if let trackingID {
             await rememberConversation(id: trackingID, model: model, requestMessages: requestMessages, assistantContent: text, options: options)
         }
-        return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty), delta: nil, finishReason: Self.finishReason(metrics?.stopReason))]))
+        // P13.1 : n'analyse les `<tool_call>` que si CETTE requête a déclaré
+        // des outils — sans quoi une réponse ordinaire qui contiendrait par
+        // hasard ce texte (hallucination) resterait un `content` brut,
+        // comportement strictement inchangé sans `tools` (critère PLAN.md
+        // P13.1).
+        var finishReason = Self.finishReason(metrics?.stopReason)
+        var toolCallsOut: [ChatCompletionToolCallOut]? = nil
+        if !options.tools.isEmpty {
+            let parsed = Qwen38ToolCallParser.parse(text)
+            if !parsed.calls.isEmpty {
+                text = parsed.content
+                toolCallsOut = parsed.calls.map { call in
+                    let schema = options.tools.first(where: { $0.name == call.name })?.parameters
+                    let argumentsJSON = Qwen38ToolArgumentTyper.typedArguments(call.parameters, schema: schema).toJSONString()
+                    return ChatCompletionToolCallOut(
+                        index: nil, id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))",
+                        type: "function", function: .init(name: call.name, arguments: argumentsJSON))
+                }
+                // Un appel tronqué par max_tokens ne devient jamais un appel
+                // malformé (voir `Qwen38ToolCallParser`) ; symétriquement,
+                // un finish_reason "length" reste "length" même si un ou
+                // plusieurs appels complets ont pu être reconnus avant la
+                // coupure — jamais "tool_calls" dans ce cas.
+                if finishReason != "length" { finishReason = "tool_calls" }
+            }
+        }
+        return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty, toolCalls: toolCallsOut), delta: nil, finishReason: finishReason)]))
     }
     private func makeStreamingResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, trackingID: String?, requestMessages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) async throws -> Response {
+        // P13.1 : quand la requête porte des outils, le `content` n'est
+        // jamais diffusé morceau par morceau — un `<tool_call>` XML
+        // pourrait sinon apparaître tel quel dans le flux avant d'être
+        // reconnu comme un appel, dupliqué avec le `tool_calls` structuré
+        // émis ensuite. Il est mis en mémoire tampon et livré en un seul
+        // fragment une fois la génération terminée (voir plus bas) — un
+        // choix simple et sûr, signalé à Vincent : la diffusion incrémentale
+        // du texte "réponse" est sacrifiée sur un tour porteur d'outils
+        // (généralement court), jamais sur un tour ordinaire. Le
+        // raisonnement (`<think>`), jamais concerné par ce marqueur,
+        // continue de s'afficher au fil de l'eau dans tous les cas.
+        let hasTools = !options.tools.isEmpty
         let body = ResponseBody { writer in
-            func writeDelta(content: String? = nil, reasoning: String? = nil, finishReason: String? = nil) async throws {
+            func writeDelta(content: String? = nil, reasoning: String? = nil, toolCalls: [ChatCompletionToolCallOut]? = nil, finishReason: String? = nil) async throws {
                 let value = ChatCompletionResponse(
                     id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion.chunk",
                     created: Int(Date().timeIntervalSince1970), model: model,
-                    choices: [.init(index: 0, message: nil, delta: .init(role: nil, content: content, reasoningContent: reasoning), finishReason: finishReason)])
+                    choices: [.init(index: 0, message: nil, delta: .init(role: nil, content: content, reasoningContent: reasoning, toolCalls: toolCalls), finishReason: finishReason)])
                 let payload = try JSONEncoder().encode(value)
                 var line = ByteBuffer(string: "data: ")
                 line.writeBytes(payload)
@@ -894,14 +1067,36 @@ public actor Qwen38InferenceServer {
                         let output = parser.append(chunk)
                         responseContent += output.content
                         if !output.reasoning.isEmpty { try await writeDelta(reasoning: output.reasoning) }
-                        if !output.content.isEmpty { try await writeDelta(content: output.content) }
+                        if !hasTools, !output.content.isEmpty { try await writeDelta(content: output.content) }
                     case .event(.metrics(let metrics)):
                         await self.completeSessionAsync(sessionID, metrics: metrics)
                         let tail = parser.finish()
                         responseContent += tail.content
                         if !tail.reasoning.isEmpty { try await writeDelta(reasoning: tail.reasoning) }
-                        if !tail.content.isEmpty { try await writeDelta(content: tail.content) }
-                        try await writeDelta(finishReason: Self.finishReason(metrics.stopReason))
+                        if !hasTools, !tail.content.isEmpty { try await writeDelta(content: tail.content) }
+
+                        var finishReason = Self.finishReason(metrics.stopReason)
+                        if hasTools {
+                            let parsed = Qwen38ToolCallParser.parse(responseContent)
+                            if !parsed.content.isEmpty { try await writeDelta(content: parsed.content) }
+                            if !parsed.calls.isEmpty {
+                                let toolCallDeltas = parsed.calls.enumerated().map { index, call -> ChatCompletionToolCallOut in
+                                    let schema = options.tools.first(where: { $0.name == call.name })?.parameters
+                                    let argumentsJSON = Qwen38ToolArgumentTyper.typedArguments(call.parameters, schema: schema).toJSONString()
+                                    return ChatCompletionToolCallOut(
+                                        index: index, id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24))",
+                                        type: "function", function: .init(name: call.name, arguments: argumentsJSON))
+                                }
+                                // Livré en un seul fragment complet plutôt
+                                // que morceau par morceau — voir le
+                                // commentaire de fonction et le rapport à
+                                // Vincent.
+                                try await writeDelta(toolCalls: toolCallDeltas)
+                                if finishReason != "length" { finishReason = "tool_calls" }
+                            }
+                            responseContent = parsed.content
+                        }
+                        try await writeDelta(finishReason: finishReason)
                         if let trackingID {
                             await self.rememberConversation(
                                 id: trackingID, model: model,

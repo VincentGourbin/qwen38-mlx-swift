@@ -116,17 +116,57 @@ public enum Qwen4ExpPromptBuilder {
         tokenizer: any Tokenizer,
         messages: [Message],
         thinking: Bool,
-        reasoningEffort: String = "low"
+        reasoningEffort: String = "low",
+        tools: [ToolSpec]? = nil
     ) throws -> Qwen4ExpBuiltPrompt {
         let tokenIDs = try tokenizer.applyChatTemplate(
             messages: messages,
-            tools: nil,
+            tools: tools,
             additionalContext: [
                 "enable_thinking": thinking,
                 "reasoning_effort": reasoningEffort,
             ]
         ).map(Int32.init)
         return Qwen4ExpBuiltPrompt(tokenIDs: tokenIDs)
+    }
+
+    /// P13.1 : convertit un `Qwen38ChatMessage` transport-neutre vers le
+    /// `Tokenizers.Message` attendu par `applyChatTemplate` — le point de
+    /// conversion partagé par les trois sites d'appel stateless de
+    /// `Qwen38FlashNextEngine` (`renderedTokenIDs`, `generateFromMessages`,
+    /// `generateBatch`). Un tour assistant portant des `toolCalls` se rend
+    /// exactement comme la forme `message.tool_calls[].function.
+    /// {name,arguments}` du gabarit du checkpoint (chat_template.jinja) —
+    /// `arguments` doit y être un objet JSON, jamais la chaîne JSON du
+    /// format fil OpenAI (`Qwen38ToolCall.argumentsJSON`), parce que le
+    /// gabarit boucle dessus avec Jinja `|items` ; d'où le nouveau parsing
+    /// ci-dessous. Un `role: .tool` se rend en `{"role":"tool","content":…}`
+    /// — le gabarit n'utilise jamais d'identifiant d'appel, seulement
+    /// l'ordre des messages (voir `chat_template.jinja`, aucune référence à
+    /// `tool_call_id`).
+    public static func hfMessage(from message: Qwen38ChatMessage) -> Message {
+        switch message.role {
+        case .system, .user:
+            return ["role": message.role.rawValue, "content": message.content]
+        case .tool:
+            return ["role": "tool", "content": message.content]
+        case .assistant:
+            var dict: Message = ["role": "assistant", "content": message.content]
+            guard !message.toolCalls.isEmpty else { return dict }
+            dict["tool_calls"] = message.toolCalls.map { call -> [String: any Sendable] in
+                let arguments: any Sendable
+                if case .object(let fields)? = try? Qwen38JSONValue.parse(call.argumentsJSON) {
+                    arguments = fields.mapValues { $0.sendableValue }
+                } else {
+                    arguments = [String: any Sendable]()
+                }
+                return [
+                    "id": call.id, "type": "function",
+                    "function": ["name": call.name, "arguments": arguments],
+                ]
+            }
+            return dict
+        }
     }
 
     /// Continuation-turn rendering (H2.3): only the new suffix is

@@ -56,6 +56,15 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     /// de requête `ablation` est refusé en HTTP 400 avant d'atteindre ce
     /// point (voir `Qwen38InferenceServer`).
     public var ablation: Qwen4ExpLayerBenchAblation?
+    /// P13.1 : outils OpenAI déclarés pour ce tour, Flash-Next uniquement —
+    /// vide (le défaut) laisse `applyChatTemplate(tools:)` recevoir `nil`,
+    /// comportement strictement inchangé. Le serveur ne peuple ce champ que
+    /// lorsque la requête porte elle-même `tools`, et route alors la
+    /// requête entière autour du cache de conversation Flash-Next (voir
+    /// `Qwen38InferenceServer`) : ce champ n'entre donc jamais en jeu dans
+    /// `Qwen38Runtime`'s prefix/LRU comparisons en pratique, mais reste
+    /// comparé ci-dessous par défense en profondeur.
+    public var tools: [Qwen38ToolSpec]
 
     public init(
         maxTokens: Int = 256,
@@ -70,7 +79,8 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         repetitionPenalty: Float = 1.0,
         penaltyContextTokens: Int = 2048,
         routedExpertCount: Int? = nil,
-        ablation: Qwen4ExpLayerBenchAblation? = nil
+        ablation: Qwen4ExpLayerBenchAblation? = nil,
+        tools: [Qwen38ToolSpec] = []
     ) {
         self.maxTokens = maxTokens
         self.temperature = temperature
@@ -85,6 +95,7 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
         self.penaltyContextTokens = penaltyContextTokens
         self.routedExpertCount = routedExpertCount
         self.ablation = ablation
+        self.tools = tools
     }
 
     public var parameters: GenerateParameters {
@@ -203,16 +214,28 @@ public enum Qwen38GenerationEvent: Sendable {
 /// Core lets the server replay a complete OpenAI-style conversation without
 /// exposing MLXLMCommon's non-Sendable Chat.Message type.
 public struct Qwen38ChatMessage: Sendable, Equatable {
-    public enum Role: String, Sendable, Equatable { case system, user, assistant }
+    /// P13.1 : `.tool` s'ajoute à la famille — un message `role: "tool"`
+    /// OpenAI (le résultat d'un appel), rendu par le gabarit du checkpoint
+    /// comme un `<tool_response>` fusionné dans le tour utilisateur suivant
+    /// (voir `chat_template.jinja`, aucune référence à `tool_call_id` : les
+    /// réponses sont appariées par ordre, pas par identifiant).
+    public enum Role: String, Sendable, Equatable { case system, user, assistant, tool }
 
     public let role: Role
     public let content: String
     public let imageURLs: [URL]
+    /// P13.1 : uniquement significatif pour `role == .assistant` — les
+    /// appels d'outils de ce tour, dans l'ordre OpenAI, rejoués dans le
+    /// rendu du tour suivant comme autant de blocs `<tool_call>` (voir
+    /// `Qwen4ExpPromptBuilder.hfMessage(from:)`). Vide pour un tour
+    /// assistant ordinaire.
+    public let toolCalls: [Qwen38ToolCall]
 
-    public init(role: Role, content: String, imageURLs: [URL] = []) {
+    public init(role: Role, content: String, imageURLs: [URL] = [], toolCalls: [Qwen38ToolCall] = []) {
         self.role = role
         self.content = content
         self.imageURLs = imageURLs
+        self.toolCalls = toolCalls
     }
 }
 
@@ -904,6 +927,7 @@ public actor Qwen38Runtime {
             && a.mtp == b.mtp
             && a.presencePenalty == b.presencePenalty
             && a.repetitionPenalty == b.repetitionPenalty
+            && a.tools == b.tools
     }
 
     private func clearActiveConversation() {

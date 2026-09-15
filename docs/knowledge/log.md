@@ -5982,3 +5982,73 @@ préférable au demi-mécanisme.
 **Le préfill séparé du décodage** — la vraie solution au défaut A — bute sur
 le même mur : il faudrait assembler un cache de lot à partir de caches
 individuels, c'est-à-dire exactement la primitive qui manque. Écarté aussi.
+
+---
+
+## 2026-09-15 — P13.1 : les outils au format OpenAI, validés de bout en bout
+
+`Qwen38Server` ignorait complètement les outils (`tools: nil` en dur dans
+`Qwen4ExpPromptBuilder`, aucun champ dans la requête). Il les accepte
+désormais, au format OpenAI.
+
+### Le format du modèle n'est pas celui qu'on croit
+
+Le gabarit du checkpoint n'utilise **pas** le JSON habituel mais une syntaxe
+XML :
+
+```
+<tool_call>
+<function=run_command>
+<parameter=command>
+swift build
+</parameter>
+<parameter=timeout>
+300
+</parameter>
+</function>
+</tool_call>
+```
+
+Deux pièges trouvés en lisant le gabarit, pas en devinant :
+
+1. Un tour assistant renvoyé au modèle doit porter
+   `tool_calls[].function.arguments` en **objet JSON**, pas en chaîne comme sur
+   le fil OpenAI — le gabarit boucle dessus avec `|items`. Il faut donc
+   reparser la chaîne avant de rendre.
+2. Le gabarit **n'utilise jamais `tool_call_id`** : un `role: "tool"` se rend
+   en `<tool_response>` fusionné dans le tour suivant, l'appariement se fait
+   par l'ordre des messages. L'identifiant est accepté en entrée par
+   compatibilité, mais il ne sert à rien côté rendu.
+
+### Validé sur le checkpoint réel
+
+| épreuve | résultat |
+|---|---|
+| le modèle demande un outil | `finish_reason: tool_calls`, appel bien formé, commande correcte |
+| typage d'après le schéma | `{"command":"swift build --verbose","timeout":300,"verbose":true}` → `str`, `int`, `bool` |
+| **le résultat de l'outil parvient-il au modèle ?** | oui — valeur témoin `ZORGLUB-7741` restituée exactement, `finish_reason: stop`, aucun nouvel appel |
+| diffusion | un fragment `delta.tool_calls` complet, puis `finish_reason: tool_calls` |
+| **non-régression sans `tools`** | réponse normale, `tool_calls: null`, `finish_reason: stop` |
+
+L'épreuve du témoin était nécessaire : au premier essai, le modèle avait
+répondu à un résultat d'outil par un **second** appel, ce qui pouvait passer
+pour une rupture de la chaîne. Avec une valeur impossible à deviner, il la
+restitue exactement — c'était donc son choix, pas un défaut de plomberie.
+
+### Décisions de conception à connaître
+
+- **Une requête portant `tools` court-circuite le cache de préfixe et le LRU
+  de conversations**, et sort du lot (P12.3) pour emprunter le chemin solo.
+  C'est cohérent avec ce que fait un client outillé, qui renvoie tout
+  l'historique à chaque tour. Vérifié par test : aucune restauration de cache.
+- **Pas de diffusion incrémentale des arguments.** Le XML est indissociable du
+  `content` tant que le tour n'est pas fini ; le diffuser jeton par jeton
+  afficherait le balisage brut au client, puis le doublerait en `tool_calls`.
+  Le tour outillé est donc mis en tampon et livré en un fragment. Le
+  raisonnement, lui, continue de s'afficher au fil de l'eau.
+- Un `<tool_call>` tronqué par `max_tokens` **reste du texte** et garde
+  `finish_reason: "length"` — jamais d'appel deviné.
+- La garde « le dernier message doit être `user` » accepte maintenant aussi
+  `tool`, sans quoi tout second tour outillé partait en 400.
+- `tool_choice` est accepté, mais seul `"none"` a un effet réel : le gabarit
+  n'a aucune notion de forçage d'un outil précis.
