@@ -7,7 +7,7 @@ paramètres requis présents), et tâche aboutie ou non.
 
     python3 Scripts/agent-loop.py --task 1 --max-steps 12
 """
-import argparse, json, os, subprocess, sys, time, urllib.request
+import argparse, json, os, subprocess, sys, time, urllib.request, urllib.error
 
 TOOLS = [
  {"type":"function","function":{"name":"list_files","description":"Liste les fichiers d'un dossier du dépôt.",
@@ -60,22 +60,37 @@ def main():
     ap.add_argument("--task", type=int, default=1)
     ap.add_argument("--max-steps", type=int, default=12)
     ap.add_argument("--max-tokens", type=int, default=400)
+    ap.add_argument("--thinking", action="store_true", help="active le mode réflexion du modèle")
     a = ap.parse_args()
     model = json.load(urllib.request.urlopen(a.base+"/healthz"))["model"]
     task = TASKS[a.task]
     print(f"modèle {model}\ntâche  {task}\n" + "-"*70)
     msgs = [{"role":"system","content":
-             "Tu es un assistant de code. Tu explores le dépôt avec les outils fournis, "
-             "puis tu appelles final_answer avec ta réponse. Ne devine jamais : vérifie dans le code."},
+             "Tu es un assistant de code qui explore un dépôt Swift avec les outils fournis.\n\n"
+             "Méthode :\n"
+             "1. Cherche avec grep un terme précis du code (un nom de type, un mot-clé Swift), "
+             "pas une expression du langage courant.\n"
+             "2. Dès qu'une sortie d'outil contient la réponse, APPELLE final_answer immédiatement. "
+             "N'explore pas plus loin par précaution.\n"
+             "3. Si trois recherches de suite ne donnent rien, change complètement d'angle.\n\n"
+             "Tu DOIS terminer par un appel à final_answer. Une exploration sans réponse est un échec."},
             {"role":"user","content":task}]
     stats = {"tours":0,"appels":0,"bien_formes":0,"valides":0,"texte_sans_appel":0}
     t0=time.time()
     for step in range(a.max_steps):
         body={"model":model,"messages":msgs,"tools":TOOLS,"temperature":0,
-              "max_tokens":a.max_tokens,"enable_thinking":False,"mtp":False}
+              "max_tokens":a.max_tokens,"enable_thinking":a.thinking,"mtp":False}
         req=urllib.request.Request(a.base+"/v1/chat/completions",data=json.dumps(body).encode(),
                                    headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req,timeout=1800) as r: d=json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req,timeout=1800) as r: d=json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # Surfacer le corps : un 500 nu ne dit rien, et c'est précisément
+            # ce qu'on veut diagnostiquer (constaté le 2026-09-15, tâche 2).
+            corps = e.read().decode('utf-8', 'replace')[:600]
+            print(f"\n!!! HTTP {e.code} au pas {step} · prompt ~{sum(len(str(m)) for m in msgs)//4} jetons")
+            print(f"!!! corps : {corps}")
+            raise SystemExit(1)
         stats["tours"]+=1
         m=d["choices"][0]["message"]; fr=d["choices"][0].get("finish_reason")
         tcs=m.get("tool_calls") or []

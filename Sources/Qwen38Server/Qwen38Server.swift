@@ -509,7 +509,7 @@ public actor Qwen38InferenceServer {
         serverPort = port; self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty; lastError = nil; serverStatus = .starting
         let router = Router()
         router.get("healthz") { [self] _, _ in await self.healthResponse() }
-        router.get("v1/models") { [self] request, _ in try await self.modelsResponse(request: request) }
+        router.get("v1/models") { [self] request, _ in await self.catchingHTTPErrors { try await self.modelsResponse(request: request) } }
         router.get("metrics") { [self] _, _ in await self.metricsResponse() }
         // P12.3 : à `batchSize == 1` (le défaut), `/v1/chat/completions`
         // reste très exactement `chatCompletionsResponse` — pas une variante
@@ -518,9 +518,9 @@ public actor Qwen38InferenceServer {
         // la place `chatCompletionsResponseBatched`, qui seule connaît
         // `batchCoordinator`/`batchExecutionLock`.
         if self.batchSize > 1 {
-            router.post("v1/chat/completions") { [self] request, _ in try await self.chatCompletionsResponseBatched(request: request) }
+            router.post("v1/chat/completions") { [self] request, _ in await self.catchingHTTPErrors { try await self.chatCompletionsResponseBatched(request: request) } }
         } else {
-            router.post("v1/chat/completions") { [self] request, _ in try await self.chatCompletionsResponse(request: request) }
+            router.post("v1/chat/completions") { [self] request, _ in await self.catchingHTTPErrors { try await self.chatCompletionsResponse(request: request) } }
         }
         let application = Application(router: router, configuration: .init(address: .hostname("0.0.0.0", port: port), serverName: "Qwen38Inference"))
         serverTask = Task { [weak self, application] in
@@ -577,7 +577,28 @@ public actor Qwen38InferenceServer {
         // dernier message valide, au même titre que "user" — c'est
         // exactement la forme d'une requête de suivi OpenAI après un appel
         // d'outil.
-        guard let lastMessageRole = input.messages.last?.role, lastMessageRole == "user" || lastMessageRole == "tool" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user (ou tool après un appel d'outil).") }
+        //
+        // Défaut du 2026-09-15 : "assistant" rejoint la liste. Une boucle
+        // d'agent réelle (OpenCode, Claude Code) peut parfaitement produire
+        // ce dernier rôle — le modèle a atteint `max_tokens` en pleine
+        // réflexion, sans texte ni appel d'outil, et le client a ajouté un
+        // tour assistant (vide, ou porteur du texte tronqué) puis a
+        // renvoyé l'historique pour que le serveur termine ce tour. Ce
+        // n'est pas un protocole étranger à ce serveur : c'est exactement
+        // ce que `dispatchConversationTurn`/`continueConversationTurn`
+        // (P13.3) savent déjà faire — le suffixe à préfiller est calculé
+        // par différence de rendu complet, donc indépendant du rôle du
+        // dernier message (voir `Qwen4ExpPromptBuilder.continuationSuffix`) —
+        // et le rejeu complet (`generateFromMessages`/`buildFromMessages`)
+        // qui sert de repli n'a lui non plus aucune hypothèse sur le rôle
+        // du dernier message. Rejeter cette forme obligerait exactement le
+        // client qui a motivé P13.3 (une boucle d'agent) à réémettre tout
+        // l'historique sous un rôle différent pour contourner un refus
+        // artificiel — moins cohérent avec le reste du serveur que de
+        // l'accepter tel quel.
+        guard let lastMessageRole = input.messages.last?.role,
+              lastMessageRole == "user" || lastMessageRole == "tool" || lastMessageRole == "assistant"
+        else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user, tool (après un appel d'outil), ou assistant (pour continuer un tour interrompu).") }
         let requestedTools = input.effectiveTools.map { $0.toSpec() }
         guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -718,8 +739,11 @@ public actor Qwen38InferenceServer {
         let input: ChatCompletionRequest
         do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
         guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
-        // P13.1 : voir le même commentaire dans `chatCompletionsResponse`.
-        guard let lastMessageRole = input.messages.last?.role, lastMessageRole == "user" || lastMessageRole == "tool" else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user (ou tool après un appel d'outil).") }
+        // P13.1 / défaut du 2026-09-15 : voir le même commentaire dans
+        // `chatCompletionsResponse`.
+        guard let lastMessageRole = input.messages.last?.role,
+              lastMessageRole == "user" || lastMessageRole == "tool" || lastMessageRole == "assistant"
+        else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user, tool (après un appel d'outil), ou assistant (pour continuer un tour interrompu).") }
         let requestedTools = input.effectiveTools.map { $0.toSpec() }
         guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -1183,6 +1207,39 @@ public actor Qwen38InferenceServer {
         var response = jsonResponse(ErrorResponse(error: .init(message: message, type: status.code >= 500 ? "server_error" : "invalid_request_error", code: nil)))
         response.status = status
         return response
+    }
+
+    /// Défaut du 2026-09-15 : le filet posé par T8 (le `catch` interne de
+    /// `chatCompletionsResponse`/`chatCompletionsResponseBatched`, plus bas)
+    /// ne couvrait que les erreurs levées APRÈS son `do {` — les gardes de
+    /// validation placées avant (corps vide, liste de messages vide, dernier
+    /// message d'un rôle refusé, `tools[].name` manquant, `authorize` sur
+    /// `v1/models`…) s'échappaient telles quelles jusqu'au routeur
+    /// Hummingbird. `RouterResponder.respond` (voir
+    /// `.build/checkouts/hummingbird/Sources/Hummingbird/Router/
+    /// RouterResponder.swift`) ne rattrape que les erreurs conformes à
+    /// `HTTPResponseError` ; tout le reste retombe sur le filet générique
+    /// d'`Application.run()`, qui répond `Response(status: .internalServerError,
+    /// body: .init())` — un HTTP 500 au corps vide, indiagnosticable côté
+    /// client. Reproduit avec un dernier message `assistant` après un aller-
+    /// retour d'outil complet (voir le test dédié).
+    ///
+    /// Plutôt que d'étendre le `do/catch` interne de chaque gestionnaire (un
+    /// correctif au cas par cas, qui laisserait le même piège ouvert à toute
+    /// future garde ou tout futur point d'entrée), ce filet s'enregistre UNE
+    /// SEULE FOIS à l'endroit où chaque route est déclarée (`start()`) : il
+    /// capture absolument toute erreur Swift qui s'échapperait du
+    /// gestionnaire — gardes de validation comprises — et la transforme via
+    /// `status(for:)`/`errorResponse` en réponse JSON de style OpenAI, avec
+    /// un statut et un corps toujours présents. Le `do/catch` interne des
+    /// deux gestionnaires `/v1/chat/completions` reste néanmoins en place :
+    /// lui seul sait faire le ménage de session/conversation avant de
+    /// renvoyer l'erreur (voir son propre commentaire) ; ce filet-ci ne fait
+    /// que garantir qu'aucune erreur ne peut plus jamais ressortir sans
+    /// corps, quel que soit l'endroit d'où elle est levée.
+    private func catchingHTTPErrors(_ handler: () async throws -> Response) async -> Response {
+        do { return try await handler() }
+        catch { return Self.errorResponse(Self.status(for: error), message: error.localizedDescription) }
     }
 
     /// LAN test 2026-09-09 (T8): a `Qwen38ServerError` escaping the handler used

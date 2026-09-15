@@ -4910,6 +4910,266 @@ func serverAcceptsToolRoleAsLastMessage() async throws {
     _ = data
 }
 
+/// Défaut du 2026-09-15 : reproduit très exactement la requête curl du
+/// rapport — `tools` déclarés, historique se terminant par un tour
+/// `assistant` vide APRÈS un aller-retour d'outil complet (le modèle a
+/// atteint `max_tokens` sans texte ni appel d'outil, le client a ajouté un
+/// tour assistant vide et a renvoyé tout l'historique). Avant le correctif,
+/// la garde sur le dernier rôle (`chatCompletionsResponse`, avant son
+/// `do/catch`) rejetait "assistant" et l'erreur s'échappait telle quelle
+/// jusqu'au filet générique de Hummingbird (`Application.run()`), qui
+/// répond systématiquement `Response(status: .internalServerError, body:
+/// .init())` pour toute erreur ne conformant pas à `HTTPResponseError` — un
+/// 500 au corps vide, indiagnosticable. Ce test vérifie maintenant les DEUX
+/// versants du correctif : le serveur répond 200 (la décision prise ici est
+/// d'accepter "assistant" comme dernier rôle valide, voir le commentaire de
+/// la garde) et la requête atteint bien le moteur.
+@Test("Défaut 2026-09-15 : un dernier message assistant après un aller-retour d'outil complet répond 200, jamais 500 au corps vide")
+func serverAcceptsAssistantRoleAsLastMessageAfterToolRoundTrip() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-assistant-last-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    mock.scriptedContent = "Aucun résultat supplémentaire."
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    let tools: [[String: Any]] = [
+        [
+            "type": "function",
+            "function": [
+                "name": "grep", "description": "Cherche un motif.",
+                "parameters": [
+                    "type": "object", "properties": ["pattern": ["type": "string"]],
+                    "required": ["pattern"],
+                ],
+            ],
+        ]
+    ]
+    let messages: [[String: Any]] = [
+        ["role": "user", "content": "cherche le mot test"],
+        [
+            "role": "assistant", "content": "",
+            "tool_calls": [
+                [
+                    "id": "c1", "type": "function",
+                    "function": ["name": "grep", "arguments": "{\"pattern\":\"test\"}"],
+                ]
+            ],
+        ],
+        ["role": "tool", "tool_call_id": "c1", "content": "3 résultats"],
+        ["role": "assistant", "content": ""],
+    ]
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID, "temperature": 0, "max_tokens": 30,
+        "enable_thinking": false, "mtp": false,
+        "tools": tools, "messages": messages,
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    let httpResponse = try #require(response as? HTTPURLResponse)
+    #expect(httpResponse.statusCode == 200)
+    #expect(!data.isEmpty)
+    let decoded = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let choices = try #require(decoded["choices"] as? [[String: Any]])
+    let message = try #require(choices[0]["message"] as? [String: Any])
+    #expect(message["content"] as? String == mock.scriptedContent)
+    #expect(choices[0]["finish_reason"] as? String == "stop")
+    // La requête a bien atteint le moteur avec le dernier tour assistant
+    // (pas de rejet en amont ni de repli sur un historique tronqué).
+    let lastMessages = try #require(mock.lastGenerateFromMessages)
+    #expect(lastMessages.last?.role == .assistant)
+    #expect(lastMessages.last?.content == "")
+}
+
+/// Défaut du 2026-09-15 : même historique que ci-dessus, mais le tour
+/// assistant vide n'est plus en dernière position — un tour utilisateur le
+/// suit. Le dernier rôle redevient "user", déjà accepté depuis P13.1 : ce
+/// test garde cette variante verte pour ne pas la casser en élargissant la
+/// garde à "assistant".
+@Test("Défaut 2026-09-15 : un tour assistant vide au milieu de l'historique (dernier message user) continue de répondre 200")
+func serverAcceptsEmptyAssistantTurnInMiddleOfHistory() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-assistant-middle-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    mock.scriptedContent = "Voici la suite."
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    let tools: [[String: Any]] = [
+        [
+            "type": "function",
+            "function": [
+                "name": "grep", "description": "Cherche un motif.",
+                "parameters": [
+                    "type": "object", "properties": ["pattern": ["type": "string"]],
+                    "required": ["pattern"],
+                ],
+            ],
+        ]
+    ]
+    let messages: [[String: Any]] = [
+        ["role": "user", "content": "cherche le mot test"],
+        [
+            "role": "assistant", "content": "",
+            "tool_calls": [
+                [
+                    "id": "c1", "type": "function",
+                    "function": ["name": "grep", "arguments": "{\"pattern\":\"test\"}"],
+                ]
+            ],
+        ],
+        ["role": "tool", "tool_call_id": "c1", "content": "3 résultats"],
+        ["role": "assistant", "content": ""],
+        ["role": "user", "content": "et alors ?"],
+    ]
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID, "tools": tools, "messages": messages,
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    #expect(!data.isEmpty)
+}
+
+/// Défaut du 2026-09-15 : même forme d'historique (se termine par un tour
+/// assistant), mais sans jamais déclarer `tools` dans la requête — la garde
+/// sur le dernier rôle ne doit pas dépendre de la présence d'outils.
+@Test("Défaut 2026-09-15 : un dernier message assistant sans le champ tools répond aussi 200")
+func serverAcceptsAssistantLastMessageWithoutToolsField() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-assistant-last-no-tools-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let factory = MockFlashNextEngineFactory()
+    let runtime = Qwen38Runtime(flashNextEngineFactory: factory)
+    try await runtime.load(from: flashDirectory)
+    let mock = try #require(factory.lastEngine)
+    mock.scriptedContent = "Bien reçu."
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    let messages: [[String: Any]] = [
+        ["role": "user", "content": "raconte une blague"],
+        ["role": "assistant", "content": ""],
+    ]
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID, "messages": messages,
+    ])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    #expect((response as? HTTPURLResponse)?.statusCode == 200)
+    #expect(!data.isEmpty)
+}
+
+/// Défaut du 2026-09-15 : filet générique — une requête authentiquement
+/// malformée (ici une liste `messages` vide) doit répondre en 4xx avec un
+/// corps JSON exploitable, jamais en 500 au corps vide. Avant le correctif,
+/// ce `guard` précédait le `do/catch` interne de `chatCompletionsResponse`
+/// et son erreur s'échappait jusqu'au filet générique de Hummingbird
+/// (`RouterResponder`/`Application.run()`), qui ne convertit en réponse
+/// que les erreurs conformant à `HTTPResponseError` — tout le reste devient
+/// `Response(status: .internalServerError, body: .init())`. Ce test exerce
+/// le nouveau filet `catchingHTTPErrors` posé à l'enregistrement de la
+/// route plutôt qu'un correctif local à cette seule garde : n'importe quel
+/// futur `throw` placé avant un `do/catch` local doit rester couvert.
+@Test("Défaut 2026-09-15 : une requête malformée répond en 4xx avec un corps JSON, jamais en 500 vide")
+func serverReturnsJSONBodyForMalformedRequest() async throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("qwen38-malformed-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let modelID = "Qwen3.8-Flash-Next-4bit"
+    let flashDirectory = root.appendingPathComponent(modelID, isDirectory: true)
+    try FileManager.default.createDirectory(at: flashDirectory, withIntermediateDirectories: true)
+    try JSONSerialization.data(withJSONObject: qwen4ExpFixtureConfig())
+        .write(to: flashDirectory.appendingPathComponent("config.json"))
+
+    let runtime = Qwen38Runtime(flashNextEngineFactory: MockFlashNextEngineFactory())
+    try await runtime.load(from: flashDirectory)
+
+    let server = Qwen38InferenceServer(runtime: runtime)
+    try await server.start(port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root)
+    defer { Task { await server.stop() } }
+
+    let snapshot = await server.snapshot()
+    var request = URLRequest(url: URL(string: "http://127.0.0.1:\(snapshot.port)/v1/chat/completions")!)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["model": modelID, "messages": []])
+    let (data, response) = try await URLSession.shared.data(for: request)
+    let httpResponse = try #require(response as? HTTPURLResponse)
+    #expect((400 ..< 500).contains(httpResponse.statusCode))
+    #expect(!data.isEmpty)
+    let decoded = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let error = try #require(decoded["error"] as? [String: Any])
+    #expect((error["message"] as? String)?.isEmpty == false)
+
+    // Même garde côté `/v1/chat/completions` en mode lot
+    // (`chatCompletionsResponseBatched`), avec exactement le même piège
+    // avant correctif (guard avant son propre `do/catch`).
+    let batchedRuntime = Qwen38Runtime(flashNextEngineFactory: MockFlashNextEngineFactory())
+    try await batchedRuntime.load(from: flashDirectory)
+    let batchedServer = Qwen38InferenceServer(runtime: batchedRuntime)
+    try await batchedServer.start(
+        port: Int.random(in: 20_000 ..< 40_000), modelsDirectory: root, batchSize: 4)
+    defer { Task { await batchedServer.stop() } }
+    let batchedSnapshot = await batchedServer.snapshot()
+    var batchedRequest = URLRequest(
+        url: URL(string: "http://127.0.0.1:\(batchedSnapshot.port)/v1/chat/completions")!)
+    batchedRequest.httpMethod = "POST"
+    batchedRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    batchedRequest.httpBody = try JSONSerialization.data(withJSONObject: [
+        "model": modelID, "messages": [],
+    ])
+    let (batchedData, batchedResponse) = try await URLSession.shared.data(for: batchedRequest)
+    let batchedHTTPResponse = try #require(batchedResponse as? HTTPURLResponse)
+    #expect((400 ..< 500).contains(batchedHTTPResponse.statusCode))
+    #expect(!batchedData.isEmpty)
+}
+
 /// P13.2 : reproduit la forme exacte de `Scripts/agent-loop.py` — deux tours
 /// HTTP successifs, sans `conversation_id`, le second renvoyant tout
 /// l'historique plus le résultat d'un outil (`role: "tool"`) — et vérifie

@@ -6170,3 +6170,69 @@ tâche de fond. Le premier s'en est aperçu, a jugé l'approche du second
 meilleure, a retiré sa propre tentative et l'a signalé. Vérifié après coup :
 aucune trace résiduelle, compilation et 195 tests verts. **Arrêter un agent
 avant d'en lancer un second sur les mêmes fichiers.**
+
+---
+
+## 2026-09-15 — Deux enseignements de la boucle d'agent : la réflexion est obligatoire, et un 500 au corps vide
+
+### La réflexion n'est pas optionnelle pour l'agentique
+
+Même tâche, même harnais, seule la réflexion change :
+
+| | sans réflexion | avec réflexion |
+|---|---:|---:|
+| appels émis | 22 (16 pas) | **5 (4 pas)** |
+| bien formés | 22/22 | 5/5 |
+| **réponse finale** | **aucune** | **`Qwen4ExpQSAKVCache`, exacte** |
+| durée | 557 s | 119 s |
+
+Sans réflexion, le modèle enchaîne des recherches pertinentes mais ne
+**synthétise jamais** ce qu'il a lu. Vérifié avant d'accuser le modèle : la
+déclaration `public final class Qwen4ExpQSAKVCache` est ligne 44 du fichier
+qu'il avait lu au pas 3, donc bien dans ce que l'outil lui avait montré. Ce
+n'est pas une troncature du harnais, c'est une limite de synthèse que le mode
+réflexion lève.
+
+**Conséquence pour P13.4** : un client agentique branché sur ce serveur doit
+avoir la réflexion active. Le défaut actuel du serveur est `enable_thinking`
+à faux — à reconsidérer pour ce cas d'usage.
+
+### Un 500 au corps vide, et sa cause racine
+
+Reproduction minimale : `tools` + un aller-retour d'outil complet + un dernier
+message **assistant** vide → `HTTP 500 · corps 0 octets`. Arrivé en vrai parce
+que le modèle avait atteint `max_tokens` **pendant sa réflexion**, donc n'avait
+produit ni texte ni appel ; le client ajoute alors un tour assistant vide.
+
+**Cause** : les gardes de validation (dernier rôle, corps vide, `messages`
+vide, nom d'outil manquant) étaient placées **avant** le `do { … } catch` du
+gestionnaire. Une erreur levée par ces gardes s'échappait donc jusqu'au filet
+générique de Hummingbird, qui répond littéralement
+`Response(status: .internalServerError, body: .init())` — un 500 vide, quel
+que soit le message. `Qwen38ServerError` n'étant pas conforme à
+`HTTPResponseError`, le routeur ne le rattrape pas non plus.
+
+Trouvé au passage : `/v1/models` n'avait **aucun** `catch`, donc une clé d'API
+invalide y produisait déjà le même 500 vide au lieu d'un 401.
+
+**Correctif à la racine** : un enrobage `catchingHTTPErrors` posé une fois sur
+les trois routes qui peuvent lever, qui garantit un corps JSON pour toute
+erreur échappée, gardes amont comprises. Les `catch` internes restent : eux
+seuls savent nettoyer session et conversation avant de répondre.
+
+**Décision sur un dernier message assistant : accepté**, pas rejeté. C'est
+exactement ce que produit une boucle d'agent tronquée par `max_tokens`, et la
+continuation par différence est déjà générique sur le rôle du dernier message.
+Rejeter aurait forcé le client visé par tout §P13 à contourner un refus
+artificiel.
+
+Le diagnostic a été vérifié par annulation : sans le correctif, le test
+reproduit exactement le symptôme.
+
+### Vérifié sur le serveur réel
+
+| épreuve | résultat |
+|---|---|
+| la séquence qui donnait 500 | **200**, réponse cohérente |
+| `messages: []` | **400** avec `{"error":{"type":"invalid_request_error","message":"La requête doit contenir au moins un message."}}` |
+| clé d'API invalide sur `/v1/models` | non concluant — le serveur tournait sans `--api-key`, il n'y avait rien à refuser |
