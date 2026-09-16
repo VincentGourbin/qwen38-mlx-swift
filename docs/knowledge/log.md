@@ -6321,3 +6321,85 @@ Et ce n'est pas notre plomberie qui est en cause : même à 138 t/s, le
 meilleur débit jamais mesuré ici, 31 700 jetons coûteraient encore
 **3,8 minutes**. **La charge d'outils de Claude Code est la contrainte, pas le
 serveur.**
+
+---
+
+## 2026-09-16 — Le crash sous Xcode : un défaut d'MLX, pas du panneau agent
+
+### Le symptôme
+
+Au lancement de la GUI depuis Xcode :
+
+```
+-[MTLDebugComputeCommandEncoder setBytes:length:attributeStride:atIndex:]:387:
+failed assertion `bytes argument cannot be nil.'
+```
+
+### Ce n'est ni le panneau agent, ni notre code
+
+Reproduit en une commande, **sans aucun outil ni panneau**, sur une simple
+génération de texte :
+
+```
+MTL_DEBUG_LAYER=1 qwen38 flash-chat-probe <checkpoint> --prompt "Bonjour" …
+→ SIGABRT (code 134)
+```
+
+`MTL_DEBUG_LAYER=1` active la **validation Metal**, qu'Xcode active par défaut
+dans ses schémas. Sans elle, la même commande passe depuis toujours. **Toutes
+les mesures du projet restent donc valides** : elles tournent en Release depuis
+le terminal, validation désactivée.
+
+### La cause, dans MLX
+
+Pile obtenue sous `lldb` :
+
+```
+Qwen4ExpStreamingDecoder.forward → eval → mlx::core::eval_impl
+  → mlx::core::Gather::eval_gpu (indexing.cpp:200)
+    → CommandEncoder::set_vector_bytes<std::vector<int>>
+      → MTL::ComputeCommandEncoder::setBytes(bytes=nil, index=7)
+```
+
+L'index 7 est `idx_shapes`, et MLX documente le choix noir sur blanc
+(`mlx/backend/metal/indexing.cpp`) :
+
+```cpp
+// We don't need to check for empty idx_shapes because gather has a
+// idx_ndim == 0 specialization
+compute_encoder.set_vector_bytes(idx_shapes, 7);
+```
+
+Un `std::vector` vide a un `data()` nul. MLX s'appuie sur une spécialisation
+du noyau qui ne lit jamais ce tampon — correct à l'exécution, mais la couche
+de validation refuse un pointeur nul quelle que soit la longueur.
+`idx_shapes` est vide quand l'indice du *gather* est **scalaire**.
+
+**C'est donc un défaut en amont**, dans une opération légitime, et non un bug
+de ce dépôt.
+
+### Bissection, pour mémoire
+
+| sonde, sous validation | résultat |
+|---|---|
+| `op-overhead-probe` (SwitchGLU, matmuls) | ✅ passe |
+| `flash-layer-bench` GDN et QSA (synthétique) | ✅ passe |
+| `flash-ngram-parity` (table n-gram réelle) | ✅ passe |
+| `flash-global-probe` (embeddings, lm_head) | ✅ passe |
+| **`flash-chat-probe`** (résident **et** streamé) | ❌ **SIGABRT** |
+
+Ni le bloc d'experts, ni les couches, ni la table n-gram, ni les embeddings.
+Le *gather* fautif est sur le chemin de génération complet.
+
+### Ce qu'il faut faire
+
+1. **Contournement immédiat** : décocher « Metal API Validation » dans le
+   schéma Xcode (Product → Scheme → Edit Scheme → Run → Diagnostics). La GUI
+   démarre alors normalement.
+2. **Correctif propre** : signaler en amont à `mlx`, le correctif tenant en
+   une ligne (ne pas appeler `set_vector_bytes` quand le vecteur est vide, ou
+   passer un pointeur factice). À suivre dans un plan d'action.
+3. À ne pas faire : traquer ce crash dans notre code. Il n'y est pas.
+
+*Les avertissements de compilation Xcode (`unused variable 'RMS_LOOPED_LIMIT'`,
+etc.) viennent des en-têtes Metal d'MLX et sont sans rapport.*
