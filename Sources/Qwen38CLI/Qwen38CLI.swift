@@ -3152,6 +3152,13 @@ struct Serve: AsyncParsableCommand {
     )
     var allowAblation = false
 
+    @Flag(
+        name: .long,
+        help:
+            "Active le mode réflexion par défaut pour les clients qui ne l'expriment pas. Nécessaire pour un harnais d'agent : sans réflexion, le modèle enchaîne des appels d'outils pertinents sans jamais conclure (mesuré le 2026-09-15). Un client qui envoie enable_thinking ou reasoning_effort garde toujours la main."
+    )
+    var enableThinking = false
+
     @Option(
         name: .long,
         help:
@@ -3233,7 +3240,7 @@ struct Serve: AsyncParsableCommand {
             conversationCacheGB: conversationCacheGb,
             routedExpertCount: routedExperts,
             allowAblation: allowAblation,
-            batchSize: batchSize,
+            batchSize: batchSize, enableThinking: enableThinking,
             batchMaxPromptTokens: batchMaxPromptTokens,
             batchWindowMs: batchWindowMs)
         print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")

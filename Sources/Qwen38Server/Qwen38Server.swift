@@ -290,7 +290,7 @@ private struct ChatCompletionToolCallFunctionOut: Codable, Sendable {
 private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
-private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; let batchMaxPromptTokensConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", ablation, batchSizeConfigured = "batch_size_configured", batchMaxPromptTokensConfigured = "batch_max_prompt_tokens_configured" } }
+private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let defaultEnableThinking: Bool; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; let batchMaxPromptTokensConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", defaultEnableThinking = "default_enable_thinking", ablation, batchSizeConfigured = "batch_size_configured", batchMaxPromptTokensConfigured = "batch_max_prompt_tokens_configured" } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
 
@@ -386,6 +386,14 @@ public actor Qwen38InferenceServer {
     /// commentaire. `> 1` construit `batchCoordinator` et enregistre
     /// `chatCompletionsResponseBatched` à la place.
     private var batchSize = 1
+    /// Valeur de repli du mode réflexion pour les clients qui ne
+    /// l'expriment pas (`serve --enable-thinking`). Nécessaire pour les
+    /// harnais d'agent : mesuré le 2026-09-15, sans réflexion le modèle
+    /// enchaîne des appels d'outils pertinents mais ne conclut jamais
+    /// (22 appels, 0 réponse finale ; avec réflexion, 4 pas). Un client
+    /// qui envoie explicitement `enable_thinking` ou `reasoning_effort`
+    /// garde toujours la main : ce n'est qu'un défaut.
+    private var defaultEnableThinking = false
     /// Défaut A (2026-09-14) : `serve --batch-max-prompt-tokens` (défaut
     /// 256). Une requête froide dont le prompt RENDU dépasse ce seuil ne
     /// rejoint jamais `batchCoordinator` — elle garde le chemin
@@ -434,13 +442,14 @@ public actor Qwen38InferenceServer {
     // call sites and tests are unaffected.
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1, batchMaxPromptTokens: Int = 256, batchWindowMs: Int = 30) async throws {
+    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1, enableThinking: Bool = false, batchMaxPromptTokens: Int = 256, batchWindowMs: Int = 30) async throws {
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
         // P12.3 : mémorisé pour toute la durée de vie du serveur — voir
         // `batchSize`'s doc comment. `<= 1` désactive le regroupement,
         // exactement comme avant P12.3 (aucun `Qwen38BatchCoordinator`
         // construit, route `chatCompletionsResponse` inchangée ci-dessous).
         self.batchSize = max(batchSize, 1)
+        self.defaultEnableThinking = enableThinking
         // Défaut A (2026-09-14) : voir `batchMaxPromptTokens`'s doc comment.
         self.batchMaxPromptTokens = max(batchMaxPromptTokens, 0)
         if self.batchSize > 1 {
@@ -562,7 +571,7 @@ public actor Qwen38InferenceServer {
     // P11.2 : `ablation` publié systématiquement, `"none"` quand il n'y en a
     // pas (aucun engin Flash-Next chargé, ou aucune ablation demandée) —
     // même garde de publication que `routed_expert_count`, PLAN.md P11.2.
-    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize, batchMaxPromptTokensConfigured: batchMaxPromptTokens)) }
+    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), defaultEnableThinking: defaultEnableThinking, routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize, batchMaxPromptTokensConfigured: batchMaxPromptTokens)) }
     private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
     private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
 
@@ -639,7 +648,7 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
             // P13.2 : une requête outillée touche désormais le cache de
             // conversation Flash-Next (LRU/préfixe implicite) exactement
@@ -773,7 +782,7 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
+            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
 
             // P12.3 : une image, ou une requête qui touche le cache de
