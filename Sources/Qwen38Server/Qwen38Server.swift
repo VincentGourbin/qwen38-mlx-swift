@@ -175,7 +175,16 @@ private struct ChatCompletionRequest: Codable, Sendable {
     var effectiveMaxTokens: Int? { maxCompletionTokens ?? maxTokens }
     var effectiveReasoningEffort: String? { reasoningEffort ?? reasoning?.effort ?? extra?.reasoningEffort }
     var effectiveThinking: Bool? { enableThinking ?? extra?.enableThinking }
-    var effectiveMTP: Bool? { mtp ?? extra?.mtp ?? true }
+    /// Défaut passé à `false` le 2026-09-16. Deux raisons mesurées :
+    /// (a) P11.4 a montré le MTP **perdant** (0,939× le greedy : 19,72 contre
+    /// 21,01 tok/s) — il coûtait donc du débit à tout client qui ne le
+    /// désactivait pas ; (b) le chemin MTP fait planter le serveur à long
+    /// contexte (`[broadcast_shapes] Shapes (1,1,20310,20575) et
+    /// (1,1,20310,20577)` dans le masque QSA, écart de 2 = les jetons de
+    /// brouillon), défaut jamais vu avant parce que toutes les validations
+    /// de §P13 envoyaient explicitement `mtp: false`. Un client qui demande
+    /// `mtp: true` garde la main, et retombe sur le même chemin qu'avant.
+    var effectiveMTP: Bool? { mtp ?? extra?.mtp ?? false }
     var effectiveMTPEngine: Qwen38MTPEngine { Qwen38MTPEngine(rawValue: (mtpEngine ?? extra?.mtpEngine ?? "local").lowercased()) ?? .local }
     var effectiveMTPDraftTokens: Int { min(max(mtpDraftTokens ?? extra?.mtpDraftTokens ?? 1, 1), 8) }
     var effectiveConversationID: String? { (conversationID ?? extra?.conversationID)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
