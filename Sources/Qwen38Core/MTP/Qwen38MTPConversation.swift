@@ -134,10 +134,10 @@ public final class Qwen38MTPConversation: @unchecked Sendable {
         target: any LanguageModel,
         drafter: any MTPDrafterModel
     ) throws -> Qwen38MTPPipeline.Result {
-        guard started, let pendingToken, let previousDrafterState = drafterState else {
+        guard started, pendingToken != nil, drafterState != nil else {
             throw Error.notStarted
         }
-        guard let statefulDrafter = drafter as? any StatefulMTPDrafterModel else {
+        guard drafter is any StatefulMTPDrafterModel else {
             throw Error.unsupportedContinuation
         }
 

@@ -30,6 +30,13 @@ final class AgentPanelViewModel: ObservableObject {
     @Published var statusLabel = "Prêt"
 
     private var runTask: Task<Void, Never>?
+    /// Empêche un second `start()` de faire tourner deux boucles à la fois
+    /// (double-clic, ou relance pendant qu'une tâche tourne déjà en fond —
+    /// ce dernier cas est redevenu possible une fois cet objet hissé dans
+    /// `BenchViewModel` : avant, changer d'onglet détruisait cette instance
+    /// avec sa tâche, ce qui masquait le problème). Extrait dans
+    /// `Qwen38Agent.AgentRunGate` pour rester testable sans réseau.
+    private var runGate = AgentRunGate()
 
     func chooseRootDirectory() {
         let panel = NSOpenPanel()
@@ -42,13 +49,15 @@ final class AgentPanelViewModel: ObservableObject {
     }
 
     func start(baseURL: String, apiKey: String) {
-        guard !isRunning else { return }
+        guard runGate.tryStart() else { return }
         guard let rootURL else {
+            runGate.finish()
             errorMessage = "Choisis d'abord un dossier racine."
             return
         }
         let trimmedTask = task.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTask.isEmpty else {
+            runGate.finish()
             errorMessage = "Écris la tâche à confier à l'agent."
             return
         }
@@ -73,8 +82,17 @@ final class AgentPanelViewModel: ObservableObject {
     func stop() {
         runTask?.cancel()
         runTask = nil
+        runGate.finish()
         isRunning = false
         statusLabel = "Arrêté par l'utilisateur"
+    }
+
+    /// Filet de sécurité si cette instance est un jour désallouée pendant
+    /// qu'une boucle tourne (aujourd'hui elle ne l'est plus tant que l'app
+    /// vit, `BenchViewModel` la retient — voir `Qwen38BenchUIApp.swift`) :
+    /// `Task.cancel()` est sûr à appeler depuis n'importe quel contexte.
+    deinit {
+        runTask?.cancel()
     }
 
     private func performRun(
@@ -83,6 +101,7 @@ final class AgentPanelViewModel: ObservableObject {
         defer {
             isRunning = false
             runTask = nil
+            runGate.finish()
         }
 
         let model: String
@@ -203,7 +222,18 @@ private enum AgentPanelError: LocalizedError {
 
 struct AgentPanelView: View {
     @ObservedObject var model: BenchViewModel
-    @StateObject private var agent = AgentPanelViewModel()
+    // §Agent panel : cet objet vit dans `BenchViewModel`, pas ici — un
+    // `@StateObject` local était détruit (et sa tâche en cours avec lui) dès
+    // que l'onglet changeait, puisque `ContentView` retire alors cette vue
+    // de la hiérarchie (`if selectedTab == … else … AgentPanelView(...)`).
+    // `@ObservedObject` sur l'instance partagée de `model` fait que revenir
+    // sur l'onglet retrouve l'état exact, journal et compteurs compris.
+    @ObservedObject var agent: AgentPanelViewModel
+
+    init(model: BenchViewModel) {
+        self.model = model
+        self.agent = model.agentPanel
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {

@@ -1571,12 +1571,12 @@ public actor Qwen38Runtime {
                         // "live" pointer, so the GUI's *next* turn always
                         // restores explicitly instead of assuming nothing
                         // touched the shared engine in between.
-                        await self.rememberFlashConversation(
+                        self.rememberFlashConversation(
                             id: trackingID, model: modelKey, requestMessages: fullMessages,
                             assistantContent: responseText, options: options)
-                        await self.flushGUIConversationToLRU(
+                        self.flushGUIConversationToLRU(
                             id: trackingID, model: modelKey, options: options)
-                        await self.setFlashGUIMessages(
+                        self.setFlashGUIMessages(
                             fullMessages + [Qwen38ChatMessage(role: .assistant, content: responseText)])
                         continuation.finish()
                     } catch {

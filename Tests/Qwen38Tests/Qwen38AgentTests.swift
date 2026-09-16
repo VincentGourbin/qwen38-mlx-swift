@@ -321,6 +321,39 @@ func loopEngineContinuingBeforeLastStepIsNil() throws {
     #expect(AgentBudget.evaluate(outcome: .continuing, stepsUsed: 2, maxSteps: 16) == nil)
 }
 
+// MARK: - AgentRunGate : une seule boucle à la fois
+
+@Test("Une deuxième tentative de démarrage pendant qu'une boucle tourne est refusée")
+func runGateRejectsConcurrentStart() throws {
+    var gate = AgentRunGate()
+
+    #expect(gate.tryStart() == true)
+    #expect(gate.isRunning == true)
+    // La relance (double clic, ou tâche déjà en fond après le hissage de
+    // l'état dans BenchViewModel) ne doit jamais laisser deux boucles vivre :
+    // le deuxième appel ne doit pas remettre `isRunning` à `true` "à
+    // nouveau" au sens où l'appelant recommencerait quoi que ce soit.
+    #expect(gate.tryStart() == false)
+    #expect(gate.isRunning == true)
+}
+
+@Test("Après finish(), une nouvelle boucle peut démarrer")
+func runGateAllowsRestartAfterFinish() throws {
+    var gate = AgentRunGate()
+
+    #expect(gate.tryStart() == true)
+    gate.finish()
+    #expect(gate.isRunning == false)
+    #expect(gate.tryStart() == true)
+}
+
+@Test("finish() sans démarrage préalable ne fait rien (idempotent)")
+func runGateFinishWithoutStartIsHarmless() throws {
+    var gate = AgentRunGate()
+    gate.finish()
+    #expect(gate.isRunning == false)
+}
+
 // MARK: - AgentWireFormat : construction/lecture JSON (sans réseau)
 
 @Test("buildRequestBody produit un corps JSON conforme au contrat serveur")

@@ -628,15 +628,46 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
     /// device is not the same number as the CPU's core count.
     private static let maxConcurrentReads = 16
 
-    private static func readRowsConcurrently<Element: FixedWidthInteger & UnsignedInteger>(
+    /// A `[Int: [Element]]` guarded by an `NSLock`, so writes from the
+    /// concurrent `pread` workers in `readRowsConcurrently` below are
+    /// mutually exclusive. Swift 6's concurrency checker cannot see that a
+    /// lock makes a captured `var` safe to mutate from multiple tasks, so
+    /// this type makes the safety explicit instead of silencing the
+    /// checker: the lock (and therefore the access pattern) is unchanged
+    /// from the previous `var results` + `NSLock` pair, just packaged
+    /// together. `take()` is only valid once all writers have finished
+    /// (after `DispatchGroup.wait()`), same as reading `results` used to be.
+    private final class LockedRowResults<Element>: @unchecked Sendable {
+        private var storage: [Int: [Element]]
+        private let lock = NSLock()
+
+        init(minimumCapacity: Int) {
+            storage = [Int: [Element]](minimumCapacity: minimumCapacity)
+        }
+
+        func set(_ row: Int, _ value: [Element]) {
+            lock.lock()
+            defer { lock.unlock() }
+            storage[row] = value
+        }
+
+        func take() -> [Int: [Element]] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
+    private static func readRowsConcurrently<
+        Element: FixedWidthInteger & UnsignedInteger & Sendable
+    >(
         _ type: Element.Type, descriptor: Int32, dataStart: UInt64, byteWidth: Int, rows: [Int],
         url: URL
     ) -> [Int: [Element]] {
         guard !rows.isEmpty else { return [:] }
         let elementsPerRow = byteWidth / MemoryLayout<Element>.size
         let uniqueRows = Array(Set(rows))
-        var results = [Int: [Element]](minimumCapacity: uniqueRows.count)
-        let lock = NSLock()
+        let results = LockedRowResults<Element>(minimumCapacity: uniqueRows.count)
         let semaphore = DispatchSemaphore(value: min(maxConcurrentReads, uniqueRows.count))
         let group = DispatchGroup()
         let queue = DispatchQueue(
@@ -654,13 +685,11 @@ public final class Qwen4ExpLazyNGramStorage: @unchecked Sendable {
                 guard n == byteWidth else {
                     preconditionFailure("Lecture n-gram incomplète: \(url.path):\(row)")
                 }
-                lock.lock()
-                results[row] = buffer
-                lock.unlock()
+                results.set(row, buffer)
             }
         }
         group.wait()
-        return results
+        return results.take()
     }
 
     /// P5.4: bulk row reads for the n-gram table's mmap-backed shards.

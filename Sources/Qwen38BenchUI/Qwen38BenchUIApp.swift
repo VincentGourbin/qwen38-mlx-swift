@@ -137,6 +137,14 @@ final class BenchViewModel: ObservableObject {
     let runtime: Qwen38Runtime
     private let inferenceServer: Qwen38InferenceServer
     private var traceData: Data?
+    /// L'état du panneau Agent vit ici, pas dans `AgentPanelView` : ce
+    /// modèle est créé une fois par `ContentView` (`@StateObject`) et
+    /// persiste tant que la fenêtre existe, alors qu'`AgentPanelView`
+    /// disparaît de la hiérarchie dès qu'on change d'onglet
+    /// (`if selectedTab == … else …`). Un `@StateObject` local à cette vue
+    /// était donc détruit — avec la tâche en cours — à chaque changement
+    /// d'onglet ; le journal et les compteurs semblaient s'évaporer.
+    let agentPanel = AgentPanelViewModel()
 
     init() {
         let runtime = Qwen38Runtime()
@@ -150,6 +158,22 @@ final class BenchViewModel: ObservableObject {
             ? Self.defaultProfiles
             : Self.defaultProfiles.filter { !saved.contains($0) } + saved
         self.modelPath = UserDefaults.standard.string(forKey: Self.lastPathKey) ?? Self.defaultProfiles[0]
+        // La boucle d'agent tourne maintenant plus longtemps que la vue qui
+        // l'a lancée (c'est le but du fix) ; il faut donc l'arrêter
+        // explicitement à la fermeture, plutôt que de compter sur la
+        // désallocation d'une vue qui n'a plus lieu. Cette app termine à la
+        // fermeture de sa seule fenêtre (`applicationShouldTerminateAfterLastWindowClosed`
+        // renvoie `true`), donc observer la terminaison couvre ce cas. Ce
+        // `BenchViewModel` est un singleton pour la durée de vie de l'app
+        // (créé une fois par `ContentView`), donc l'observateur n'a jamais
+        // besoin d'être retiré : il ne capture que `agentPanel`, pas `self`,
+        // donc aucun cycle de rétention.
+        let agentPanel = self.agentPanel
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in agentPanel.stop() }
+        }
     }
 
     // MARK: profils de chemins
@@ -1497,7 +1521,8 @@ enum Qwen38LocalNetwork {
             var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &buffer, socklen_t(buffer.count),
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            candidates.append((String(cString: entry.pointee.ifa_name), String(cString: buffer)))
+            let address = buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+            candidates.append((String(cString: entry.pointee.ifa_name), address))
         }
         return (candidates.first { $0.name == "en0" } ?? candidates.first)?.address
     }

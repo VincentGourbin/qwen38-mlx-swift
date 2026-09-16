@@ -498,9 +498,9 @@ public enum Qwen4ExpLayerBench {
             for stepInGroup in 0..<count {
                 output = buildStep()
                 if stepInGroup == count - 1 {
-                    eval(output)
+                    eval(output!)
                 } else {
-                    asyncEval(output)
+                    asyncEval(output!)
                 }
             }
             lastOutput = output
