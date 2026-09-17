@@ -1,8 +1,0 @@
-experts (switch_mlp): bits=3 group_size=64
-ablation P7.1 : moe
---- couche qsa ---
-mémoire couche: 1,15 GB
-ms/pas — médiane 0.98  p10 0.97  p90 1.00  min 0.96  max 1.05
-CPU moyen: 122.0 %   GPU moyen: 1.6 %
-MLX mémoire active: 20 bytes
-MLX mémoire peak: 1,17 GB

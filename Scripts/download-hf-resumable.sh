@@ -7,7 +7,7 @@
 set -euo pipefail
 
 MODEL_ID="${1:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
-MODELS_DIR="${2:-/Volumes/Lexar/models}"
+MODELS_DIR="${2:-${QWEN38_MODELS_DIR:-$HOME/models}}"
 START_PATH="${3:-}"
 END_PATH="${4:-}"
 TARGET="${MODELS_DIR}/${MODEL_ID}"

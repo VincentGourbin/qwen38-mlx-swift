@@ -8,7 +8,7 @@
 set -uo pipefail
 export LC_ALL=C
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-model_dir="${1:-/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
+model_dir="${1:-${QWEN38_MODELS_DIR:-$HOME/models}/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
 port="${2:-8848}"
 model_id="$(basename "$model_dir")"
 bin=./.xcodebuild/Build/Products/Release/qwen38

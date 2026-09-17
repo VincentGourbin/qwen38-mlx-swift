@@ -1,7 +1,0 @@
-ablation P7.1 : moe-shared-expert
---- couche gdn ---
-mémoire couche: 1,63 GB
-ms/pas — médiane 4.57  p10 4.54  p90 4.62  min 4.47  max 5.40
-CPU moyen: 24.5 %   GPU moyen: 49.4 %
-MLX mémoire active: 16 bytes
-MLX mémoire peak: 2,91 GB

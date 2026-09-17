@@ -3946,7 +3946,7 @@ struct Download: AsyncParsableCommand {
     @Argument(help: "Identifiant Hugging Face, par exemple mlx-community/Qwen3.8-27B-4bit")
     var modelID: String
 
-    @Option(name: .long, help: "Répertoire racine local (Lexar par défaut)")
+    @Option(name: .long, help: "Répertoire racine local (défaut : $QWEN38_MODELS_DIR, sinon ~/models)")
     var modelsDir: String?
 
     @Option(name: .long, help: "Token Hugging Face ; HF_TOKEN est utilisé par défaut")

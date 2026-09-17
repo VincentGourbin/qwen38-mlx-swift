@@ -2,7 +2,7 @@
 
 > **Statut : rév. 4 du 2026-09-06 — Jalon 3 réanalysé et réorienté (§6-§7 réécrits, §0.1 et §11 amendés).** Rév. 3 (cadrage acté par Vincent le 2026-08-28) reste valable pour §1-§5. Document de référence **local** (pas d'artifact). Le journal d'exécution (REQUEST/RÉPONSE/Étapes V1…V54) suit le §11.
 > Roadmap : **Jalon 1 (27B + GUI) → Jalon 2 (serveur d'inférence LAN) → Jalon 3 (portage Flash-Next)**. À chaque jalon, Vincent teste lui-même via la GUI de bench.
-> Cible matérielle : MacBook Pro M3 Max, 96 Go RAM unifiée, macOS 15+, disque externe Lexar (`/Volumes/Lexar/models`, **~384 Go libres** après nettoyage).
+> Cible matérielle : MacBook Pro M3 Max, 96 Go RAM unifiée, macOS 15+, disque externe Lexar (`$QWEN38_MODELS_DIR`, **~384 Go libres** après nettoyage).
 
 ---
 
@@ -271,7 +271,7 @@ Ce qui manque pour qu'un utilisateur voie Flash-Next :
 - Résidence partielle (tout sauf n-gram ; n-gram en mmap + LRU) : **pic MLX 79-82 Go**. Incompatible avec un 27B chargé en même temps (17-54 Go) → un seul modèle résident par process (contrat §5.1.1, déjà en place côté serveur).
 - Chargement one-shot depuis le Lexar : **~95-105 s**. C'est le TTFT du premier tour d'un process neuf. Dans un process résident (GUI, serveur), ce coût est payé **une seule fois** ; il ne bloque donc pas l'étape H. Ce qui reste lent **par token** relève du chantier P.
 - Le Bash tool de Claude Code dispose du device Metal (mémoire `project-flashnext-terminal-metal-access`) : exécuter les probes directement, en tâche de fond, avec des timeouts longs (un run résident 8 tokens ≈ 2-3 min après correctif V54, mais 15-25 min si l'I/O Lexar est contendue).
-- **Avant chaque run résident**, vérifier : Lexar monté (`ls /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP/config.json`), pas d'autre charge GPU lourde (`top -l 1 | grep PhysMem`, `ps aux | grep -c '[c]laude'`). Deux runs ont été tués pour mémoire basse à cause de charges concurrentes (V53-V54).
+- **Avant chaque run résident**, vérifier : Lexar monté (`ls $QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP/config.json`), pas d'autre charge GPU lourde (`top -l 1 | grep PhysMem`, `ps aux | grep -c '[c]laude'`). Deux runs ont été tués pour mémoire basse à cause de charges concurrentes (V53-V54).
 
 ### 6.1 Réorientation — décisions rév. 4
 
@@ -284,7 +284,7 @@ Ce qui manque pour qu'un utilisateur voie Flash-Next :
 
 ### 6.2 Étapes restantes (ordre strict)
 
-Conventions : une tâche = un commit = un critère vérifiable. Build : `Scripts/build.sh` (xcodebuild, jamais `swift build`). Tests : `Scripts/run-tests.sh`. Binaire : `./.xcodebuild/Build/Products/Debug/qwen38`. Checkpoint : `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, noté `$FLASH` ci-dessous. Prompt de référence : « Explique en français qui est le président de la Chine et quel est son rôle. » Image de référence : `/Users/vincent/Downloads/licensed-image-2.jpeg`. Sortie greedy attendue sur le prompt de référence (8 tokens, sans thinking) : `"Le président de la Chine est Xi Jinping"`. Les probes (`flash-generate-probe`, `flash-chat-probe`), le bench `flash-layer-bench`, les runs H6 et la démo G-8 utilisent le binaire **Release** (`Scripts/build-release.sh`, wrapper `QWEN38_CONFIGURATION=Release Scripts/build.sh` ; binaire `.xcodebuild/Build/Products/Release/qwen38`) ; Debug (`Scripts/build.sh` par défaut) reste réservé aux tests (`Scripts/run-tests.sh`).
+Conventions : une tâche = un commit = un critère vérifiable. Build : `Scripts/build.sh` (xcodebuild, jamais `swift build`). Tests : `Scripts/run-tests.sh`. Binaire : `./.xcodebuild/Build/Products/Debug/qwen38`. Checkpoint : `$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, noté `$FLASH` ci-dessous. Prompt de référence : « Explique en français qui est le président de la Chine et quel est son rôle. » Image de référence : `~/Downloads/licensed-image-2.jpeg`. Sortie greedy attendue sur le prompt de référence (8 tokens, sans thinking) : `"Le président de la Chine est Xi Jinping"`. Les probes (`flash-generate-probe`, `flash-chat-probe`), le bench `flash-layer-bench`, les runs H6 et la démo G-8 utilisent le binaire **Release** (`Scripts/build-release.sh`, wrapper `QWEN38_CONFIGURATION=Release Scripts/build.sh` ; binaire `.xcodebuild/Build/Products/Release/qwen38`) ; Debug (`Scripts/build.sh` par défaut) reste réservé aux tests (`Scripts/run-tests.sh`).
 
 **H0 — Préalables (0,5 j)**
 
@@ -815,7 +815,7 @@ Observations remontées après un test réel :
 
 - La mini-GUI ne propose actuellement que les boutons 4-bit et 8-bit. Le
   prochain round doit ajouter la variante **BF16** et sélectionner
-  `/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-bf16`, avec son drafter
+  `$QWEN38_MODELS_DIR/mlx-community/Qwen3.8-27B-bf16`, avec son drafter
   apparié `Qwen3.8-27B-MTP-bf16`. L'état de disponibilité MTP et les mesures
   mémoire doivent être recalculés après chaque changement de variante.
 - Avec M2 activé, un second tour peut afficher `La conversation M2 n'a pas
@@ -899,7 +899,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
   `content` du flux thinking avec `Qwen38ThinkingStreamParser`; les IDs bruts
   du runtime et du ledger M2 restent inchangés.
 - Matrice exécutée avec `xcodebuild`, thinking `low`, plafond 2 048 tokens,
-  température greedy, image `/Users/vincent/Downloads/licensed-image-2.jpeg`
+  température greedy, image `~/Downloads/licensed-image-2.jpeg`
   (Macron, car l'image Xi demandée n'était pas présente au moment du run),
   puis les deux questions textuelles de suivi. Six rapports sont disponibles
   sous `results/qualification-*.tsv`, avec 18 réponses et 18 traces sidecar.
@@ -943,7 +943,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
 
 - Run complet :
   `results/final-profile-4bit-m2-local-2048.tsv`, avec image
-  `/Users/vincent/Downloads/licensed-image-2.jpeg` (Macron, utilisée comme
+  `~/Downloads/licensed-image-2.jpeg` (Macron, utilisée comme
   média disponible ; le fichier Xi n'était pas présent au moment de cette
   exécution).
 - Résultats : tour 1 image, prompt 1 296 tokens, TTFT 10 990,1 ms, 222
@@ -982,7 +982,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
   supprimé par `URLSession`. Pour ne pas perdre les gros fichiers, le secours
   est `Scripts/download-hf-resumable.sh`, qui télécharge directement les URLs
   HF avec `curl --continue-at -`, retries et validation de taille, dans
-  `/Volumes/Lexar/models/Vontra/`. Le nouveau téléchargement est actif.
+  `$QWEN38_MODELS_DIR/Vontra/`. Le nouveau téléchargement est actif.
 - Référence de conversion :
   `https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`. Le runtime
   Swift actuel ne sait pas encore charger `qwen4_exp` ; la prochaine tâche
@@ -1243,7 +1243,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
   sanitizer convertit les clés checkpoint `shard_N` vers la représentation
   Swift `shards.N` ; une assertion couvre le shard 127.
 - Le préflight Release a été exécuté sur
-  `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` sans charger
+  `$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` sans charger
   les poids : `3747` tenseurs, `22` shards, `1020` poids quantifiés, `128`
   shards n-gram, `1` couche MTP, `113,21 GB` de poids.
 - `Qwen4ExpSparseMoE` porte le routeur top-k ascendant, les projections
@@ -1314,7 +1314,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
 - Le préflight conserve les validations header-only puis vérifie les ancres
   de forme du vrai checkpoint (largeurs packées embedding/lm-head, GDN, QSA et
   deux projections d’experts). Sur
-  `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, ces contrôles
+  `$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, ces contrôles
   passent sur les 22 shards et 3 747 tenseurs.
 - Validation finale : compilation et `xcodebuild test` sérialisé réussis,
   puis `xcrun xctest` direct avec **37 tests passés**. `qwen38 info` valide le
@@ -1340,7 +1340,7 @@ accept rate, compteurs MTP et mémoire affichés séparément pour chaque tour.
   ne doivent donc respectivement pas recevoir le conteneur 4-bit et ne doivent
   pas être exposées par la réflexion `Module`.
 - Sur le checkpoint réel
-  `/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, les deux
+  `$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`, les deux
   couches chargent chacune 71 tenseurs depuis 2/3 shards ; les forwards réels
   renvoient `[1, 4, 2560]`. La couche 0 matérialise environ 2,02 Go.
 - Validation de round : compilation et tests MLX via `xcodebuild`, puis bundle
@@ -1855,7 +1855,7 @@ entre :
 
 Inclure une recommandation concrète pour la matrice 4-bit/8-bit/BF16 et le gate
 MTP, en tenant compte des variantes déjà présentes dans
-`/Volumes/Lexar/models/mlx-community/` et de la contrainte de validation
+`$QWEN38_MODELS_DIR/mlx-community/` et de la contrainte de validation
 `xcodebuild`, puis `xcrun xctest`.
 
 ---
@@ -1911,7 +1911,7 @@ Découpler deux choses que le gate actuel confond :
 - Validation Swift après ce changement : `xcodebuild build-for-testing`, puis
   `xcrun xctest` direct avec les fixtures réelles, **47 tests passés**.
 - Gate 27B 4-bit exécuté avec l'image disponible
-  `/Users/vincent/Downloads/licensed-image-2.jpeg`, greedy, 16 tokens/tour,
+  `~/Downloads/licensed-image-2.jpeg`, greedy, 16 tokens/tour,
   sur les trois prompts de référence : standard et MTP produisent des textes
   **identiques sur les trois tours**. Le M1 upstream est actif au tour 1 avec
   `7/8` tokens acceptés ; les tours 2 et 3 passent en fallback documenté car
@@ -1992,7 +1992,7 @@ qualité. La modification d’API upstream M1 est hors périmètre du portage.
 
 - Le binaire `flash-generate-probe` a été rejoué avec le checkpoint réel
   `Qwen3.8-Flash-Next-MLX-4bit-MTP` et l'image locale
-  `/Users/vincent/Downloads/licensed-image-2.jpeg`.
+  `~/Downloads/licensed-image-2.jpeg`.
 - La chaîne technique complète fonctionne : vision `1216x800`, `950`
   marqueurs image, prompt `971` tokens, globals, 48 couches, réduction et
   premier token généré (`2005`, décodé `“`). Le profiler a écrit
@@ -2286,7 +2286,7 @@ qualité. La modification d’API upstream M1 est hors périmètre du portage.
   fonctionne (`24` tokens de prompt, TTFT `128,457 s`, pic `34,66 Go`), mais la
   sortie n'est pas une réponse exploitable.
 - Le même smoke avec l'image locale
-  `/Users/vincent/Downloads/licensed-image-2.jpeg` consomme bien la tour
+  `~/Downloads/licensed-image-2.jpeg` consomme bien la tour
   vision (`1216×800`, `950` marqueurs, `978` tokens de prompt) et traverse les
   `48` couches. Il produit néanmoins `y\\n\\n2user...\\n<|im_end|>` : la
   multimodalité est techniquement branchée, mais sa qualité n'est pas validée.
@@ -2609,7 +2609,7 @@ Toute l'infrastructure de parité (QSA masque/indexeur, MRoPE, vision, GDN, glob
 python3 -m venv venv617 && venv617/bin/pip install mlx-vlm==0.6.17
 # sanité absolue, normes corrigées (≈ 2 min, pic ≈ 35 Go)
 venv617/bin/python Scripts/qwen4-exp-official-teacher-forced.py \
-  --model-dir /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP \
+  --model-dir $QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP \
   --norm-shift -1 --output /tmp/qb-normfix.safetensors \
   --ids 248045,846,198,42498,2295,644,52543,7528,1725,501,85648,401,1147,183085,1778,24232,1725,4292,176517,13,248046,198,248045,74455,198,248068,271,248069,271
 # comparaison checkpoint ↔ HF BF16 (couche 0 + globaux, expert 0)
@@ -2918,7 +2918,7 @@ venv617/bin/python Scripts/qwen4-exp-checkpoint-vs-hf.py
 ### Étape V46 — probe Flash et parité n-gram exécutés depuis Xcode — 2026-09-05
 
 - `flash-generate-probe` a terminé avec le code 0 et a exporté
-  `/Users/vincent/Downloads/qwen38-flash.trace.json`. Le chemin d'exécution
+  `~/Downloads/qwen38-flash.trace.json`. Le chemin d'exécution
   Flash-Next et l'écriture de trace sont donc fonctionnels dans le contexte
   Xcode/Metal.
 - `flash-ngram-parity --shard 0 --rows 0,1,12345` a terminé avec le code 0 :
@@ -2932,7 +2932,7 @@ venv617/bin/python Scripts/qwen4-exp-checkpoint-vs-hf.py
 
 ### Étape V47 — trace profiler Flash-Next vérifiée — 2026-09-05
 
-- La trace `/Users/vincent/Downloads/qwen38-flash.trace.json`, copiée dans le
+- La trace `~/Downloads/qwen38-flash.trace.json`, copiée dans le
   dépôt après export Xcode, contient 608 événements et identifie le device
   `applegpu_g15s`.
 - Les événements `C` `Flash n-gram cache` sont présents avec deux points
@@ -3065,7 +3065,7 @@ Reprise recommandée, dans cet ordre :
 
    ```text
    flash-generate-probe
-   /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+   $QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
    --prompt
    Explique en français qui est le président de la Chine et quel est son rôle.
    --max-new-tokens
@@ -3074,7 +3074,7 @@ Reprise recommandée, dans cet ordre :
    --resident-eval-interval
    8
    --trace
-   /Users/vincent/Developpements/qwen38-mlx-swift/qwen38-flash-quality-enriched.trace.json
+   <repo>/qwen38-flash-quality-enriched.trace.json
    ```
 
 3. Inspecter dans la nouvelle trace `Session Info.decoded` et
@@ -3203,7 +3203,7 @@ et prompt identiques au reste de la campagne V53/V54) :
 
 ```text
 flash-generate-probe
-/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
 --prompt "Explique en français qui est le président de la Chine et quel est son rôle."
 --max-new-tokens 8
 --mtp
@@ -3636,7 +3636,7 @@ réelle est `in × bits % 32 == 0`) ; Lexar : 192 Go libres.
 
 | # | Tâche | Critère |
 |---|---|---|
-| Q3.1 | `Scripts/qwen4-exp-requantize-experts.py` (Python `venv617`) : shard par shard, pour chaque tenseur `*.mlp.switch_mlp.{gate,up,down}_proj.weight` avec ses `.scales`/`.biases` : `mx.dequantize(4, g32)` → `mx.quantize(bits=3, group_size=64)` ; tous les autres tenseurs recopiés tels quels (n-gram, attention, shared expert, gates, normes) ; `mx.eval` par tenseur, un shard en mémoire à la fois ; nouvel index et `config.json` avec `"quantization": {"group_size": 32, "bits": 4, "mode": "affine", "experts": {"group_size": 64, "bits": 3, "mode": "affine"}}`. Sortie : `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`. Rapport : taille totale, taille experts, erreur de reconstruction moyenne/max sur 3 experts (4-bit vs 3-bit vs les deux). | dossier complet, `index.json` cohérent, taille experts ≈ 53 Go |
+| Q3.1 | `Scripts/qwen4-exp-requantize-experts.py` (Python `venv617`) : shard par shard, pour chaque tenseur `*.mlp.switch_mlp.{gate,up,down}_proj.weight` avec ses `.scales`/`.biases` : `mx.dequantize(4, g32)` → `mx.quantize(bits=3, group_size=64)` ; tous les autres tenseurs recopiés tels quels (n-gram, attention, shared expert, gates, normes) ; `mx.eval` par tenseur, un shard en mémoire à la fois ; nouvel index et `config.json` avec `"quantization": {"group_size": 32, "bits": 4, "mode": "affine", "experts": {"group_size": 64, "bits": 3, "mode": "affine"}}`. Sortie : `$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`. Rapport : taille totale, taille experts, erreur de reconstruction moyenne/max sur 3 experts (4-bit vs 3-bit vs les deux). | dossier complet, `index.json` cohérent, taille experts ≈ 53 Go |
 | Q3.2 | Swift : `Qwen4ExpQuantization` lit l'override `experts` ; `Qwen4ExpQuantizationSpec` relaxe la précondition ; `Qwen4ExpSparseMoE` construit `SwitchGLU` avec le spec experts ; loader résident et `dequantize` (oracle E3) choisissent le spec selon la clé ; `Qwen4ExpLayerBench --expert-bits 3` pour mesurer le débit 3-bit. Tests : parse de l'override, module empaqueté 3-bit, bench réduit. | 65+ tests verts, Release construit |
 | Q3.3 | Validation sur le nouveau checkpoint (machine propre, préflight, `caffeinate`) : (a) `flash-teacher-forced-score` sur la séquence V32 — rapporter hit-rate et logprob face aux 10/28 et −4,4 du 4-bit ; (b) `flash-chat-probe … --temperature 0 --max-new-tokens 8 --resident-layers` sur le prompt de référence ; (c) pic mémoire et s/token via le sampler. | tableau 4-bit vs 3-bit dans `log.md` ; décision « qualité acceptable ? » posée à Vincent |
 | P3 (post-G-8) | Déchargement disque des experts : experts sur SSD interne, mmap, gather des 10 experts routés vers un tenseur `[10, out, in]` par couche et par token, LRU d'experts chauds ; à concevoir après Q3. | étude puis prototype sur le bench |
@@ -3649,7 +3649,7 @@ acceptée sur le dernier message utilisateur en mode stateless.
 
 **Démo G-8 (Vincent)** — checkpoint `local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`,
 binaire Release (`Scripts/build-release.sh`), machine dans son état normal :
-1. GUI : sélectionner le 3-bit dans le catalogue (`/Volumes/Lexar/models/local`),
+1. GUI : sélectionner le 3-bit dans le catalogue (`$QWEN38_MODELS_DIR/local`),
    chargement ~60 s avec progression, puis texte / thinking / image / deux tours.
 2. Serveur : onglet Serveur ou `qwen38 serve --model-path …`, puis depuis
    l'autre Mac : `curl -N` streaming, SDK `openai`, image en `data:` base64.
@@ -3997,7 +3997,7 @@ le **modèle réel** à IDs identiques ; sinon retiré et consigné.
 | P7.3 | **`MLX.compile` du pas complet** (et non par couche, seule variante jamais testée) : dans le bench, compiler la fonction « 1 token → logits » sur les N couches résidentes avec les caches en `inputs`/`outputs` ; mesurer `--compiled-step` contre le chemin normal. P2-code (c) n'avait compilé qu'une couche isolée : à l'échelle du pas, `compile` peut fusionner les chaînes élémentaires **entre** couches. Si `compile` refuse (formes dépendant de l'offset de cache), documenter l'obstacle exact. | ms/pas avant/après, parité 1e-3 |
 | P7.4 | **Fusion Metal du sous-bloc dominant** désigné par P7.1 (candidat attendu : la chaîne de gating GDN — `-exp(A_log)·softplus(a+dt_bias)`, `sigmoid(b)`, fenêtre conv1d, RMSNormGated — soit ~15-20 ops élémentaires réductibles à un noyau) via `MLXFast.metalKernel`, derrière `Qwen4ExpFusionLevel`, avec test de parité bit-exacte ou 1e-3 contre le chemin d'origine conservé. Un seul sous-bloc, celui qui domine. | bench : ms/pas avant/après ; parité |
 | P7.5 | **Second sous-bloc** (si P7.1 en désigne un autre > 15 % et que P7.4 a tenu sa promesse) ; sinon passer directement à P7.6. | idem |
-| P7.6 | **Validation sur le checkpoint réel** (3-bit hybride SSD `/Users/vincent/models/local/…e3bit-MTP`) : `flash-chat-probe --temperature 0 --max-new-tokens 32 --resident-layers --resident-async` ⇒ IDs identiques à `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, …]` ; garde Q-B (`-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()`, 10/28 et −4,80) ; tok/s greedy et MTP avant/après ; `BENCHMARKS.md`. **Jauge : ≥ 9 tok/s** (≈ 2,3 ms/couche), à défaut consigner le plafond atteint et ce qui le tient. | tableau récapitulatif |
+| P7.6 | **Validation sur le checkpoint réel** (3-bit hybride SSD `~/models/local/…e3bit-MTP`) : `flash-chat-probe --temperature 0 --max-new-tokens 32 --resident-layers --resident-async` ⇒ IDs identiques à `[2229, 85648, 401, 1147, 183085, 1725, 41016, 90171, …]` ; garde Q-B (`-only-testing:Qwen38Tests/flashTeacherForcedRegressionGuardV32()`, 10/28 et −4,80) ; tok/s greedy et MTP avant/après ; `BENCHMARKS.md`. **Jauge : ≥ 9 tok/s** (≈ 2,3 ms/couche), à défaut consigner le plafond atteint et ce qui le tient. | tableau récapitulatif |
 
 Hors périmètre P7 : le préfill (traité le 2026-09-11, la copie SSD des shards
 n-gram donne −37 % ; le reliquat est le chemin hôte de lecture des lignes), le

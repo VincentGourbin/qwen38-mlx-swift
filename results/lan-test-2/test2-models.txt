@@ -1,2 +1,0 @@
-{"data":[{"object":"model","loaded":true,"id":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","family":"qwen4_exp","owned_by":"local"}],"object":"list"}
-HTTP_CODE: 200

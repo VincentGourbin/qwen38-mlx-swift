@@ -18,3 +18,12 @@ results/**/*.xctrace.log
 
 Scripts/hf-cache/
 venv617/
+
+# Fixtures de parité : régénérables depuis la référence Python avec le
+# checkpoint complet (docs/parity-method.md). Trop lourdes pour un dépôt
+# public, et inutiles sans le checkpoint.
+parity/*.safetensors
+
+# Bytecode Python des scripts de référence (régénérable)
+__pycache__/
+*.pyc

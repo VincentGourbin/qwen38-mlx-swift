@@ -1,2 +1,0 @@
-{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"La capitale de l'Australie est **Canberra**.\n\nBien que Sydney et Melbourne soient les villes les plus connues et les plus peuplées, Canberra a été choisie comme capitale fédérale en 1908"}}],"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","id":"chatcmpl-31C0889F-9EF6-4B48-BB1C-168542B0772F","object":"chat.completion","created":1788990449}
-HTTP_CODE: 200

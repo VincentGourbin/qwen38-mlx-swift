@@ -1,4 +1,4 @@
-[12:17:14] === dialogue A/B sur http://192.168.0.226:8848 · modèle Qwen3.8-Flash-Next-MLX-e3bit-MTP · max_tokens 120 · T=0.7
+[12:17:14] === dialogue A/B sur http://192.0.2.10:8848 · modèle Qwen3.8-Flash-Next-MLX-e3bit-MTP · max_tokens 120 · T=0.7
 [12:17:14] A (Aria) : Hello
 [12:17:27] B (Bastien) [tour 1 · prompt 82 tok · 76 tok · TTFT 1.53 s · 6.5 tok/s · 13.3 s · finish stop · cumul 76 tok, 0.2 min] : Salut ! Tu as une drôle de façon de commencer une conversation historique, on dirait que tu viens de débarquer d'une autre époque avec ton « Hello » anglophone.
 

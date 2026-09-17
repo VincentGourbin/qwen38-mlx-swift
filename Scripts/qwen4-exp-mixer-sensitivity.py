@@ -12,7 +12,7 @@ basculer l'argmax).
 
 Usage :
   python3 Scripts/qwen4-exp-mixer-sensitivity.py \
-    --model-dir /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP \
+    --model-dir "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP" \
     --scratch <chemin du language.py qwen4_exp de référence> \
     --fixture parity/qwen4-exp-selected-layers-reference.safetensors
 """

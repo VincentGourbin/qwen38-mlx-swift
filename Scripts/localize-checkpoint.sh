@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Crée sur le SSD interne une vue « hybride » d'un checkpoint Flash-Next du
-# Lexar : les shards de la table n-gram (lus par petits accès aléatoires à
+# Crée sur le SSD interne une vue « hybride » d'un checkpoint Flash-Next posé
+# sur un volume externe : les shards de la table n-gram (lus par petits accès aléatoires à
 # chaque token, ceux qui souffrent le plus de l'USB) sont COPIÉS, les autres
 # shards (lus une fois, séquentiellement, au chargement) sont des LIENS
-# SYMBOLIQUES vers le Lexar, et les petits fichiers (config, tokenizer…) sont
+# SYMBOLIQUES vers le volume externe, et les petits fichiers (config, tokenizer…) sont
 # copiés. Le loader suit les liens sans rien savoir. Avec --full, tout est
-# copié (plus aucune dépendance au Lexar). Idempotent : relancer complète.
+# copié (plus aucune dépendance au volume externe). Idempotent : relancer complète.
 #
-#   Scripts/localize-checkpoint.sh <src Lexar> <dst SSD> [--full]
+#   Scripts/localize-checkpoint.sh <src volume externe> <dst SSD interne> [--full]
 set -euo pipefail
 export LC_ALL=C
 src="${1:?src}"; dst="${2:?dst}"; mode="${3:-ngram}"

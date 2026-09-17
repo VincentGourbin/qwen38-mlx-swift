@@ -1,1 +1,0 @@
-{"object":"chat.completion","id":"chatcmpl-9E1BA79E-2A74-4B8C-864E-CCDAB095AE00","model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","created":1788949955,"choices":[{"message":{"content":"Le président de la Chine, Xi Jinping, est né le 15 juin 1953. Il a","role":"assistant"},"index":0,"finish_reason":"length"}]}

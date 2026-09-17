@@ -73,7 +73,7 @@
   commands, and a small SwiftUI benchmark surface.
 - Verified a Debug build with `xcodebuild`; tests must run serially through
   `Scripts/run-tests.sh` because of the known MLX lock-order hazard.
-- Downloaded `mlx-community/Qwen3.8-27B-4bit` to `/Volumes/Lexar/models`
+- Downloaded `mlx-community/Qwen3.8-27B-4bit` to `$QWEN38_MODELS_DIR`
   (16.08 GB, three shards). A custom URLSession delegate stalled before the
   first byte on the HF LFS redirect; the native async `URLSession.download`
   path follows the redirect correctly and now resumes at completed-file
@@ -94,7 +94,7 @@
   and keeps the model weights resident. Thinking effort is passed per turn as
   `low`, `medium`, or `xhigh` through the Qwen chat-template context.
 - The 8-bit sibling checkpoint is available on the Lexar at
-  `/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-8bit` (29.53 GB) and passed
+  `$QWEN38_MODELS_DIR/mlx-community/Qwen3.8-27B-8bit` (29.53 GB) and passed
   a real smoke inference: 69 prompt tokens at 12 tok/s, 24 generated at 6.9
   tok/s, TTFT 5.85 s. The 4-bit ChatSession path also passed: 67 prompt tokens
   at 57 tok/s, 24 generated at 10.7 tok/s, TTFT 1.19 s.
@@ -794,7 +794,7 @@ exécutée depuis le contexte Xcode/GUI qui dispose du device Metal.
 ## 2026-09-05 — probe Flash et parité n-gram depuis Xcode
 
 Le probe Flash-Next a terminé avec le code 0 et écrit
-`/Users/vincent/Downloads/qwen38-flash.trace.json`. La parité n-gram réelle
+`~/Downloads/qwen38-flash.trace.json`. La parité n-gram réelle
 est exacte (`max delta 0`, `mean delta 0`, `18 hits`, `9 misses`, `9 entrées`,
 delta de répétition nul). Il reste à inspecter dans Perfetto que la trace
 contient bien les événements `Flash n-gram cache` exportés par le profiler.
@@ -869,7 +869,7 @@ finale visible. TTFT 96,891 s, décodage 87,191 s, pic MLX 78,83/80,27 Go. Ce
 résultat est un sanity-check positif, pas encore une preuve complète du
 bornage thinking — un budget de tokens plus large serait nécessaire pour voir
 `</think>` et la réponse. Étape suivante du HANDOFF : test multimodal avec
-`/Users/vincent/Downloads/licensed-image-2.jpeg`, l'image de référence déjà
+`~/Downloads/licensed-image-2.jpeg`, l'image de référence déjà
 utilisée dans toute la campagne Flash-Next.
 
 Le test multimodal (même checkpoint, image `licensed-image-2.jpeg` — portrait
@@ -1570,7 +1570,7 @@ conformément à PLAN.md §6.3 piège 8.
 
 **Test avant la conversion complète** : `--dry-run` (liste 3747 tenseurs
 dont 441 clés d'experts) puis `--limit-shards 1` vers
-`/Volumes/Lexar/models/local/_test-e3bit` (supprimé ensuite — seul dossier
+`$QWEN38_MODELS_DIR/local/_test-e3bit` (supprimé ensuite — seul dossier
 Lexar que j'ai créé moi-même). Formes vérifiées : poids `[512, 640, 240]`
 (gate/up, entrée 2560) et `[512, 2560, 60]` (down, entrée 640) ; scales
 `[512, 640, 40]` et `[512, 2560, 10]` — `2560/64=40` et `640/64=10` comme
@@ -1617,7 +1617,7 @@ tenseur-par-tenseur.
 64, "bits": 3, "mode": "affine"}}` ; tous les autres fichiers non-safetensors
 (tokenizer, chat template, LICENSE, README, `.gitattributes`, etc.) sont
 copiés tels quels. Nouveau checkpoint :
-`/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`.
+`$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`.
 
 ## 2026-09-08 — Q3.2 : support Swift du spec experts distinct
 
@@ -1670,7 +1670,7 @@ Vontra » restent verts (logique de normes inchangée, non touchée par Q3.2).
 
 ## 2026-09-08 (nuit) — Q3.3 : experts 3-bit g64 validés sur la référence
 
-Checkpoint `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+Checkpoint `$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
 (Q3.1 : experts 71,8 → 50,2 Go, total 84 Go ; erreur de reconstruction
 4-bit → 3-bit ≈ 20 % RMS relative, uniforme sur les couches 0/24/47).
 Mesures Release, résident, `asyncEval`, machine en usage courant (8 à 22 Go
@@ -2031,7 +2031,7 @@ implémenté (ci-dessus).
 
 ### F7 — validation sur le checkpoint 3-bit : bloquée, non exécutée
 
-`Scripts/preflight-resident.sh /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+`Scripts/preflight-resident.sh $QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
 (seuil relevé à 30 Go comme prescrit pour ce checkpoint) : **REFUS** — 43,9 Go
 à évincer (41,0 Go anonyme + 2,4 Go compresseur + 0,5 Go swap), dont 24,0 Go
 pour `qwen38-bench-ui` (process actif, PID distinct de cette session) et
@@ -2047,12 +2047,12 @@ pour qu'une prochaine session puisse lancer F7 directement quand la machine
 sera libre :
 
 ```
-Scripts/preflight-resident.sh /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP
+Scripts/preflight-resident.sh $QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP
 caffeinate -dimsu ./.xcodebuild/Build/Products/Release/qwen38 flash-chat-probe \
-  /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
+  $QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
   --prompt "Explique en français qui est le président de la Chine et quel est son rôle." \
   --temperature 0 --max-new-tokens 8 --resident-layers --resident-async --fusion-level 4
-TEST_RUNNER_QWEN38_FLASH_MODEL=/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
+TEST_RUNNER_QWEN38_FLASH_MODEL=$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
   TEST_RUNNER_SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=1 caffeinate -dimsu \
   xcodebuild -scheme Qwen38MLXSwift-Package -configuration Debug \
   -destination 'platform=macOS' -derivedDataPath .xcodebuild-tests \
@@ -2114,7 +2114,7 @@ Reprise du fil laissé ouvert par V54 (~880s hors de toute phase profilée sur
 Objectif : instrumenter `Qwen4ExpFlashMTPGenerator.generateMTP` (PM1),
 corriger dans l'ordre du coût mesuré (PM2), puis décider si le MTP local
 passe en production (PM3). Tout mesuré sur le checkpoint 3-bit
-`/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`, Release,
+`$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`, Release,
 `--resident-layers --resident-async`, prompt de référence.
 
 ### PM1 — instrumentation
@@ -2347,7 +2347,7 @@ vert.
 ### PM4.3 — mesure sur le 3-bit
 
 Protocole : préflight (`QWEN38_PREFLIGHT_LIMIT_GB=35 Scripts/preflight-resident.sh
-/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`) → 23,1 Go à
+$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`) → 23,1 Go à
 évincer, PASS. Chaque run sous `caffeinate -dimsu`, Release,
 `--resident-layers --resident-async`, prompt de référence. **IDs identiques
 au greedy dans les 12 runs** (32 et 128 tokens, blocs 2/3/4, comparaison
@@ -2533,7 +2533,7 @@ réelles, pas seulement en test unitaire.
 
 ## 2026-09-09 — Checkpoint 3-bit « hybride » sur le SSD interne (n-gram local, experts liés au Lexar)
 
-`Scripts/localize-checkpoint.sh` crée `/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` :
+`Scripts/localize-checkpoint.sh` crée `~/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` :
 les 7 shards de la table n-gram (35,7 Go, lus par accès aléatoires à chaque
 token) sont copiés sur le SSD (54 s), les 15 autres shards sont des liens
 symboliques vers le Lexar, les petits fichiers sont copiés ; `--full` copie
@@ -2574,7 +2574,7 @@ soit 40 ms/token contre 5 ms/token à chaud), tâche P4.5.
 
 Protocole PLAN.md « P4 — Débit de décodage : mesurer exactement, puis
 fusionner » (2026-09-09). Ordre exécuté : P4.0 → P4.1 → P4.2 → P4.4 → P4.5 →
-P4.3 → P4.6. Tout mesuré sur `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
+P4.3 → P4.6. Tout mesuré sur `$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`
 (3-bit, 84 Go), Release, résident, prompt de référence, `caffeinate -dimsu` +
 `Scripts/preflight-resident.sh` (seuil 35 Go) devant chaque run réel, jamais
 deux runs simultanés.
@@ -2879,7 +2879,7 @@ et le sweep complet conservés dans `results/`.
 ## 2026-09-09 (soir) — Test LAN par agent (8 requêtes) et correctifs GUI/serveur
 
 Serveur lancé depuis la GUI (Release), 3-bit chargé, agent Haiku en client
-`curl` sur `http://192.168.1.183:8848` (bind LAN, même machine). 8 requêtes :
+`curl` sur `http://192.0.2.10:8848` (bind LAN, même machine). 8 requêtes :
 tours liés par `conversation_id`, streaming MTP (98 chunks, `[DONE]`,
 33/63 acceptés), thinking `low` (reasoning et contenu non vides, Canberra),
 image (Emmanuel Macron, 976 tokens de prompt, TTFT 7,3 s), sampling
@@ -2926,7 +2926,7 @@ est Xi Jinping… ») mais le serveur la rangeait dans `reasoning_content` :
 indépendamment de l'option réellement rendue. Le parser de flux thinking
 supposait le prompt terminé à l'intérieur de `<think>`. Correctif :
 `thinkingIsPrimed = options.enableThinking`. Au passage : l'IP LAN du Mac
-change avec le DHCP (192.168.1.183 → .87 cette nuit) ; l'onglet Serveur la lit
+change avec le DHCP (192.0.2.10 → .87 cette nuit) ; l'onglet Serveur la lit
 en direct, les scripts de test doivent la relire aussi.
 
 ## 2026-09-10 — Dialogue A/B de 20 minutes sous profiler 1.5.0 (serveur CLI, 3-bit)
@@ -3296,7 +3296,7 @@ sans P3, même après reboot.
 ## 2026-09-11 — Shards n-gram sur le SSD interne : le préfill réel gagne 37 %
 
 `Scripts/localize-checkpoint.sh` a produit
-`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` : 7 shards
+`~/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` : 7 shards
 n-gram copiés (35,7 Go, 53 s), 15 shards liés au Lexar, 138 Go encore libres.
 Le chargement lit les shards liés et n'est pas concerné ; seul le préfill
 touche la table n-gram (mmap paresseux).
@@ -3532,7 +3532,7 @@ consigne) — et P7.4 n'a de toute façon rien retenu. Passage direct à P7.6.
 
 ### P7.6 — validation finale sur le checkpoint réel
 
-`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
+`~/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
 hybride SSD), `caffeinate -dimsu` + `Scripts/preflight-resident.sh` (seuil
 35 Go, PASS à 16,8-23,5 Go selon les runs) devant chaque run, jamais deux
 runs simultanés, GUI vérifiée non résidente (`pgrep qwen38-bench-ui`
@@ -3935,7 +3935,7 @@ piste consignée pour une tâche future.
 
 ### P8.5 — validation sur le checkpoint réel
 
-`/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
+`~/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (3-bit
 hybride SSD interne). `pgrep -x qwen38-bench-ui` négatif avant chaque run.
 `Scripts/preflight-resident.sh` avec `QWEN38_PREFLIGHT_LIMIT_GB=35` (25,3 Go
 à évincer, sous le seuil retenu pour cette tâche) : PASS. Tous les runs

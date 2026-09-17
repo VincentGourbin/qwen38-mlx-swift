@@ -56,15 +56,25 @@ final class BenchViewModel: ObservableObject {
     /// Profils de chemins de modèle (demande Vincent 2026-09-09) : liste
     /// persistée dans UserDefaults, un clic recharge le catalogue autour du
     /// chemin choisi ; le dernier chemin utilisé est restauré au lancement.
-    static let defaultProfiles = [
-        // Hybride : shards n-gram sur le SSD interne, le reste lié au Lexar.
-        // Mesuré le 2026-09-11 : préfill réel 48,6 → 77,6 tok/s (−37 %), la
-        // couche n-gram pesant 88 % du préfill sur du texte varié.
-        "/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
-        "/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
-        "/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
-        "/Volumes/Lexar/models/mlx-community/Qwen3.8-27B-4bit",
-    ]
+    /// Construits à partir de `Qwen38ModelCache.modelsDirectory`, donc de
+    /// `$QWEN38_MODELS_DIR` (défaut `~/models`) : aucun chemin de machine
+    /// n'est codé en dur. Ces entrées ne sont que des amorces — la liste
+    /// réellement affichée est celle persistée dans `UserDefaults`, que
+    /// l'utilisateur complète depuis l'interface.
+    ///
+    /// Un checkpoint « hybride » (shards n-gram copiés sur le SSD interne,
+    /// le reste en liens symboliques vers le volume externe, cf.
+    /// `Scripts/localize-checkpoint.sh`) se déclare comme un profil de plus :
+    /// mesuré le 2026-09-11, préfill réel 48,6 → 77,6 tok/s (−37 %), la
+    /// couche n-gram pesant 88 % du préfill sur du texte varié.
+    static var defaultProfiles: [String] {
+        let models = Qwen38ModelCache.modelsDirectory.path
+        return [
+            "\(models)/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP",
+            "\(models)/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+            "\(models)/mlx-community/Qwen3.8-27B-4bit",
+        ]
+    }
     private static let profilesKey = "qwen38.modelProfiles"
     private static let lastPathKey = "qwen38.lastModelPath"
 
@@ -250,7 +260,7 @@ final class BenchViewModel: ObservableObject {
                     mtpEnabled = false
                 }
                 if await runtime.isFlashNextLoaded {
-                    status = "Chargement Flash-Next (résident, ~100 s depuis le Lexar)…"
+                    status = "Chargement Flash-Next (résident, ~100 s depuis un SSD externe USB)…"
                     flashLoadProgress = (0, expectedLayers)
                     if let progress = await runtime.flashNextWarmUp() {
                         for await visited in progress {

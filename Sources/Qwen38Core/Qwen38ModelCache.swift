@@ -1,8 +1,23 @@
 import Foundation
 
-/// Local model discovery for the external Lexar volume and the user cache.
+/// Local model discovery.
+///
+/// The root is resolved once, in this order:
+///   1. `customModelsDirectory`, set programmatically (CLI `--model-path`, GUI, tests);
+///   2. `$QWEN38_MODELS_DIR` — use it to point at an external volume, e.g.
+///      `export QWEN38_MODELS_DIR=/Volumes/MySSD/models`;
+///   3. `~/models` when that directory exists;
+///   4. `~/Library/Caches/models` otherwise (the download destination).
 public enum Qwen38ModelCache {
-    public static let defaultModelDirectory = URL(fileURLWithPath: "/Volumes/Lexar/models", isDirectory: true)
+    /// `$QWEN38_MODELS_DIR` if set, else `~/models`.
+    public static let defaultModelDirectory: URL = {
+        let environment = ProcessInfo.processInfo.environment["QWEN38_MODELS_DIR"] ?? ""
+        if !environment.isEmpty {
+            return URL(fileURLWithPath: (environment as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("models", isDirectory: true)
+    }()
 
     /// Override used by the CLI, GUI, and tests. Set this once during process
     /// startup, before loading a model.

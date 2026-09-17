@@ -1,7 +1,0 @@
-ablation P7.1 : moe-routing
---- couche qsa ---
-mémoire couche: 1,62 GB
-ms/pas — médiane 0.97  p10 0.96  p90 0.99  min 0.96  max 1.03
-CPU moyen: 121.9 %   GPU moyen: 0.9 %
-MLX mémoire active: 20 bytes
-MLX mémoire peak: 1,64 GB

@@ -4,6 +4,7 @@ tensors fetched by HTTP range requests (only layer 0 + globals, expert 0 only).
 
 Revue 2026-09-02. Necessite `hf auth token` valide et mlx (venv 0.6.17 ou python systeme).
 Les tenseurs BF16 (~120 Mo) sont mis en cache dans Scripts/hf-cache/ (ou $QWEN4_HF_CACHE).
+Checkpoint : $QWEN38_FLASH_CHECKPOINT, sinon $QWEN38_MODELS_DIR (defaut ~/models) + le chemin Vontra.
 Resultat attendu : projections 4-bit rel_rms ~0.085 / cos ~0.996 ; hc_norm : ecart +1.0."""
 import json, os, struct, subprocess, sys
 import numpy as np
@@ -11,7 +12,11 @@ import mlx.core as mx
 
 S = os.environ.get("QWEN4_HF_CACHE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf-cache"))
 os.makedirs(S, exist_ok=True)
-M = "/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP"
+MODELS_DIR = os.environ.get("QWEN38_MODELS_DIR") or os.path.expanduser("~/models")
+M = os.environ.get(
+    "QWEN38_FLASH_CHECKPOINT",
+    os.path.join(MODELS_DIR, "Vontra", "Qwen3.8-Flash-Next-MLX-4bit-MTP"),
+)
 BASE = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 TOK = subprocess.run(["hf", "auth", "token"], capture_output=True, text=True).stdout.strip()
 idx = json.load(open(f"{M}/model.safetensors.index.json"))["weight_map"]

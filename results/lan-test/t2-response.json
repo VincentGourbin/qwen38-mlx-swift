@@ -1,1 +1,0 @@
-{"created":1788988627,"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","object":"chat.completion","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Je ne connais pas la date."},"index":0}],"id":"chatcmpl-15F93828-50E8-49C6-B1DB-A2E0D6CA5280"}

@@ -1,8 +1,0 @@
-routed experts (K) : 10/512
-fusion level : 7 · resident-async-interval : 48
-=== variante : none · 1 jeton(s)/pas ===
-ablation active : none
-routed experts (K) : 10/512
-ms/pas (1 jeton(s)/pas) — pas retenus 96 · médiane 44.511 · moyenne 43.859 · écart-type 1.676 · min 39.491 · max 47.017
-MLX mémoire active: 57,39 GB
-MLX mémoire peak: 57,42 GB

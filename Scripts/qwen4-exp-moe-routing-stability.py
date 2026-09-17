@@ -12,7 +12,7 @@ Deux mesures sur le fixture naturel couche 4 et les poids réels du checkpoint :
 
 Usage :
   python3 Scripts/qwen4-exp-moe-routing-stability.py \
-    --model-dir /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP \
+    --model-dir "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP" \
     --fixture parity/qwen4-exp-e5-natural-public-layer-4-reference.safetensors \
     --layer 4
 """

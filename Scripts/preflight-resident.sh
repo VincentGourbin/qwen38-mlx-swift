@@ -13,7 +13,7 @@ set -euo pipefail
 export LC_ALL=C
 
 limit_gb="${QWEN38_PREFLIGHT_LIMIT_GB:-9}"
-checkpoint="${1:-/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
+checkpoint="${1:-${QWEN38_MODELS_DIR:-$HOME/models}/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"
 page=$(vm_stat | head -1 | grep -o '[0-9]*')
 anon=$(vm_stat | awk '/Anonymous pages/ {gsub("\\.","",$3); print $3}')
 comp=$(vm_stat | awk '/Pages stored in compressor/ {gsub("\\.","",$5); print $5}')
@@ -41,7 +41,7 @@ status=0
 if [ "${power}" != "AC Power" ]; then echo "AVERTISSEMENT : sur batterie — brancher le secteur (P1 : veille à 1 min sur batterie)"; fi
 if [ "${assert}" = "0" ]; then echo "AVERTISSEMENT : aucune assertion anti-veille — lancer le run via caffeinate -dimsu (la GUI/le serveur la posent eux-mêmes depuis P1)"; fi
 if [ ! -f "${checkpoint}/config.json" ]; then
-  echo "REFUS : checkpoint absent (Lexar non monté ?) : ${checkpoint}"; status=1
+  echo "REFUS : checkpoint absent (volume de modèles non monté ?) : ${checkpoint}"; status=1
 fi
 if python3 -c "import sys; sys.exit(0 if $total_gb <= $limit_gb else 1)"; then
   echo "OK : marge mémoire suffisante"

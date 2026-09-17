@@ -1,1 +1,0 @@
-{"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","temperature":0,"max_tokens":466,"messages":[{"role":"user","content":"Explique en détail le fonctionnement d'un connecteur USB-C, ses broches, ses modes alternatifs et ses limites électriques."}]}

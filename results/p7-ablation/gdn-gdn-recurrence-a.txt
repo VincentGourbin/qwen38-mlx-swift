@@ -1,7 +1,0 @@
-ablation P7.1 : gdn-recurrence
---- couche gdn ---
-mémoire couche: 1,63 GB
-ms/pas — médiane 4.44  p10 4.41  p90 4.48  min 4.40  max 5.31
-CPU moyen: 21.9 %   GPU moyen: 49.4 %
-MLX mémoire active: 16 bytes
-MLX mémoire peak: 2,91 GB

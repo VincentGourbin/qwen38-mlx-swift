@@ -1,2 +1,0 @@
-{"model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","choices":[{"index":0,"finish_reason":"length","message":{"content":"Sur cette image, on voit **Emmanuel Macron**, le président de la République française.\n\n### Rôle :\nIl est **le chef de l’État français**, élu au suffrage universel direct pour un mandat de cinq ans","role":"assistant"}}],"id":"chatcmpl-792976CB-00C8-4FD9-B547-FF12D9D8112A","object":"chat.completion","created":1788990494}
-HTTP_CODE: 200

@@ -1,2 +1,0 @@
-{"error":{"type":"invalid_request_error","message":"Modèle indisponible dans le catalogue local : inexistant."}}
-HTTP_CODE: 404

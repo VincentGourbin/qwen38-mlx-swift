@@ -4,7 +4,7 @@
 PLAN.md, "G-4bis levée — décision Vincent du 2026-09-08", tâche Q3.1.
 
 Streams the converted Vontra checkpoint
-(`/Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`) shard by
+(`$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`) shard by
 shard. For every `*.mlp.switch_mlp.{gate_proj,up_proj,down_proj}.weight`
 tensor (and its `.scales`/`.biases` companions):
 
@@ -27,21 +27,25 @@ written to its output shard and released before the next one is touched.
 
 Usage:
     venv617/bin/python Scripts/qwen4-exp-requantize-experts.py --dry-run \
-        --src /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+        --src "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP"
 
     venv617/bin/python Scripts/qwen4-exp-requantize-experts.py \
-        --src /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP \
+        --src "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP" \
         --limit-shards 1 --dst /path/to/test-dir
 
     caffeinate -dimsu venv617/bin/python \
         Scripts/qwen4-exp-requantize-experts.py \
-        --src /Volumes/Lexar/models/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+        --src "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP"
+
+`$QWEN38_MODELS_DIR` defaults to `~/models`; `--dst` defaults to
+`$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import time
@@ -51,7 +55,8 @@ from typing import Any
 
 import mlx.core as mx
 
-DEFAULT_DST = "/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP"
+MODELS_DIR = os.environ.get("QWEN38_MODELS_DIR") or os.path.expanduser("~/models")
+DEFAULT_DST = os.path.join(MODELS_DIR, "local", "Qwen3.8-Flash-Next-MLX-e3bit-MTP")
 INDEX_NAME = "model.safetensors.index.json"
 EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.weight$")
 SUFFIXES = (".weight", ".scales", ".biases")

@@ -1,7 +1,0 @@
-ablation P7.1 : moe
---- couche gdn ---
-mémoire couche: 1,63 GB
-ms/pas — médiane 0.54  p10 0.53  p90 0.57  min 0.52  max 0.67
-CPU moyen: 95.8 %   GPU moyen: 18.1 %
-MLX mémoire active: 16 bytes
-MLX mémoire peak: 1,73 GB

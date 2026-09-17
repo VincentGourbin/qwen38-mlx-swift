@@ -1,2 +1,0 @@
-{"status":"running","model":"Qwen3.8-Flash-Next-MLX-e3bit-MTP","queue":"0","model_loaded":true}
-HTTP_CODE: 200
