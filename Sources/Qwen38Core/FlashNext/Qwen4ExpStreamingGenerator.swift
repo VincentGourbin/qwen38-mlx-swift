@@ -286,7 +286,11 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
             inputIDs: prompt,
             positionIDs: positionIDs,
             visionEmbeddings: visionEmbeddings,
-            imageTokenID: imageTokenID)
+            imageTokenID: imageTokenID,
+            // Seule `logits[0..., -1, 0...]` (ci-dessous) est lue : pas de
+            // `preMixerHidden` multi-position, pas de `verificationCapture`
+            // — voir le commentaire de `forward(lastPositionOnly:)`.
+            lastPositionOnly: true)
         eval(prefill.logits)
         recordNGramCacheStats(profiler)
         var layerVisitCount = prefill.reports.count
@@ -357,7 +361,8 @@ public final class Qwen4ExpStreamingGenerator: @unchecked Sendable {
             }
             if Task.isCancelled { break }
 
-            let step = try model.forward(inputIDs: MLXArray([token]).reshaped([1, 1]))
+            let step = try model.forward(
+                inputIDs: MLXArray([token]).reshaped([1, 1]), lastPositionOnly: true)
             eval(step.logits)
             lmHeadTimeTotal += model.lastLMHeadDuration
             recordNGramCacheStats(profiler)

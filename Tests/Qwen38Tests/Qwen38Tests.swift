@@ -3053,6 +3053,97 @@ func qwen4ExpSharedExpertCompiledActivationMatchesOriginalPathAtProductionDtype(
         "écart normalisé max \(maxNormalizedDiff) (attendu ≤ 1, bruit d'arrondi bf16)")
 }
 
+// MARK: - Crash mémoire 2026-09-17 (`metal::malloc`, préfill à ~68 000
+// jetons) : `Qwen4ExpStreamingTextModel.forward(lastPositionOnly:)` doit
+// tronquer les états cachés à la dernière position AVANT
+// `reduceHyperStreams`/`logits`, et cette troncature doit être
+// mathématiquement transparente : identique à calculer toutes les positions
+// puis n'en garder qu'une, comme le font aujourd'hui les appelants
+// (`logits[0..., -1, 0...]`). Ce test isole exactement les deux opérations
+// que `forward` enchaîne après le décodeur (`Qwen4ExpGlobalTextModel.
+// reduceHyperStreams` puis `.logits`) — RMSNorm, la porte sigmoïde bas-rang
+// et le partage lm_head sont tous strictement locaux à la position (aucun
+// mélange le long de l'axe séquence), donc aucun chargement de checkpoint
+// n'est nécessaire pour établir la parité : un `Qwen4ExpGlobalTextModel` aux
+// petites dimensions, poids aléatoires, suffit — même méthode que les tests
+// F8/F9 juste au-dessus (`qwen4ExpFusionTestRandomLeaf`).
+@Test(
+    "Crash 2026-09-17 : tronquer avant reduceHyperStreams/logits (lastPositionOnly) égale, au bruit d'arrondi GPU près, la dernière position du chemin complet"
+)
+func qwen4ExpGlobalTextModelLastPositionTruncationMatchesFullPathExactly() {
+    // Dimensions minuscules et sans rapport avec le checkpoint réel : ce
+    // test ne porte que sur la localité par position de
+    // reduceHyperStreams/logits, pas sur une valeur numérique de production.
+    let configuration = Qwen4ExpTextConfiguration(
+        hiddenSize: 8, numHiddenLayers: 1, numAttentionHeads: 1, numKeyValueHeads: 1,
+        headDim: 8, layerTypes: [.linearAttention], fullAttentionInterval: 1,
+        linearNumKeyHeads: 1, linearNumValueHeads: 1, linearKeyHeadDim: 8,
+        linearValueHeadDim: 8, linearConvKernelDim: 4, numExperts: 2, numExpertsPerToken: 1,
+        moeIntermediateSize: 8, sharedExpertIntermediateSize: 8, indexerBudget: 8,
+        indexerCompressRatio: 1, indexerHeadDim: 8, indexerKVHeads: 1, indexerNHeads: 1,
+        hcCount: 3, hcLowrank: 4, ngramSize: 3, ngramVocabSizeBase: 100,
+        splitNgramParts: 1, pleLayerIDs: [], pleConvKernelSize: 4, vocabSize: 11,
+        maxPositionEmbeddings: 64)
+
+    MLXRandom.seed(20_260_917)
+    let global = Qwen4ExpGlobalTextModel(configuration: configuration, quantization: nil)
+    let randomWeights = Dictionary(
+        uniqueKeysWithValues: global.parameters().flattened().map {
+            ($0.0, qwen4ExpFusionTestRandomLeaf(like: $0.1))
+        })
+    eval(Array(randomWeights.values))
+    try! global.update(parameters: ModuleParameters.unflattened(randomWeights), verify: [.all])
+
+    // `result.output` côté `Qwen4ExpStreamingTextModel.forward` : rang 3,
+    // dernier axe `hcCount * hiddenSize` — ici 7 positions pour ressembler
+    // à un préfill multi-jeton, batch 1.
+    MLXRandom.seed(20_260_917 &+ 1)
+    let seqLen = 7
+    let hyperOutput = MLXRandom.uniform(
+        low: Float(-1), high: Float(1), [1, seqLen, configuration.hcCount * configuration.hiddenSize])
+    eval(hyperOutput)
+
+    // Chemin complet (comportement actuel, `lastPositionOnly: false`) :
+    // reduceHyperStreams/logits sur toutes les positions, puis l'appelant
+    // ne garde que la dernière — exactement `logits[0..., -1, 0...]`.
+    let reducedFull = global.reduceHyperStreams(hyperOutput)
+    let logitsFull = global.logits(from: reducedFull)
+    eval(logitsFull)
+    let lastOfFull = logitsFull[0..., seqLen - 1, 0...]
+
+    // Chemin tronqué (`lastPositionOnly: true`) : exactement ce que
+    // `Qwen4ExpStreamingTextModel.forward` fait désormais — tronquer avant
+    // `reduceHyperStreams`, pas après `logits`.
+    let truncatedInput = hyperOutput[0..., (seqLen - 1)..<seqLen, 0...]
+    let reducedTruncated = global.reduceHyperStreams(truncatedInput)
+    let logitsTruncated = global.logits(from: reducedTruncated)
+    eval(logitsTruncated)
+    #expect(logitsTruncated.shape == [1, 1, configuration.vocabSize])
+    let lastOfTruncated = logitsTruncated[0..., 0, 0...]
+
+    // Égalité attendue au bruit d'arrondi GPU près, pas forcément bit à
+    // bit : reduceHyperStreams (RMSNorm + porte bas-rang) et logits
+    // (lm_head) sont tous les deux strictement locaux à la position —
+    // aucune opération ne mélange l'axe séquence — mais un matmul Metal sur
+    // 7 lignes et le même matmul sur 1 ligne peuvent choisir un pavage/ordre
+    // de sommation différent pour la même ligne, ce qui déplace le dernier
+    // bit de mantisse (constaté ici : p.ex. -0.0059130094 vs -0.005913011).
+    // Même méthode de comparaison que les tests F8/F9 juste au-dessus, pour
+    // la même raison : borner le bruit d'arrondi, pas l'interdire.
+    let fullValues = lastOfFull.asType(.float32)
+    let truncatedValues = lastOfTruncated.asType(.float32)
+    let relativeTolerance: Float = 1e-3
+    let absoluteTolerance: Float = 1e-3
+    let absoluteDiff = MLX.abs(fullValues - truncatedValues)
+    let tolerance = absoluteTolerance + relativeTolerance * MLX.abs(fullValues)
+    let normalizedDiff = absoluteDiff / tolerance
+    eval(normalizedDiff)
+    let maxNormalizedDiff = normalizedDiff.max().item(Float.self)
+    #expect(
+        maxNormalizedDiff <= 1,
+        "écart normalisé max \(maxNormalizedDiff) entre lastPositionOnly:true et la dernière position du chemin complet (attendu ≤ 1, bruit d'arrondi GPU)")
+}
+
 // MARK: - P11.1 : largeur de routage MoE réglable à l'exécution
 
 @Test("P11.1 : sans surcharge, la valeur du checkpoint est utilisée telle quelle")
@@ -4385,7 +4476,8 @@ private final class FakeConstantBatchForwardModel: Qwen4ExpBatchForwardModel, @u
     }
 
     func batchForward(
-        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?,
+        lastPositionOnly: Bool
     ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
         lock.lock(); forwardCallCount += 1; lock.unlock()
         if stepDelay > 0 { Thread.sleep(forTimeInterval: stepDelay) }
@@ -4419,7 +4511,8 @@ private final class FakeContentAddressedForwardModel: Qwen4ExpBatchForwardModel,
     init(vocabSize: Int = 6) { self.vocabSize = vocabSize }
 
     func batchForward(
-        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?,
+        lastPositionOnly: Bool
     ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
         let batchSize = inputIDs.dim(0)
         let sequenceLength = inputIDs.dim(1)

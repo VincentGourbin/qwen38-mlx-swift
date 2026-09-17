@@ -20,7 +20,12 @@ import MLXProfiler
 /// bouclerait indéfiniment plutôt que d'appeler la méthode d'origine.
 public protocol Qwen4ExpBatchForwardModel: AnyObject, Sendable {
     func batchForward(
-        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?,
+        // 2026-09-17 (crash mémoire `metal::malloc` en production, lot ou
+        // non — voir `Qwen4ExpStreamingTextModel.forward(lastPositionOnly:)`) :
+        // relayé tel quel, sans défaut ici, pour que chaque appelant de ce
+        // protocole (production comme témoins de test) décide explicitement.
+        lastPositionOnly: Bool
     ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport])
     func resetConversation()
     func resetNGramCacheStats()
@@ -29,9 +34,12 @@ public protocol Qwen4ExpBatchForwardModel: AnyObject, Sendable {
 
 extension Qwen4ExpStreamingTextModel: Qwen4ExpBatchForwardModel {
     public func batchForward(
-        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?
+        inputIDs: MLXArray, positionIDs: MLXArray?, leftPadding: [Int]?,
+        lastPositionOnly: Bool
     ) throws -> (logits: MLXArray, preMixerHidden: MLXArray, reports: [Qwen4ExpStreamingLayerReport]) {
-        try forward(inputIDs: inputIDs, positionIDs: positionIDs, leftPadding: leftPadding)
+        try forward(
+            inputIDs: inputIDs, positionIDs: positionIDs, leftPadding: leftPadding,
+            lastPositionOnly: lastPositionOnly)
     }
 }
 
@@ -220,7 +228,8 @@ public final class Qwen4ExpBatchStreamingGenerator: @unchecked Sendable {
         let started = Date()
         profiler.startPrefill()
         let prefill = try model.batchForward(
-            inputIDs: promptArray, positionIDs: prefillPositionIDs, leftPadding: layout.leftPadding)
+            inputIDs: promptArray, positionIDs: prefillPositionIDs, leftPadding: layout.leftPadding,
+            lastPositionOnly: true)
         eval(prefill.logits)
         let prefillEnd = Date()
         profiler.endPrefill()
@@ -363,7 +372,8 @@ public final class Qwen4ExpBatchStreamingGenerator: @unchecked Sendable {
             let decodePositionIDs = qwen4ExpLeftPaddedDecodePositionIDsArray(
                 tokenCounts: tokenCounts, step: step)
             let stepResult = try model.batchForward(
-                inputIDs: nextInput, positionIDs: decodePositionIDs, leftPadding: layout.leftPadding)
+                inputIDs: nextInput, positionIDs: decodePositionIDs, leftPadding: layout.leftPadding,
+                lastPositionOnly: true)
             eval(stepResult.logits)
             logits = stepResult.logits[0..., -1, 0...]
         }

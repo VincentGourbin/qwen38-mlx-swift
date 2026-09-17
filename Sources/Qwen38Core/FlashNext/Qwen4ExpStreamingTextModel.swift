@@ -115,7 +115,37 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
         /// sonde n'a d'effet que pour un appelant qui fournit explicitement
         /// ses propres `positionIDs` par ligne, ce que ce paramètre seul ne
         /// change pas.
-        leftPadding: [Int]? = nil
+        leftPadding: [Int]? = nil,
+        /// Coupe-circuit mémoire (2026-09-17, crash `metal::malloc` en
+        /// production — 67,8 Go demandés pour un `lm_head` sur ~68 250
+        /// positions de préfill contre un plafond Metal de 62,6 Go) :
+        /// quand `true`, les états cachés sont tronqués à la dernière
+        /// position **avant** `global.reduceHyperStreams`/`global.logits`,
+        /// au lieu de calculer les logits de chaque position du préfill
+        /// pour n'en garder qu'une (`logits[0..., -1, 0...]` côté
+        /// appelant). `reduceHyperStreams` (RMSNorm + porte sigmoïde) est
+        /// strictement position-locale, donc la dernière position de sa
+        /// sortie est bit-à-bit identique, tronquée avant ou après — voir
+        /// le test de parité `Qwen4ExpStreamingTextModelLastPositionOnly*`.
+        /// `false` (le défaut) ne change rien : `output` reste calculé sur
+        /// toutes les positions, exactement comme avant ce paramètre.
+        ///
+        /// `preMixerHidden` (le retour `result.output`, ci-dessous) N'EST
+        /// JAMAIS tronqué par ce paramètre — seul `output` (les logits,
+        /// dimensionnés par le vocabulaire, donc responsables de
+        /// l'allocation qui plante) l'est. Les appelants qui ont besoin de
+        /// `preMixerHidden` sur toutes les positions (brouillonnage/
+        /// vérification MTP) restent donc corrects même s'ils passaient
+        /// `true` par erreur — mais ne devraient jamais avoir besoin de le
+        /// faire : seuls les générateurs qui ne lisent que la dernière
+        /// position des logits (`Qwen4ExpStreamingGenerator`,
+        /// `Qwen4ExpGreedyGenerator`, `Qwen4ExpBatchStreamingGenerator` via
+        /// `batchForward`) le passent à `true`. Tout appelant qui a besoin
+        /// des logits de plusieurs positions (`scoreTeacherForced`, les
+        /// parités `Qwen4ExpGlobalParity`/`Qwen4ExpSelectedLayersParity`,
+        /// la vérification MTP avec `verificationCapture`) DOIT garder
+        /// `false`.
+        lastPositionOnly: Bool = false
     ) throws -> (
         logits: MLXArray,
         preMixerHidden: MLXArray,
@@ -148,7 +178,14 @@ public final class Qwen4ExpStreamingTextModel: @unchecked Sendable {
             onLayerVisited: onLayerVisited,
             leftPadding: leftPadding)
         let lmHeadStart = ContinuousClock.now
-        let reduced = global.reduceHyperStreams(result.output)
+        let mixerInput: MLXArray
+        if lastPositionOnly {
+            let seqLen = result.output.dim(1)
+            mixerInput = result.output[0..., (seqLen - 1)..<seqLen, 0...]
+        } else {
+            mixerInput = result.output
+        }
+        let reduced = global.reduceHyperStreams(mixerInput)
         let output = global.logits(from: reduced)
         eval(output)
         lastLMHeadDuration = (ContinuousClock.now - lmHeadStart).seconds

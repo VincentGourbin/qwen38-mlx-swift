@@ -147,7 +147,11 @@ public final class Qwen4ExpGreedyGenerator: @unchecked Sendable {
             inputIDs: prompt,
             positionIDs: positionIDs,
             visionEmbeddings: visionEmbeddings,
-            imageTokenID: imageTokenID)
+            imageTokenID: imageTokenID,
+            // `firstTokenTopK` (ci-dessous) ne lit lui aussi que la
+            // dernière position — voir le commentaire de
+            // `forward(lastPositionOnly:)`.
+            lastPositionOnly: true)
         eval(prefill.logits)
         recordNGramCacheStats(profiler)
         let firstTokenCandidates: [Qwen4ExpLogitCandidate]
@@ -189,7 +193,7 @@ public final class Qwen4ExpGreedyGenerator: @unchecked Sendable {
             }
 
             let step = try model.forward(
-                inputIDs: MLXArray([token]).reshaped([1, 1]))
+                inputIDs: MLXArray([token]).reshaped([1, 1]), lastPositionOnly: true)
             eval(step.logits)
             recordNGramCacheStats(profiler)
             logits = step.logits[0..., -1, 0...]

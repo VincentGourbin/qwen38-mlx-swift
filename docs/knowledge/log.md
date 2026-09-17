@@ -6403,3 +6403,70 @@ Le *gather* fautif est sur le chemin de génération complet.
 
 *Les avertissements de compilation Xcode (`unused variable 'RMS_LOOPED_LIMIT'`,
 etc.) viennent des en-têtes Metal d'MLX et sont sans rapport.*
+
+---
+
+## 2026-09-17 — Les logits n'étaient calculés que pour être jetés
+
+### Le défaut, trouvé en production
+
+Le serveur mourait à répétition pendant une session d'agent réelle :
+
+```
+Fatal error: [metal::malloc] Attempting to allocate 67871309232 bytes
+which is greater than the maximum allowed buffer size of 62620631040 bytes
+```
+
+63,1 Gio en **une seule allocation**, plafond Metal 58,3 Gio.
+
+**Cause** : `Qwen4ExpStreamingTextModel.forward` appliquait `lm_head` sur
+**toutes** les positions du préfill, et les appelants n'en gardaient qu'une
+(`logits[0..., -1, 0...]`). À 248 320 entrées de vocabulaire, cela fait ~1 Mo
+de logits par jeton de prompt, calculés puis jetés. Le compte le confirme :
+67 871 309 232 / (248 320 × 4) ≈ **68 308 positions**, soit exactement la
+taille du contexte au moment du crash.
+
+**Plafond dur induit** : 63 044 jetons de contexte, quelle que soit la
+mémoire disponible.
+
+### Le correctif
+
+Paramètre `lastPositionOnly: Bool = false` sur `forward` — défaut inchangé,
+donc aucun comportement existant modifié. À `true`, les états cachés sont
+tronqués à la dernière position **avant** `reduceHyperStreams`, pas seulement
+avant `lm_head` : `hcNorm` et la porte de rang faible sont strictement locales
+à la position, donc c'est équivalent et ça économise aussi du calcul.
+
+`preMixerHidden` n'est **jamais** tronqué, et la sortie reste de rang 3, donc
+tout appelant qui fait `[0..., -1, 0...]` fonctionne sans changement.
+
+**Trois appelants basculés** : `Qwen4ExpStreamingGenerator`,
+`Qwen4ExpGreedyGenerator`, `Qwen4ExpBatchStreamingGenerator` — ils ne lisent
+jamais que la dernière position.
+
+**Laissés à `false`, vérifiés un par un** : `scoreTeacherForced` (garde Q-B,
+score chaque position), le chemin MTP (`Qwen4ExpFlashMTPGenerator`, qui lit
+`preMixerHidden` en entier pour amorcer le drafter et compare les logits de
+chaque position vérifiée), les chemins de parité, le warm-up (déjà à un
+jeton), et les instruments de mesure du CLI — ambigus, donc laissés au défaut.
+
+### Parité
+
+Le test unitaire à tolérance a été nécessaire : l'égalité **bit-à-bit échoue**,
+car un produit matriciel sur une ligne ne partitionne pas la somme comme sur
+sept. Écarts au dernier bit de mantisse (−0,0059130094 contre −0,005913011).
+
+Cette tolérance ne suffisant pas à conclure — un écart au dernier bit peut
+faire basculer un argmax — le contrôle décisif a été fait sur le checkpoint
+réel : **identifiants greedy strictement identiques à la référence du dépôt**,
+sur 8 jetons **et** sur 64. Pic MLX inchangé (57,42 Go).
+
+### Gain
+
+| | avant | après |
+|---|---:|---:|
+| allocation des logits à 68 000 jetons | **63,1 Gio** | **~970 Ko** |
+| plafond de contexte | 63 044 jetons | supprimé |
+
+En prime, `reduceHyperStreams` n'est plus calculé que sur une position au lieu
+de toutes : le préfill y gagne aussi du calcul, pas seulement de la mémoire.
