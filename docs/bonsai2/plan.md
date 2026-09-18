@@ -1031,3 +1031,68 @@ et la ligne exacte de la garde ajoutée dans chaque branche.
   fichiers touchés (`Qwen38Runtime.swift`, `Qwen38Server.swift`).
 - Pas d'agent : 1 (session courante, plus l'agent Plan de l'auteur du plan
   entre les deux reprises) · appels d'outils : ~150 au total sur B-4.
+
+## B-5 — Cache de préfixe sur le chemin 27B — 2026-09-18 — validée
+
+- Fait :
+  1. **Découverte clé** qui a simplifié la fiche : `GenerateCompletionInfo`
+     (MLXLMCommon/Evaluate.swift) porte déjà `cachedPromptTokenCount` — «
+     the number of prompt tokens served by a reused KV-cache prefix …
+     `ChatSession` attributes it from its cache reuse decision. » Le chemin
+     `ChatSession` de `Qwen38Runtime.generate` (utilisé par le GUI) ne lisait
+     simplement jamais ce champ. Corrigé en un endroit (construction de
+     `Qwen38RunMetrics` dans `generate`) : `cachedPromptTokens:
+     info.cachedPromptTokenCount`. `Qwen38Server.swift` savait déjà
+     construire `usage.prompt_tokens_details.cached_tokens` et la ligne
+     stderr depuis ce champ (commit `10e9c10`, antérieur) — rien à y
+     toucher.
+  2. **`generateStatelessContinuation(priorTurns:newUserTurn:options:)`**
+     (nouvelle fonction privée, `Qwen38Runtime.swift`) : le chemin rapide
+     pour un historique se terminant par `.user`. État dédié,
+     délibérément séparé de `chatSession`/`conversationTurns` (le GUI) pour
+     ne jamais laisser une requête LAN interférer avec une conversation GUI
+     interactive : `statelessSession: ChatSession?`,
+     `statelessLedger: [Qwen38ConversationTurn]`,
+     `statelessLedgerKey: Qwen38StatelessCacheKey?` (le sous-ensemble
+     d'options qui change le rendu du gabarit — `enableThinking`,
+     `reasoningEffort`, `tools` — pas `temperature`/`maxTokens`).
+     - Extension stricte détectée (`priorTurns == statelessLedger` et même
+       clé de cache) : réutilise `statelessSession` tel quel — son cache KV
+       est intact, `streamDetails` ne préremplit que le nouveau tour.
+     - Sinon : reconstruit une session via l'initialiseur MLXLMCommon de
+       « Prompt Re-hydration » (`ChatSession.init(_:instructions:history:…)`,
+       `Cache.history([Chat.Message])`, préremplissage différé au premier
+       usage) — toujours correct, jamais qu'une optimisation manquée en cas
+       de non-correspondance.
+     - `Qwen38ConversationTurn` est devenu `Equatable` (tous ses champs le
+       sont déjà) pour permettre la comparaison stricte du ledger.
+  3. `generateStateless` : le cas `.user` (auparavant fondu dans la règle à
+     trois cas de B-4) route maintenant vers
+     `generateStatelessContinuation` au lieu du rejeu complet
+     systématique ; le cas `.tool` (round-trip d'outil) garde le chemin B-4
+     inchangé — combiner cache et continuation d'outil n'est pas couvert
+     par cette fiche.
+- Porte de sortie observée : serveur réel, deux requêtes successives de la
+  même conversation (« Dis bonjour en un mot. » puis, historique étendu,
+  « Et maintenant dis au revoir en un mot. ») :
+  ```
+  qwen38 serve · usage · client LAN · prompt 19 jetons (dont 0 en cache) · sortie 1 jetons · 9.3 tok/s
+  qwen38 serve · usage · client LAN · prompt 43 jetons (dont 21 en cache) · sortie 2 jetons · 8.7 tok/s
+  ```
+  `usage.prompt_tokens_details.cached_tokens` : 0 puis 21 (> 0). Vérifié en
+  plus (hors périmètre strict de la porte de sortie, mais utile pour la
+  confiance) : une conversation non liée retombe proprement à
+  `cached_tokens: 0` (pas de corruption depuis le ledger précédent), puis
+  son propre second tour réutilise le cache à son tour
+  (`cached_tokens: 30`). Suite complète rejouée : 233 tests, aucune
+  régression.
+- Écart au plan : aucun dans le résultat, un raccourci dans la méthode — la
+  fiche suggérait de s'inspirer de `Qwen4ExpPromptBuilder.continuationSuffix`
+  (diff de rendu au niveau des jetons, technique de Flash-Next qui n'a pas
+  d'abstraction de session). Inutile ici : `ChatSession` de MLXLMCommon a
+  déjà ce mécanisme intégré (réutilisation de cache + comptage exact via
+  `cachedPromptTokenCount`) et une API de réhydratation par historique —
+  utiliser directement le niveau d'abstraction adapté plutôt que
+  réimplémenter à la main ce qu'il fait déjà. `swift build --product qwen38`
+  propre, zéro avertissement dans les fichiers touchés.
+- Pas d'agent : 1 (session courante) · appels d'outils : ~60.

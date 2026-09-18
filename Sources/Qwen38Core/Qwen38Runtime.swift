@@ -284,7 +284,7 @@ public struct Qwen38BatchGenerationResult: Sendable {
     }
 }
 
-private struct Qwen38ConversationTurn: Sendable {
+private struct Qwen38ConversationTurn: Sendable, Equatable {
     let role: Chat.Message.Role
     let text: String
     let imageURLs: [URL]
@@ -297,6 +297,22 @@ private struct Qwen38ConversationTurn: Sendable {
     /// capture pas ce champ sur un message `role: "tool"` entrant ; le
     /// gabarit du checkpoint apparie les réponses par ordre, pas par nom).
     var toolName: String? = nil
+}
+
+/// B-5 (docs/bonsai2/plan.md): the subset of `Qwen38GenerationOptions` that
+/// changes what the chat template renders — `temperature`/`maxTokens`/
+/// sampling penalties do not, so comparing the whole struct would reject a
+/// cache-reuse-eligible request over an irrelevant field.
+private struct Qwen38StatelessCacheKey: Equatable {
+    let enableThinking: Bool
+    let reasoningEffort: String
+    let tools: [Qwen38ToolSpec]
+
+    init(_ options: Qwen38GenerationOptions) {
+        enableThinking = options.enableThinking
+        reasoningEffort = options.reasoningEffort
+        tools = options.tools
+    }
 }
 
 /// B-4 (docs/bonsai2/plan.md) : converts a transport-neutral
@@ -395,6 +411,19 @@ public actor Qwen38Runtime {
     private var m2Conversation: Qwen38MTPConversation?
     private var m2ConversationTurns: [Qwen38ConversationTurn] = []
     private var conversationTurnCount = 0
+    /// B-5 (docs/bonsai2/plan.md): a cache-reuse ledger for the stateless
+    /// (LAN/HTTP) path, deliberately SEPARATE from `chatSession`/
+    /// `conversationTurns` above (the GUI's own live conversation) — reusing
+    /// those directly would let a LAN request reseed or interfere with an
+    /// interactive GUI session, exactly the cross-interface leakage
+    /// `generateStateless`'s always-replay design was built to avoid. `nil`
+    /// until the first `.user`-terminated stateless request; `statelessLedger`
+    /// mirrors the message history `statelessSession` currently has realized
+    /// (or is lazily seeded with), so a later request can be recognized as a
+    /// strict extension and reuse the cache instead of a full replay.
+    private var statelessSession: ChatSession?
+    private var statelessLedger: [Qwen38ConversationTurn] = []
+    private var statelessLedgerKey: Qwen38StatelessCacheKey?
     /// M1's standalone upstream MTP path rebuilds the prompt through
     /// `MLXLMCommon.generate`, so it cannot share ChatSession's persistent KV
     /// cache yet. Once a conversation uses MTP, keep subsequent turns on the
@@ -1570,29 +1599,34 @@ public actor Qwen38Runtime {
             throw Qwen38RuntimeError.missingUserMessage
         }
         // B-4 (docs/bonsai2/plan.md, réponse "A-bis" à l'ASK) : trois cas sur
-        // le dernier rôle. `.user` : comportement historique. `.tool` : un
-        // tour d'outils sans nouveau texte utilisateur (le suivi standard
-        // OpenAI après un appel d'outil) — tout l'historique devient
-        // `conversationTurns`, `generate(newUserTurn: nil, …)` ne pousse rien
-        // de nouveau et laisse le gabarit produire lui-même l'invite de
-        // continuation (vérifié directement contre `chat_template.jinja` du
-        // pack : un message `.tool` final se rend comme un tour
-        // `<|im_start|>user\n<tool_response>…</tool_response><|im_end|>`
-        // synthétisé, rien à faire côté rendu). Tout autre dernier rôle
-        // (`.assistant`, `.system`) : rejeté — un historique fini par
-        // `.assistant` serait un préremplissage de réponse, hors périmètre.
-        let priorTurns: [Qwen38ConversationTurn]
-        let newUserTurn: Qwen38ConversationTurn?
-        switch lastMessage.role {
-        case .user:
-            priorTurns = messages.dropLast().map(conversationTurn)
-            newUserTurn = conversationTurn(lastMessage)
-        case .tool:
-            priorTurns = messages.map(conversationTurn)
-            newUserTurn = nil
-        case .assistant, .system:
+        // le dernier rôle. `.tool` : un tour d'outils sans nouveau texte
+        // utilisateur (le suivi standard OpenAI après un appel d'outil) —
+        // tout l'historique devient `conversationTurns`, `generate(
+        // newUserTurn: nil, …)` ne pousse rien de nouveau et laisse le
+        // gabarit produire lui-même l'invite de continuation (vérifié
+        // directement contre `chat_template.jinja` du pack : un message
+        // `.tool` final se rend comme un tour `<|im_start|>user\n
+        // <tool_response>…</tool_response><|im_end|>` synthétisé, rien à
+        // faire côté rendu). Tout autre dernier rôle (`.assistant`,
+        // `.system`) : rejeté — un historique fini par `.assistant` serait
+        // un préremplissage de réponse, hors périmètre.
+        //
+        // `.user` : B-5 (docs/bonsai2/plan.md) — pas de rejeu complet par
+        // défaut. `generateStatelessContinuation` reconnaît une extension
+        // stricte du ledger résident et ne préremplit que le nouveau tour ;
+        // sinon elle retombe sur un rejeu complet (toujours correct, jamais
+        // qu'une optimisation manquée).
+        guard lastMessage.role != .assistant, lastMessage.role != .system else {
             throw Qwen38RuntimeError.missingUserMessage
         }
+        guard lastMessage.role == .tool else {
+            let priorTurns = messages.dropLast().map(conversationTurn)
+            let newUserTurn = conversationTurn(lastMessage)
+            return try await generateStatelessContinuation(
+                priorTurns: priorTurns, newUserTurn: newUserTurn, options: options)
+        }
+        let priorTurns = messages.map(conversationTurn)
+        let newUserTurn: Qwen38ConversationTurn? = nil
         let previousTurns = conversationTurns
         let previousCount = conversationTurnCount
         let previousDirectMode = directConversationMode
@@ -1629,6 +1663,150 @@ public actor Qwen38Runtime {
             conversationTurnCount = previousCount
             directConversationMode = previousDirectMode
             throw error
+        }
+    }
+
+    /// B-5 (docs/bonsai2/plan.md): the `.user`-terminated fast path for
+    /// `generateStateless` — reuses `statelessSession`'s live KV cache when
+    /// `priorTurns` is an exact match for `statelessLedger` under the same
+    /// cache-relevant options, otherwise reseeds a fresh session with
+    /// `priorTurns` as history ("Prompt Re-hydration",
+    /// `ChatSession.init(_:instructions:history:…)`, MLXLMCommon) before
+    /// continuing. Always correct either way — the match only decides
+    /// whether a prefill can be skipped, never changes the answer.
+    /// `statelessSession`/`statelessLedger` are deliberately separate from
+    /// `chatSession`/`conversationTurns` (see their declaration for why).
+    private func generateStatelessContinuation(
+        priorTurns: [Qwen38ConversationTurn],
+        newUserTurn: Qwen38ConversationTurn,
+        options: Qwen38GenerationOptions
+    ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        guard let container else { throw Qwen38RuntimeError.modelNotLoaded }
+        let cacheKey = Qwen38StatelessCacheKey(options)
+        let reused =
+            statelessSession != nil && priorTurns == statelessLedger
+            && statelessLedgerKey == cacheKey
+        let session: ChatSession
+        if reused {
+            session = statelessSession!
+        } else {
+            session = try ChatSession(
+                container,
+                history: priorTurns.map(chatMessage),
+                additionalContext: Qwen4ExpPromptBuilder.templateContext(
+                    thinking: options.enableThinking,
+                    reasoningEffort: options.reasoningEffort,
+                    tools: options.tools.isEmpty ? nil : options.tools),
+                tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
+            statelessSession = session
+        }
+        session.generateParameters = options.parameters
+
+        let profiler = MLXProfiler.shared
+        let (profileSession, ownsSession, requestPhase) = Qwen38Profiling.beginRequestSession(
+            title: "QWEN3.8 INFERENCE",
+            metadata: [
+                "model": loadedDirectory?.lastPathComponent ?? "Qwen3.8",
+                "kvBits": options.kvBits.map(String.init) ?? "none",
+                "statelessCacheReused": String(reused),
+            ],
+            phase: "Requête stateless")
+        let requestStart = Date()
+        profiler.start("Turn")
+        profiler.start("Time to first token")
+
+        let images = newUserTurn.imageURLs.map(UserInput.Image.url)
+        let generationStream = session.streamDetails(to: newUserTurn.text, images: images)
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var completionInfo: GenerateCompletionInfo?
+                    var timeToFirstToken: TimeInterval?
+                    var outputText = ""
+                    for try await event in generationStream {
+                        switch event {
+                        case .chunk(let text):
+                            if timeToFirstToken == nil, !text.isEmpty {
+                                timeToFirstToken = Date().timeIntervalSince(requestStart)
+                                profiler.end("Time to first token")
+                                profiler.start("Decode")
+                            }
+                            let visibleText = Qwen38VisibleText.sanitize(text)
+                            outputText += visibleText
+                            if !visibleText.isEmpty {
+                                continuation.yield(.chunk(visibleText))
+                            }
+                        case .info(let info): completionInfo = info
+                        case .toolCall(let call):
+                            // Same reconstruction as `generate`'s event loop
+                            // — see its comment for why this is necessary.
+                            let text = reconstructedToolCallXML(call)
+                            outputText += text
+                            continuation.yield(.chunk(text))
+                        case .rejectedToolCall(let rejection):
+                            outputText += rejection.rawTextPreview
+                            continuation.yield(.chunk(rejection.rawTextPreview))
+                        }
+                    }
+                    profiler.end("Decode")
+                    profiler.end("Turn")
+                    guard let info = completionInfo else {
+                        throw Qwen38RuntimeError.missingCompletionInfo
+                    }
+                    let measured = profiler.getLLMMetrics()
+                    let metrics = LLMMetrics(
+                        tokenizationTime: measured.tokenizationTime,
+                        prefillTime: info.promptTime,
+                        generationTime: info.generateTime,
+                        decodingTime: measured.decodingTime,
+                        promptTokens: info.promptTokenCount,
+                        generatedTokens: info.generationTokenCount
+                    )
+                    continuation.yield(.metrics(Qwen38RunMetrics(
+                        metrics: metrics,
+                        stopReason: info.stopReason,
+                        report: ownsSession ? profileSession.generateReport() : "",
+                        chromeTrace: ownsSession
+                            ? ChromeTraceExporter.export(session: profileSession) : Data(),
+                        activeMemoryBytes: Memory.activeMemory,
+                        peakMemoryBytes: Memory.peakMemory,
+                        timeToFirstToken: timeToFirstToken,
+                        turnIndex: priorTurns.filter { $0.role == .user }.count + 1,
+                        cacheReused: reused,
+                        conversationReplayed: false,
+                        cachedPromptTokens: info.cachedPromptTokenCount,
+                        inputDescription: images.isEmpty
+                            ? "Texte"
+                            : "Texte + \(images.count) image\(images.count == 1 ? "" : "s")",
+                        mtpStatus: .init(availability: .unavailable)
+                    )))
+                    // Extend the ledger with this turn (both sides — the
+                    // assistant's own reply becomes part of what the NEXT
+                    // request must match) instead of resetting: this is what
+                    // makes the *next* stateless request eligible for the
+                    // fast path above.
+                    self.statelessLedger =
+                        priorTurns + [
+                            newUserTurn,
+                            .init(role: .assistant, text: outputText, imageURLs: []),
+                        ]
+                    self.statelessLedgerKey = cacheKey
+                    continuation.finish()
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
+                } catch {
+                    // Correctness over optimization: an interrupted turn
+                    // leaves the session's cache state ambiguous, so drop it
+                    // rather than risk a future match reusing something that
+                    // was never cleanly completed.
+                    self.statelessSession = nil
+                    self.statelessLedger = []
+                    self.statelessLedgerKey = nil
+                    Qwen38Profiling.endRequestSession(ownsSession: ownsSession, phase: requestPhase)
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -2034,6 +2212,14 @@ public actor Qwen38Runtime {
                         conversationReplayed: useDirectConversation
                             && turnIndex > 1
                             && !canUseLocalMTP,
+                        // B-5 (docs/bonsai2/plan.md): `ChatSession` already
+                        // attributes its own cache-reuse decision here
+                        // (`GenerateCompletionInfo.cachedPromptTokenCount`,
+                        // MLXLMCommon/Evaluate.swift) — reading it is the
+                        // whole fix; the 27B path just never looked before.
+                        // 0 on `useDirectConversation` (full replay, no
+                        // cache-owning caller) — correct, not a placeholder.
+                        cachedPromptTokens: info.cachedPromptTokenCount,
                         inputDescription: imageCount == 0
                             ? "Texte"
                             : "Texte + \(imageCount) image\(imageCount == 1 ? "" : "s")",
