@@ -131,6 +131,14 @@ public struct Qwen38RunMetrics: Sendable {
     /// True when this turn had to replay the accumulated conversation instead
     /// of appending to ChatSession's persistent KV cache (M1 MTP path).
     public let conversationReplayed: Bool
+    /// Jetons du prompt déjà présents dans le cache de conversation avant ce
+    /// tour (préfixe réutilisé). `metrics.promptTokens` ne compte que les
+    /// jetons préremplis par ce tour ; la longueur totale du prompt vue par
+    /// le modèle est `cachedPromptTokens + metrics.promptTokens`. Sert au
+    /// bloc `usage` OpenAI du serveur (`prompt_tokens_details.cached_tokens`)
+    /// — sans lui, un client comme pi n'a que son estimation chars/4 pour
+    /// suivre le contexte (issue #1). 0 sur un tour froid ou en lot.
+    public let cachedPromptTokens: Int
     public let mtpStatus: Qwen38MTPRunStatus
     /// P11.1 : largeur de routage MoE effectivement utilisée par ce tour
     /// (`Qwen38FlashNextEngine.routedExpertCount` au moment de la requête),
@@ -157,6 +165,7 @@ public struct Qwen38RunMetrics: Sendable {
         turnIndex: Int = 1,
         cacheReused: Bool = false,
         conversationReplayed: Bool = false,
+        cachedPromptTokens: Int = 0,
         inputDescription: String = "Texte",
         mtpStatus: Qwen38MTPRunStatus = .init(availability: .unavailable),
         routedExpertCount: Int? = nil,
@@ -173,6 +182,7 @@ public struct Qwen38RunMetrics: Sendable {
         self.turnIndex = turnIndex
         self.cacheReused = cacheReused
         self.conversationReplayed = conversationReplayed
+        self.cachedPromptTokens = cachedPromptTokens
         self.inputDescription = inputDescription
         self.mtpStatus = mtpStatus
         self.routedExpertCount = routedExpertCount

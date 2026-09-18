@@ -16,6 +16,10 @@ public struct Qwen38ServerSession: Sendable, Equatable, Codable, Identifiable {
     public var status: Qwen38ServerSessionStatus
     public var inputDescription: String
     public var promptTokens: Int
+    /// Jetons du prompt servis depuis le cache de conversation (préfixe
+    /// réutilisé) ; `promptTokens` ne compte que les jetons préremplis par
+    /// ce tour. Voir `Qwen38RunMetrics.cachedPromptTokens`.
+    public var cachedPromptTokens: Int = 0
     public var generatedTokens: Int
     public var timeToFirstToken: TimeInterval?
     public var tokensPerSecond: Double?
@@ -296,7 +300,24 @@ private struct ChatCompletionToolCallFunctionOut: Codable, Sendable {
     let name: String
     let arguments: String
 }
-private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice] }
+private struct ChatCompletionResponse: Codable, Sendable { let id: String; let object: String; let created: Int; let model: String; let choices: [ChatCompletionChoice]; var usage: ChatCompletionUsage? = nil }
+/// Bloc `usage` OpenAI. `prompt_tokens` est la longueur TOTALE du prompt vue
+/// par le modèle (préfixe en cache compris) et `prompt_tokens_details.
+/// cached_tokens` la part servie depuis le cache — la convention qu'un client
+/// comme pi lit pour suivre son contexte et chiffrer une session (issue #1).
+/// En diffusion, il est porté par le dernier fragment (celui du
+/// `finish_reason`), comme le fait `stream_options.include_usage`.
+private struct ChatCompletionUsage: Codable, Sendable {
+    struct PromptTokensDetails: Codable, Sendable { let cachedTokens: Int; enum CodingKeys: String, CodingKey { case cachedTokens = "cached_tokens" } }
+    let promptTokens: Int; let completionTokens: Int; let totalTokens: Int; let promptTokensDetails: PromptTokensDetails
+    enum CodingKeys: String, CodingKey { case promptTokens = "prompt_tokens", completionTokens = "completion_tokens", totalTokens = "total_tokens", promptTokensDetails = "prompt_tokens_details" }
+    init(metrics: Qwen38RunMetrics) {
+        promptTokens = metrics.cachedPromptTokens + metrics.metrics.promptTokens
+        completionTokens = metrics.metrics.generatedTokens
+        totalTokens = promptTokens + completionTokens
+        promptTokensDetails = .init(cachedTokens: metrics.cachedPromptTokens)
+    }
+}
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
 private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let defaultEnableThinking: Bool; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; let batchMaxPromptTokensConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", defaultEnableThinking = "default_enable_thinking", ablation, batchSizeConfigured = "batch_size_configured", batchMaxPromptTokensConfigured = "batch_max_prompt_tokens_configured" } }
@@ -657,7 +678,7 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
+            let options = Qwen38GenerationOptions(maxTokens: try Self.resolvedMaxTokens(input.effectiveMaxTokens), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
             // P13.2 : une requête outillée touche désormais le cache de
             // conversation Flash-Next (LRU/préfixe implicite) exactement
@@ -791,7 +812,7 @@ public actor Qwen38InferenceServer {
             } else {
                 requestedAblation = nil
             }
-            let options = Qwen38GenerationOptions(maxTokens: min(max(input.effectiveMaxTokens ?? 256, 1), 131_072), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
+            let options = Qwen38GenerationOptions(maxTokens: try Self.resolvedMaxTokens(input.effectiveMaxTokens), temperature: temperature, topP: input.topP ?? 0.95, enableThinking: input.effectiveThinking ?? (input.effectiveReasoningEffort != nil || defaultEnableThinking), reasoningEffort: input.effectiveReasoningEffort ?? "low", mtp: .init(enabled: input.effectiveMTP ?? true, draftDepth: .fixed(input.effectiveMTPDraftTokens), engine: input.effectiveMTPEngine), presencePenalty: presencePenalty, repetitionPenalty: input.effectiveRepetitionPenalty, penaltyContextTokens: max(0, input.effectivePenaltyContextTokens ?? 2048), routedExpertCount: input.effectiveRoutedExperts, ablation: requestedAblation, tools: requestedTools)
             let conversationID = input.effectiveConversationID
 
             // P12.3 : une image, ou une requête qui touche le cache de
@@ -1117,7 +1138,7 @@ public actor Qwen38InferenceServer {
         if let trackingID {
             await rememberConversation(id: trackingID, model: model, requestMessages: requestMessages, assistantContent: text, assistantToolCalls: rememberedToolCalls, options: options)
         }
-        return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty, toolCalls: toolCallsOut), delta: nil, finishReason: finishReason)]))
+        return Self.jsonResponse(ChatCompletionResponse(id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion", created: Int(Date().timeIntervalSince1970), model: model, choices: [.init(index: 0, message: .init(role: "assistant", content: text, reasoningContent: reasoning.nilIfEmpty, toolCalls: toolCallsOut), delta: nil, finishReason: finishReason)], usage: metrics.map(ChatCompletionUsage.init(metrics:))))
     }
     private func makeStreamingResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, trackingID: String?, requestMessages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) async throws -> Response {
         // P13.1 : quand la requête porte des outils, le `content` n'est
@@ -1133,11 +1154,12 @@ public actor Qwen38InferenceServer {
         // continue de s'afficher au fil de l'eau dans tous les cas.
         let hasTools = !options.tools.isEmpty
         let body = ResponseBody { writer in
-            func writeDelta(content: String? = nil, reasoning: String? = nil, toolCalls: [ChatCompletionToolCallOut]? = nil, finishReason: String? = nil) async throws {
+            func writeDelta(content: String? = nil, reasoning: String? = nil, toolCalls: [ChatCompletionToolCallOut]? = nil, finishReason: String? = nil, usage: ChatCompletionUsage? = nil) async throws {
                 let value = ChatCompletionResponse(
                     id: "chatcmpl-\(sessionID.uuidString)", object: "chat.completion.chunk",
                     created: Int(Date().timeIntervalSince1970), model: model,
-                    choices: [.init(index: 0, message: nil, delta: .init(role: nil, content: content, reasoningContent: reasoning, toolCalls: toolCalls), finishReason: finishReason)])
+                    choices: [.init(index: 0, message: nil, delta: .init(role: nil, content: content, reasoningContent: reasoning, toolCalls: toolCalls), finishReason: finishReason)],
+                    usage: usage)
                 let payload = try JSONEncoder().encode(value)
                 var line = ByteBuffer(string: "data: ")
                 line.writeBytes(payload)
@@ -1193,7 +1215,7 @@ public actor Qwen38InferenceServer {
                             }
                             responseContent = parsed.content
                         }
-                        try await writeDelta(finishReason: finishReason)
+                        try await writeDelta(finishReason: finishReason, usage: ChatCompletionUsage(metrics: metrics))
                         if let trackingID {
                             await self.rememberConversation(
                                 id: trackingID, model: model,
@@ -1214,10 +1236,37 @@ public actor Qwen38InferenceServer {
     private func authorize(_ request: Request) throws { guard let apiKey, !apiKey.isEmpty else { return }; guard request.headers[.authorization] == "Bearer \(apiKey)" else { throw Qwen38ServerError.unauthorized } }
     private func updateSession(_ id: UUID, _ body: (inout Qwen38ServerSession) -> Void) { guard var session = sessions[id] else { return }; body(&session); sessions[id] = session }
     private func updateSessionAsync(_ id: UUID, chunk: String) { updateSession(id) { $0.generatedTokens += 1; $0.lastToken = String(chunk.suffix(48)) } }
-    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) { updateSession(id) { $0.status = .completed; $0.finishedAt = Date(); $0.promptTokens = metrics.metrics.promptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate; $0.routedExpertCount = metrics.routedExpertCount; $0.ablation = metrics.ablation } }
+    private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) {
+        // Une ligne par requête sur stderr : de quoi additionner une session
+        // d'agent (entrée, sortie, part en cache) et la chiffrer au tarif d'un
+        // modèle du marché — voir Scripts/pi-session-cost.py.
+        if let session = sessions[id] {
+            let usage = ChatCompletionUsage(metrics: metrics)
+            let line = "qwen38 serve · usage · client \(session.client) · prompt \(usage.promptTokens) jetons (dont \(usage.promptTokensDetails.cachedTokens) en cache) · sortie \(usage.completionTokens) jetons · \(String(format: "%.1f", metrics.metrics.generationTokensPerSecond)) tok/s\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        updateSession(id) { $0.status = .completed; $0.finishedAt = Date(); $0.promptTokens = metrics.metrics.promptTokens; $0.cachedPromptTokens = metrics.cachedPromptTokens; $0.generatedTokens = metrics.metrics.generatedTokens; $0.timeToFirstToken = metrics.timeToFirstToken; $0.tokensPerSecond = metrics.metrics.generationTokensPerSecond; $0.inputDescription = metrics.inputDescription; $0.cacheReused = metrics.cacheReused; $0.conversationReplayed = metrics.conversationReplayed; $0.mtp = Self.mtpLabel(metrics.mtpStatus); $0.mtpProposed = metrics.mtpStatus.proposedTokens; $0.mtpAccepted = metrics.mtpStatus.acceptedTokens; $0.mtpAcceptRate = metrics.mtpStatus.acceptanceRate; $0.routedExpertCount = metrics.routedExpertCount; $0.ablation = metrics.ablation } }
     private func completeSessionAsync(_ id: UUID, metrics: Qwen38RunMetrics) { completeSession(id, metrics: metrics) }
     private func failSessionAsync(_ id: UUID, error: String) { updateSession(id) { $0.status = .failed; $0.error = error; $0.finishedAt = Date() } }
     private func trimSessions() { while sessionOrder.count > 32 { sessions.removeValue(forKey: sessionOrder.removeFirst()) } }
+    /// Un `max_tokens` (ou `max_completion_tokens`) nul ou négatif est refusé
+    /// en HTTP 400 plutôt que ramené à 1. pi — et tout client qui calcule
+    /// « fenêtre − prompt estimé » — envoie 0 ou moins quand son prompt
+    /// déborde la fenêtre qu'il s'est fixée. Générer un seul jeton puis
+    /// répondre `finish_reason: "length"` ressemblait à une réponse tronquée :
+    /// le client compactait, la compaction était elle-même surdimensionnée,
+    /// et la boucle n'avait pas de sortie (issue #1). Le message contient
+    /// volontairement « exceeds the context window » : c'est un des motifs
+    /// que pi reconnaît comme débordement de contexte, ce qui l'aiguille
+    /// vers sa récupération bornée (une compaction, un seul réessai).
+    static func resolvedMaxTokens(_ requested: Int?) throws -> Int {
+        guard let requested else { return 256 }
+        guard requested > 0 else {
+            throw Qwen38ServerError.invalidRequest(
+                "max_tokens must be positive (got \(requested)): the prompt exceeds the context window the client budgeted for it. Shorten the conversation or raise the client's contextWindow.")
+        }
+        return min(requested, 131_072)
+    }
     private static func finishReason(_ reason: Any?) -> String { guard let reason else { return "stop" }; return String(describing: reason).lowercased().contains("length") ? "length" : "stop" }
     private static func mtpLabel(_ status: Qwen38MTPRunStatus) -> String { switch status.availability { case .active: return "actif"; case .unavailable: return "indisponible"; case .fallback(let reason): return "fallback: \(reason)" } }
     private static func jsonResponse<T: Encodable>(_ value: T) -> Response { let data = (try? JSONEncoder().encode(value)) ?? Data(); var buffer = ByteBufferAllocator().buffer(capacity: data.count); buffer.writeBytes(data); var headers = HTTPFields(); headers[.contentType] = "application/json; charset=utf-8"; return .init(status: .ok, headers: headers, body: .init(byteBuffer: buffer)) }

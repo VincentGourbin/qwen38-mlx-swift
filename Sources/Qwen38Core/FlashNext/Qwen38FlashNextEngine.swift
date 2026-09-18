@@ -199,6 +199,7 @@ public final class Qwen38FlashConversationState: Qwen38FlashConversationStatePro
     fileprivate let modelSnapshot: Qwen4ExpStreamingTextModelSnapshot
     fileprivate let hasConversationHistory: Bool
     fileprivate let turnIndex: Int
+    fileprivate let conversationTokenCount: Int
     public let ledger: [Qwen38ChatMessage]
     public let byteCount: Int
     /// P6.3: the rolling buffer of prior-assistant-turn tokens the
@@ -210,11 +211,13 @@ public final class Qwen38FlashConversationState: Qwen38FlashConversationStatePro
 
     fileprivate init(
         modelSnapshot: Qwen4ExpStreamingTextModelSnapshot, hasConversationHistory: Bool,
-        turnIndex: Int, ledger: [Qwen38ChatMessage], recentAssistantTokenIDs: [Int32]
+        turnIndex: Int, conversationTokenCount: Int, ledger: [Qwen38ChatMessage],
+        recentAssistantTokenIDs: [Int32]
     ) {
         self.modelSnapshot = modelSnapshot
         self.hasConversationHistory = hasConversationHistory
         self.turnIndex = turnIndex
+        self.conversationTokenCount = conversationTokenCount
         self.ledger = ledger
         self.recentAssistantTokenIDs = recentAssistantTokenIDs
         self.byteCount = modelSnapshot.byteCount
@@ -234,6 +237,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     private let stopTokenIDs: Set<Int32>
     private let visibleTokenFilter: Qwen38VisibleTokenFilter
     private var hasConversationHistory = false
+    /// Nombre de jetons (prompt + réponses) actuellement dans les caches de
+    /// conversation du modèle — la longueur du préfixe qu'un tour continué
+    /// réutilise. Voir `Qwen38RunMetrics.cachedPromptTokens`.
+    private var conversationTokenCount = 0
     private var turnIndex = 0
     /// P6.3: rolling buffer of the most recent assistant-turn tokens this
     /// conversation generated, trimmed to `options.penaltyContextTokens`
@@ -369,6 +376,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         model.resetConversation()
         hasConversationHistory = false
         turnIndex = 0
+        conversationTokenCount = 0
         recentAssistantTokenIDs = []
         // The drafter's cache is tied to the target's own conversation
         // history; the predictor's *weights* stay loaded (no need to pay
@@ -412,7 +420,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
     ) -> any Qwen38FlashConversationStateProtocol {
         Qwen38FlashConversationState(
             modelSnapshot: model.snapshot(), hasConversationHistory: hasConversationHistory,
-            turnIndex: turnIndex, ledger: ledger,
+            turnIndex: turnIndex, conversationTokenCount: conversationTokenCount, ledger: ledger,
             recentAssistantTokenIDs: recentAssistantTokenIDs)
     }
 
@@ -429,6 +437,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         model.restore(state.modelSnapshot)
         hasConversationHistory = state.hasConversationHistory
         turnIndex = state.turnIndex
+        conversationTokenCount = state.conversationTokenCount
         recentAssistantTokenIDs = state.recentAssistantTokenIDs
         // See exportConversationState's doc comment: the drafter cache is
         // never preserved, so any stale one from before this restore must
@@ -720,6 +729,10 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         turnIndex += 1
         let currentTurnIndex = turnIndex
         let maxNewTokens = max(options.maxTokens, 1)
+        // Préfixe déjà en cache avant ce tour (0 sur un tour froid) ; le
+        // prompt de ce tour s'y ajoute tout de suite, la réponse à la fin.
+        let cachedPromptTokens = continueConversation ? conversationTokenCount : 0
+        conversationTokenCount = cachedPromptTokens + built.tokenIDs.count
         let preset = Qwen4ExpSamplingPreset.custom(
             temperature: options.temperature, topP: options.topP, topK: options.topK)
 
@@ -750,7 +763,8 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                 built: built, options: options, continueConversation: continueConversation,
                 inputDescription: inputDescription, currentTurnIndex: currentTurnIndex,
                 maxNewTokens: maxNewTokens, profiler: profiler, profileSession: profileSession,
-                ownsSession: ownsSession, requestPhase: requestPhase)
+                ownsSession: ownsSession, requestPhase: requestPhase,
+                cachedPromptTokens: cachedPromptTokens)
         }
         if requestedMTP && hasImage {
             FileHandle.standardError.write(
@@ -801,6 +815,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                             // whatever history already accumulated.
                             self.recordAssistantTokens(
                                 summary.tokenIDs, limit: options.penaltyContextTokens)
+                            self.conversationTokenCount += summary.tokenIDs.count
                             let stopReason: GenerateStopReason
                             if let last = summary.tokenIDs.last, self.stopTokenIDs.contains(last) {
                                 stopReason = .stop
@@ -841,6 +856,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                         turnIndex: currentTurnIndex,
                                         cacheReused: continueConversation,
                                         conversationReplayed: false,
+                                        cachedPromptTokens: cachedPromptTokens,
                                         inputDescription: inputDescription,
                                         mtpStatus: mtpStatus,
                                         routedExpertCount: self.model.routedExpertCount,
@@ -872,7 +888,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         continueConversation: Bool, inputDescription: String,
         currentTurnIndex: Int, maxNewTokens: Int,
         profiler: MLXProfiler, profileSession: ProfilingSession,
-        ownsSession: Bool, requestPhase: String
+        ownsSession: Bool, requestPhase: String, cachedPromptTokens: Int
     ) -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
         let requestedDrafts = options.mtp.draftDepth.requestedDraftTokens
         let blockSize = min(max(requestedDrafts + 1, 2), 4)
@@ -929,6 +945,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                     // still needs this turn's reply in its penalty context.
                     self.recordAssistantTokens(
                         result.tokenIDs, limit: options.penaltyContextTokens)
+                    self.conversationTokenCount += result.tokenIDs.count
                     let stopReason: GenerateStopReason
                     if let last = result.tokenIDs.last, self.stopTokenIDs.contains(last) {
                         stopReason = .stop
@@ -964,6 +981,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                                 turnIndex: currentTurnIndex,
                                 cacheReused: continueConversation,
                                 conversationReplayed: false,
+                                cachedPromptTokens: cachedPromptTokens,
                                 inputDescription: inputDescription,
                                 mtpStatus: mtpStatus,
                                 routedExpertCount: self.model.routedExpertCount,
