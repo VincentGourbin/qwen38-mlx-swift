@@ -4624,3 +4624,75 @@ donc pas le facteur limitant.
 
 **Ordre imposé** : P13.1 puis P13.2. Si le taux d'appels bien formés sur une
 tâche réelle s'effondre, inutile d'écrire la route Anthropic — on l'écrit.
+
+### P14 — Servir Bonsai 2 27B (Qwen3.8-27B ternaire, pack MLX 2 bits + Hadamard) — plan du 2026-09-18
+
+**L'objectif.** Que `qwen38 serve` serve `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`
+(8,6 Go sur disque, 262 k de contexte) avec les outils, pour la boucle d'agent
+pi, et mesurer s'il remplace Flash-Next 3 bits comme exécutant local.
+
+**Le pack, vérifié le 2026-09-18** (en-tête du safetensors, `config.json`,
+`runtime/*.py` du pack) :
+
+- `model_type: prism_hadamard_qwen35`, `base_model_type: qwen3_5`. `text_config`
+  = Qwen3.8-27B (64 couches, 3 GDN pour 1 attention pleine, 24 têtes q / 4 kv,
+  `head_dim` 256), `vision_config` = la tour officielle (27 blocs, F16, non
+  quantifiée). **C'est notre famille `qwen35`, même implémentation vendorisée.**
+- 2 390 tenseurs, espace de noms `language_model.*` / `vision_tower.*` — le
+  nôtre tel quel ; métadonnées `format: mlx`, donc `Qwen35.sanitize` est
+  l'identité. `eos` 248046 via `generation_config.json`.
+- **402 modules empaquetés** : `weight` U32 (16 codes 2 bits par mot),
+  `scales`/`biases` F16 par groupe de 128 (`biases == -scales`, les trois
+  niveaux {−s, 0, +s}), et un vecteur **`signs` F32 de la largeur d'entrée**
+  (5120, 6144 ou 17408). Concernés : `embed_tokens` (transformée inverse),
+  `lm_head`, `q/k/v/o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`,
+  `gate/up/down_proj`. Restent flottants : `in_proj_a`, `in_proj_b`, `conv1d`,
+  `A_log`, `dt_bias`, les normes et toute la tour vision.
+- `quantization: {bits 2, group_size 128, mode affine}` : le `loadWeights`
+  vendorisé crée déjà `QuantizedLinear` / `QuantizedEmbedding` 2 bits partout où
+  `.scales` existe ; `quantizedMM` (mlx-swift 0.31.6) accepte 2 bits.
+- **Hadamard** (`hadamard.json`, version 1) : bloc 1024, signes explicites,
+  axe = dernière dimension d'entrée. Runtime de référence (`runtime.py`) :
+  `x·signs → hadamard_transform par blocs de 1024, échelle 1/√1024 →
+  quantized_matmul` ; pour l'embedding : `dequantize(lookup) → hadamard → ·signs`.
+  La transformée est faite en **float32**. `hadamardTransform` existe dans
+  mlx-swift 0.31.6 ; 5120, 6144 et 17408 sont des multiples de 1024.
+- **Gabarit** : le même que Flash-Next (`enable_thinking`, `reasoning_effort` ∈
+  low / medium / xhigh, outils en XML `<tool_call><function=…>`), livré en
+  `chat_template.jinja` séparé, que swift-transformers sait lire.
+  `Qwen38ToolCallParser` est réutilisable tel quel. Le README prévient que
+  `low` n'est pas honoré (comportement proche de `xhigh`).
+- Ce qui coince dans notre pile aujourd'hui : (1) `Qwen38ModelFamily` ne connaît
+  pas ce `model_type` ; (2) `update(verify: [.all])` refusera les clés `.signs` ;
+  (3) la projection GDN fusionnée 4-en-1 (`qwen35FourGDNEnabled`) suppose
+  quatre `QuantizedLinear` homogènes — ici `qkv`/`z` sont empaquetés + Hadamard
+  et `a`/`b` flottants ; (4) le serveur refuse `tools` hors Flash-Next (400) ;
+  (5) le chemin 27B ne réutilise le cache KV qu'en continuation stricte, or pi
+  renvoie tout l'historique à chaque tour. Le pack le dit lui-même :
+  « Swift full-model loading still requires model integration ».
+
+| # | Étape | Porte de sortie |
+|---|---|---|
+| **P14.1** | **Charger sans Hadamard.** Enregistrer `prism_hadamard_qwen35` dans le registre VLM vers `Qwen35Configuration`/`Qwen35.init` et le mapper sur la famille `qwen35` côté `Qwen38ModelValidator` ; dans le `loadWeights` vendorisé, écarter les clés `.signs` avant `update` (une ligne, commentée) ; forcer la fusion GDN à `off` pour ce type. | Le pack se charge, 8,6 Go résidents, `qwen38 generate` produit des jetons (faux, attendu). |
+| **P14.2** | **Les deux modules Hadamard**, dans `Qwen38Core` : `Qwen38HadamardQuantizedLinear: QuantizedLinear` (`x·signs → hadamardTransform(reshape [-1, 1024], scale 1/√1024) → quantizedMM`) et `Qwen38HadamardQuantizedEmbedding: QuantizedEmbedding` (lookup déquantifié → Hadamard → `·signs`). Après `loadContainer`, `container.perform` parcourt `config.modules` (chemins sous `language_model`) et remplace les 402 modules, signes relus depuis le safetensors (clés `.signs` seulement) ou `hadamard.json`. Transformée en float32 d'abord, fidèle au runtime Python. | `qwen38 generate` greedy répond en français cohérent sur trois invites. |
+| **P14.3** | **Parité, avant tout le reste** (`docs/parity-method.md`). `Scripts/references/bonsai2_reference.py` charge via `runtime/vision_artifact.py` du pack (mlx 0.32.0, mlx-vlm 0.6.3) et écrit les logits de la dernière position + 32 ids greedy pour trois invites (dont une avec outils). Test Swift gardé par `QWEN38_BONSAI_MODEL`. | Ids greedy identiques 3/3, logits sous tolérance. |
+| **P14.4** | **Outils sur la famille 27B** : lever le 400, passer `tools` à `applyChatTemplate` du chemin `ChatSession`, brancher `Qwen38ToolCallParser` et les messages `role: "tool"`, diffusion comprise (miroir de P13.1). | Aller-retour outil → résultat → réponse, non-stream **et** stream. |
+| **P14.5** | **Cache de préfixe pour la boucle d'agent** sur ce chemin : comparaison de préfixe P6.1 (ou routage par le LRU P5.2 s'il se généralise), pour que le 2e tour ne repréremplisse pas tout l'historique. | `usage.prompt_tokens_details.cached_tokens > 0` au 2e tour d'une session pi. |
+| **P14.6** | **Mesures et décision.** Décodage et préremplissage à 1 k, 10 k, 30 k, 100 k ; une fiche T-2.x du port YuE2 via pi, chiffrée par `Scripts/pi-session-cost.py` ; jetons de réflexion par tour (le `low` ignoré est le risque principal pour la boucle d'agent) ; mémoire à 262 k (KV ≈ 64 Kio/jeton → ≈ 17 Go, à confirmer). Tableau dans `docs/knowledge/log.md`. | Go / no-go : Bonsai 2 remplace-t-il Flash-Next comme exécutant local ? |
+| **P14.7** (optionnel) | Débit : transformée en float16, fusion `signs·x` + Hadamard, noyaux du fork Prism, si le décodage reste sous 20 tok/s. | Mesure avant/après, retiré si le gain est < 5 %. |
+
+**Plan d'exécution détaillé** (fiches B-0 à B-7, ancrages de code, portes de
+sortie, journal) : `docs/bonsai2/plan.md`.
+
+**Ordre imposé** : P14.1 → P14.2 → P14.3, et rien n'avance tant que la parité
+n'est pas verte — une sortie plausible ne prouve rien (voir la méthode de
+parité). P14.4 et P14.5 ensuite, en parallèle. P14.6 clôt.
+
+**Estimation** : P14.1 à P14.3, deux à trois jours ; P14.4 et P14.5, deux
+jours ; P14.6, une soirée de mesures.
+
+**Risques** : la disposition « groupée » des têtes GDN du pack (annoncée par
+`gdn_v_grouped: true`) doit être celle de notre `Qwen35` — la parité tranche ;
+la qualité annoncée est 98,2 % du FP16 avec le recul concentré sur
+connaissances/raisonnement et l'appel d'outils (BFCL 76,7 → 74,9) ; le
+`reasoning_effort: low` non honoré peut allonger chaque tour d'agent.
