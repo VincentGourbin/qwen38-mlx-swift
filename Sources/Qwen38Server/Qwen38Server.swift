@@ -645,12 +645,14 @@ public actor Qwen38InferenceServer {
         do {
             let selectedModel = try await ensureModelLoaded(requestedModel)
             updateSession(id) { $0.model = selectedModel }
-            // P13.1 : l'appel d'outils dépend du gabarit dédié du checkpoint
-            // Flash-Next (chat_template.jinja) — la famille 27B n'a rien
-            // d'équivalent, refus explicite plutôt qu'un silence trompeur.
+            // P13.1/P14.4 : l'appel d'outils dépend du gabarit dédié du
+            // checkpoint (chat_template.jinja) — Flash-Next et la famille
+            // 27B (Bonsai 2 y compris) partagent le même gabarit, donc le
+            // même rendu d'outils ; seul l'absence de tout modèle chargé
+            // justifie un refus explicite plutôt qu'un silence trompeur.
             if !requestedTools.isEmpty {
-                guard await runtime.isFlashNextLoaded else {
-                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite un modèle Flash-Next chargé : l'appel d'outils n'est pris en charge que par cette famille (gabarit dédié).")
+                guard await runtime.isLoaded else {
+                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite qu'un modèle soit chargé.")
                 }
             }
             let prepared = try prepare(input.messages)
@@ -794,9 +796,12 @@ public actor Qwen38InferenceServer {
             catch { await batchExecutionLock.release(); throw error }
             await batchExecutionLock.release()
             updateSession(id) { $0.model = selectedModel }
+            // P13.1/P14.4 : voir le commentaire jumeau dans
+            // chatCompletionsResponse (non-stream) — même gabarit partagé,
+            // même garde.
             if !requestedTools.isEmpty {
-                guard await runtime.isFlashNextLoaded else {
-                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite un modèle Flash-Next chargé : l'appel d'outils n'est pris en charge que par cette famille (gabarit dédié).")
+                guard await runtime.isLoaded else {
+                    throw Qwen38ServerError.invalidRequest("Le champ tools nécessite qu'un modèle soit chargé.")
                 }
             }
             let prepared = try prepare(input.messages)

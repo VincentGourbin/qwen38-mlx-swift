@@ -803,3 +803,231 @@ l'arbre est propre.
 (`compact_tojson`, clés alphabétiques) a été **retirée** de
 `Scripts/references/bonsai2_reference.py`, la fixture régénérée et la parité
 B-3 rejouée telle quelle. Pour B-4, suis l'étape 4 révisée ci-dessus.
+
+## ASK — B-4 — 2026-09-18 (reprise)
+
+- Contexte : fiche reprise avec la révision ci-dessus (réponse à l'ASK
+  précédente, option B). Code écrit et compilé (zéro avertissement dans les
+  fichiers touchés) : garde serveur levée (`Qwen38Server.swift`, les deux
+  occurrences ≈ 651/797, `runtime.isLoaded` au lieu de
+  `runtime.isFlashNextLoaded`) ; `Qwen38ConversationTurn` étendue
+  (`toolCalls`, `toolName`) ; nouvelle fonction partagée `chatMessage(_:)`
+  (`Qwen38Runtime.swift`, remplace les 2 constructions triviales de
+  `Chat.Message` concernées, ≈ lignes 1764 et 1349 avant mes ajouts) ;
+  branche `useDirectConversation` : `UserInput(tools:...)` +
+  `Qwen4ExpPromptBuilder.templateContext(thinking:reasoningEffort:tools:)`.
+- Ce que j'ai testé, avec le serveur réellement lancé sur le pack
+  (`qwen38 serve --model-path "$BONSAI" --port 8848 --enable-thinking`) :
+  1. **Bug trouvé et corrigé, indépendant de B-4 mais jamais déclenché avant
+     elle.** Dès que `tools` est non vide, `MLXLMCommon.generate` (via son
+     `TokenStreamDecoder`, `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/Tool/
+     TokenStreamDecoder.swift`) intercepte tout span `<tool_call>…` et
+     l'émet comme `Generation.toolCall`/`.rejectedToolCall` — jamais comme
+     `.chunk`. Le code existant de `Qwen38Runtime.generate` (avant B-4, donc
+     déjà présent, jamais exercé) faisait `case .toolCall,
+     .rejectedToolCall: break`, perdant silencieusement tout le texte :
+     une requête outillée renvoyait `content: ""`, aucun `tool_calls`,
+     `finish_reason: "stop"`, sans erreur. Corrigé : les deux cas
+     reconstruisent le texte XML (`reconstructedToolCallXML(_:)` pour un
+     appel complet déjà validé par MLXLMCommon, `rejection.rawTextPreview`
+     tel quel pour un appel rejeté) et le réinjectent comme `.chunk`, pour
+     que `Qwen38ToolCallParser` (déjà testé, déjà utilisé par Flash-Next)
+     reste la seule source de vérité, comme le plan le voulait
+     (« rien à faire de ce côté »). **Vérifié** : `curl` non-stream ET
+     stream sur « Lis le fichier README.md » avec l'outil `read_file`
+     renvoient tous les deux `finish_reason: "tool_calls"` et
+     `tool_calls[0].function.name == "read_file"`,
+     `arguments: {"path":"README.md"}` — exactement la première moitié de
+     la porte de sortie.
+  2. **Bloquant, non résolu.** Le second `curl` (historique se terminant
+     par `role: "tool"`, sans nouveau message utilisateur — exactement la
+     forme que la porte de sortie demande) échoue systématiquement avec
+     `La conversation doit se terminer par un message utilisateur.`
+     (`Qwen38RuntimeError.missingUserMessage`). Cause : `Qwen38Runtime.
+     generateStateless` (≈ ligne 1555) a `guard let lastUserIndex =
+     messages.lastIndex(where: { $0.role == .user }) ... guard
+     lastUserIndex == messages.count - 1 else { throw missingUserMessage }`
+     — une contrainte **antérieure à B-4**, jamais mentionnée par la fiche
+     (qui ne parle que de remplir `priorTurns`, en supposant implicitement
+     que le dernier message reste `.user`). Le serveur, lui, accepte déjà
+     `tool`/`assistant` comme dernier rôle au niveau HTTP (P13.1/P13.3) —
+     l'incohérence est entre les deux couches.
+     - **Vérifié que ce n'est pas un problème de gabarit** : j'ai rendu le
+       même historique tri-tours (user → assistant+tool_calls → tool,
+       aucun nouveau user) directement via
+       `processor.tokenizer.apply_chat_template(...)` côté Python
+       (`chat_template.jinja`, celui du pack) : le gabarit **synthétise
+       lui-même** un tour `<|im_start|>user\n<tool_response>…
+       </tool_response><|im_end|>` autour du message `tool` puis ajoute
+       `<|im_start|>assistant\n<think>\n\n</think>\n\n` normalement — voir
+       le commentaire déjà présent sur `Qwen38ChatMessage.Role` (« rendu
+       … comme un `<tool_response>` fusionné dans le tour utilisateur
+       suivant »). Rien à faire côté gabarit ; `chatMessage(_:)` construit
+       déjà `Chat.Message(role: .tool, …)` correctement pour ce cas
+       (testé isolément dans le rendu, pas encore dans `generateStateless`
+       puisqu'on n'y arrive pas).
+     - **Ce qui manque réellement** : `generateStateless` sépare
+       aujourd'hui `priorTurns` (tout ce qui précède le dernier message
+       `user`) d'un nouveau « prompt » `String`, transmis à `generate(
+       prompt:…)` qui ajoute lui-même **un nouveau tour `.user`** avec ce
+       texte (≈ ligne 1723, `Qwen38ConversationTurn(role: .user, text:
+       prompt, …)`) — ce mécanisme n'a pas d'équivalent pour « il n'y a
+       pas de nouveau texte utilisateur, continue depuis l'historique tel
+       quel ». Deux façons de combler ça, aucune anodine :
+       A) Ajouter un chemin dans `generateStateless` qui, quand le dernier
+       message n'est pas `.user`, place l'intégralité de `messages` dans
+       `conversationTurns` (via `chatMessage(_:)`) et appelle la
+       génération SANS passer par `generate(prompt:…)` (qui suppose
+       toujours un nouveau tour `.user`) — nécessite une nouvelle petite
+       fonction parallèle à `generate`, pas juste changer une garde.
+       B) Assouplir `generate(prompt:…)` pour qu'un `prompt` vide
+       n'ajoute pas de tour `.user` — plus court, mais `generate` est
+       partagé par des appelants qui ne s'attendent pas à ce
+       comportement (risque de régression silencieuse ailleurs).
+     Je n'ai pas tranché : c'est exactement le type de décision
+     d'architecture que le plan me dit de ne pas prendre seul.
+- Question : comment `generateStateless` doit-il gérer un historique déjà
+  terminé par `tool`/`assistant` (aucun nouveau texte utilisateur) sur le
+  chemin 27B ?
+- Options : A) option A ci-dessus (nouveau chemin dédié, plus sûr, plus de
+  code). B) option B ci-dessus (`generate(prompt: "")` n'ajoute rien, plus
+  court, à auditer pour ne rien casser ailleurs). C) limiter le tour 2 du
+  test à un historique se terminant par un message utilisateur de relance
+  (« Continue. ») — contourne le blocage sans toucher au runtime, mais
+  s'écarte de la porte de sortie telle qu'écrite (le second `curl` doit
+  précisément renvoyer l'historique avec le message `tool`).
+
+FICHE B-4 BLOQUÉE
+
+### Réponse — B-4 (reprise) — 2026-09-18 (Vincent, via l'auteur du plan)
+
+Le bug `.toolCall`/`.rejectedToolCall` jeté en silence est un vrai bug,
+antérieur à B-4 ; le correctif (réinjection du XML en `.chunk`, parseur
+unique) est le bon : garde-le, et ajoute-lui un test unitaire sans
+checkpoint si `Generation.toolCall` se construit à la main (sinon, note-le
+comme couvert par la porte de sortie serveur).
+
+**Décision : ni A ni B tels quels — « A-bis », un seul chemin, sans
+chaîne vide magique et sans fonction parallèle.** `generate(prompt:…)` fait
+deux choses : construire le nouveau tour `.user`, puis générer depuis
+`conversationTurns`. Sépare-les :
+
+1. Renomme le corps actuel en fonction privée
+   `generate(newUserTurn: Qwen38ConversationTurn?, systemPrompt: String?,
+   options: Qwen38GenerationOptions, forceConversationReplay: Bool)`.
+   La fonction publique `generate(prompt:systemPrompt:imageURLs:options:
+   forceConversationReplay:)` devient un simple emballage qui construit
+   `Qwen38ConversationTurn(role: .user, text: prompt, imageURLs: imageURLs)`
+   et appelle le corps. Les sept appelants (`Qwen38Server.swift` ≈ 1007,
+   `Qwen38CLI.swift` × 4, `Qwen38BenchUIApp.swift` ≈ 406, et
+   `generateStateless`) ne changent pas ; aucun comportement ne bouge pour
+   eux, c'est le point.
+2. Dans le corps, `prompt` apparaît à quatre endroits (≈ 1649, 1664, 1789,
+   1868 dans ta version) :
+   - ≈ 1789, le seul qui compte ici : `if let userTurn = newUserTurn {
+     conversationTurns.append(userTurn) }` — le tour système reste ajouté
+     comme avant, avant ce `if`.
+   - ≈ 1868 (`chatSession.streamDetails(to: prompt, …)`, chemin
+     `ChatSession` non rejoué) et la branche Flash-Next (≈ 1649/1664) :
+     `guard let newUserTurn else { throw Qwen38RuntimeError.missingUserMessage }`
+     en tête de branche, puis `newUserTurn.text` / `newUserTurn.imageURLs`.
+     Ces branches exigent un nouveau texte utilisateur, on le dit
+     explicitement au lieu de le supposer. `generateStateless` ne les
+     atteint jamais (il force `forceConversationReplay: true`, donc la
+     branche `useDirectConversation`), et la branche MTP/M2 non plus pour
+     Bonsai 2 (pas de drafter) — même garde là aussi si `canUseMTP` est
+     vrai avec `newUserTurn == nil`.
+3. Dans `generateStateless` (≈ 1555) : remplace les deux `guard` par une
+   règle en trois cas sur `messages.last?.role` —
+   - `.user` : comportement actuel (`priorTurns` = tout sauf le dernier,
+     `generate(prompt: last.content, …)`) ;
+   - `.tool` : `conversationTurns = messages.map(chatMessageTurn)` (**tous**
+     les messages, via la même conversion que `priorTurns`, `toolName`
+     compris), `conversationTurnCount = nombre de tours .user`, puis
+     `generate(newUserTurn: nil, systemPrompt: nil, options: options,
+     forceConversationReplay: true)` ;
+   - tout autre dernier rôle (`.assistant`, `.system`) : `missingUserMessage`
+     comme aujourd'hui. Un historique fini par `assistant` serait un
+     préremplissage de réponse, hors périmètre ; le gabarit rend le tour
+     `tool` en `<tool_response>` fusionné dans un tour utilisateur, comme
+     tu l'as vérifié, donc `.tool` est le seul cas légitime à ouvrir.
+   Le serveur acceptait déjà `tool` en dernier rôle : l'incohérence entre
+   les deux couches disparaît sans rien changer côté HTTP.
+4. `conversationTurnCount`/`turnIndex` : `turnIndex` compte les requêtes,
+   pas les tours utilisateur ; laisse-le s'incrémenter. `cacheReused` reste
+   `false` sur ce chemin (rejoué), ce qui est vrai.
+
+Porte de sortie inchangée : le second `curl` renvoie l'historique complet
+terminé par le message `role: "tool"` et obtient une réponse finale en
+texte, en non-stream **et** en stream. L'option C (message « Continue. »)
+est refusée : elle ne teste pas la forme que pi envoie réellement.
+
+Écarts attendus au journal : la liste des sept appelants vérifiés
+(`grep -n "runtime.generate(\|try await generate(" Sources/**/*.swift`),
+et la ligne exacte de la garde ajoutée dans chaque branche.
+
+## B-4 — Outils sur la famille 27B — 2026-09-18 — validée
+
+- Fait :
+  1. **Garde serveur** (`Qwen38Server.swift`, deux occurrences) : `guard
+     await runtime.isFlashNextLoaded` → `guard await runtime.isLoaded`, avec
+     un message d'erreur générique et le commentaire P13.1 mis à jour.
+  2. **Bug `.toolCall`/`.rejectedToolCall` jeté en silence** (antérieur à
+     B-4, jamais déclenché avant elle) : `Qwen38Runtime.swift`, boucle
+     d'événements de `generate` — dès que `tools` est déclaré,
+     `MLXLMCommon.generate` intercepte tout span `<tool_call>…` via son
+     `TokenStreamDecoder` et l'émet comme `Generation.toolCall`/
+     `.rejectedToolCall`, jamais `.chunk`. Corrigé : les deux cas
+     reconstruisent le texte XML (`reconstructedToolCallXML(_:)` pour un
+     appel complet, `rejection.rawTextPreview` tel quel pour un appel rejeté)
+     et le réinjectent en `.chunk`, pour que `Qwen38ToolCallParser` (déjà
+     testé, déjà utilisé par Flash-Next) reste la seule source de vérité.
+  3. **Architecture « A-bis » (réponse à l'ASK)** pour le second tour d'un
+     round-trip d'outil (historique fini par `role: "tool"`, aucun nouveau
+     texte utilisateur) : `generate(prompt:…)` est redevenu un emballage
+     public construisant un `Qwen38ConversationTurn` puis appelant un corps
+     privé `generate(newUserTurn: Qwen38ConversationTurn?, …)`. `newUserTurn
+     == nil` signifie « rien de neuf à ajouter, génère depuis
+     `conversationTurns` tel quel » ; les trois branches qui exigent un
+     nouveau texte (Flash-Next, MTP local, `ChatSession` non rejoué) le
+     disent explicitement (`guard newUserTurn != nil else { throw
+     Qwen38RuntimeError.missingUserMessage }`). `generateStateless` porte
+     désormais une règle à trois cas sur `messages.last?.role` : `.user`
+     (comportement historique), `.tool` (tout l'historique devient
+     `conversationTurns` via la nouvelle fonction partagée
+     `conversationTurn(_:)`, `newUserTurn: nil`), tout autre rôle
+     (`missingUserMessage`, inchangé). Les sept appelants de
+     `generate(prompt:…)` (`Qwen38Server.swift:1007`,
+     `Qwen38BenchUIApp.swift:406`, `Qwen38CLI.swift:3469/3598/3714/3911`,
+     `generateStateless` lui-même) ne changent pas de signature ni de
+     comportement — vérifié par grep, confirmé par la suite de tests.
+  4. Pas de test unitaire séparé pour `reconstructedToolCallXML(_:)` /
+     `Generation.toolCall` construit à la main (la fonction est `private`,
+     minuscule, un pur formatage de chaîne) : couvert par la porte de
+     sortie serveur ci-dessous, sur les quatre scénarios réels — l'option
+     que la réponse à l'ASK autorisait explicitement en repli.
+- Porte de sortie observée : serveur lancé
+  (`.xcodebuild/Build/Products/Debug/qwen38 serve --model-path "$BONSAI"
+  --port 8848 --enable-thinking`), quatre `curl` (non-stream tour 1 et 2,
+  stream tour 1 et 2) sur « Lis le fichier README.md » avec l'outil
+  `read_file` :
+  - Non-stream tour 1 : `finish_reason: "tool_calls"`,
+    `tool_calls[0].function.name == "read_file"`,
+    `arguments: {"path":"README.md"}`.
+  - Non-stream tour 2 (historique avec le message `role: "tool"`) :
+    `finish_reason: "stop"`, réponse finale cohérente en français
+    reprenant le contenu du fichier.
+  - Stream tour 1 : `tool_calls` arrive en un seul fragment `delta`, puis
+    `finish_reason: "tool_calls"`.
+  - Stream tour 2 : réponse finale en `delta.content`, puis
+    `finish_reason: "stop"`.
+  Suite complète rejouée après coup (`Scripts/run-tests.sh` avec
+  `QWEN38_BONSAI_MODEL`/`QWEN38_BONSAI_FIXTURE`) : `Test run with 233 tests
+  in 0 suites passed` / `** TEST SUCCEEDED **` — aucune régression.
+- Écart au plan : fiche rouverte deux fois (le journal ci-dessus détaille
+  les deux ASK et leurs réponses) ; le code final suit la réponse
+  « A-bis », pas les options A/B initialement proposées dans la première
+  ASK. `swift build --product qwen38` propre, zéro avertissement dans les
+  fichiers touchés (`Qwen38Runtime.swift`, `Qwen38Server.swift`).
+- Pas d'agent : 1 (session courante, plus l'agent Plan de l'auteur du plan
+  entre les deux reprises) · appels d'outils : ~150 au total sur B-4.

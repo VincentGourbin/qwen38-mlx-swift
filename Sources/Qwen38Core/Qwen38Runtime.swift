@@ -288,6 +288,88 @@ private struct Qwen38ConversationTurn: Sendable {
     let role: Chat.Message.Role
     let text: String
     let imageURLs: [URL]
+    /// B-4 (docs/bonsai2/plan.md) : uniquement significatif pour
+    /// `role == .assistant` — les appels d'outils de ce tour, rejoués dans
+    /// le rendu du tour suivant. Vide pour un tour assistant ordinaire.
+    var toolCalls: [Qwen38ToolCall] = []
+    /// B-4 : uniquement significatif pour `role == .tool` — le nom de la
+    /// fonction dont c'est le résultat, `nil` si inconnu (le serveur ne
+    /// capture pas ce champ sur un message `role: "tool"` entrant ; le
+    /// gabarit du checkpoint apparie les réponses par ordre, pas par nom).
+    var toolName: String? = nil
+}
+
+/// B-4 (docs/bonsai2/plan.md) : converts a transport-neutral
+/// `Qwen38ChatMessage` (the server's OpenAI-shaped history) into the
+/// runtime's own `Qwen38ConversationTurn` — the single conversion
+/// `generateStateless` uses for every message, whether it ends up as prior
+/// context or (when the history already ends in `.user`) the new turn.
+private func conversationTurn(_ message: Qwen38ChatMessage) -> Qwen38ConversationTurn {
+    Qwen38ConversationTurn(
+        role: Chat.Message.Role(rawValue: message.role.rawValue) ?? .user,
+        text: message.content,
+        imageURLs: message.imageURLs,
+        toolCalls: message.role == .assistant ? message.toolCalls : [],
+        toolName: nil)
+}
+
+/// B-4 (docs/bonsai2/plan.md) : the one place a `Qwen38ConversationTurn`
+/// becomes a `Chat.Message`, shared by every `container.perform` closure
+/// that replays a conversation — an assistant turn with tool calls renders
+/// them as `Chat.Message.Tool.calls`, a `.tool` turn as `.result`, anything
+/// else is unchanged from before B-4. The template ignores `tool_call_id`
+/// (results are paired by order, see `Qwen38ChatMessage.Role`), so the
+/// empty `id:` below is inert.
+private func chatMessage(_ turn: Qwen38ConversationTurn) throws -> Chat.Message {
+    let images = turn.imageURLs.map(UserInput.Image.url)
+    switch turn.role {
+    case .assistant where !turn.toolCalls.isEmpty:
+        let calls = try turn.toolCalls.map { call in
+            ToolCall(
+                function: .init(
+                    name: call.name,
+                    arguments: try JSONDecoder().decode(
+                        [String: JSONValue].self, from: Data(call.argumentsJSON.utf8))))
+        }
+        return Chat.Message(
+            role: .assistant, content: turn.text, images: images, tool: .calls(calls))
+    case .tool:
+        return Chat.Message(
+            role: .tool, content: turn.text, images: [], tool: .result(id: "", name: turn.toolName))
+    default:
+        return Chat.Message(role: turn.role, content: turn.text, images: images)
+    }
+}
+
+/// B-4 (docs/bonsai2/plan.md): renders a `ToolCall` MLXLMCommon has already
+/// parsed back into the checkpoint's own `<tool_call>` XML — see the
+/// `.toolCall` case in `generate`'s event loop for why this round-trip
+/// exists. Argument values are written as plain text, matching the
+/// checkpoint's own convention (`<parameter=path>\nREADME.md\n</parameter>`,
+/// verified against a real completion): `Qwen38ToolArgumentTyper` recovers
+/// the declared JSON type downstream from the tool schema, not from this
+/// text's shape.
+private func reconstructedToolCallXML(_ call: ToolCall) -> String {
+    func rendered(_ value: JSONValue) -> String {
+        switch value {
+        case .null: return ""
+        case .bool(let v): return String(v)
+        case .int(let v): return String(v)
+        case .double(let v): return String(v)
+        case .string(let v): return v
+        case .array, .object:
+            guard let data = try? JSONEncoder().encode(value),
+                let text = String(data: data, encoding: .utf8)
+            else { return "" }
+            return text
+        }
+    }
+    var xml = "<tool_call>\n<function=\(call.function.name)>\n"
+    for (key, value) in call.function.arguments.sorted(by: { $0.key < $1.key }) {
+        xml += "<parameter=\(key)>\n\(rendered(value))\n</parameter>\n"
+    }
+    xml += "</function>\n</tool_call>\n"
+    return xml
 }
 
 private final class Qwen38MTPTokenSink: @unchecked Sendable {
@@ -1309,12 +1391,7 @@ public actor Qwen38Runtime {
         let existingSession = m2Conversation
         return try await targetContainer.perform { context in
             let input = UserInput(
-                chat: turns.map { turn in
-                    Chat.Message(
-                        role: turn.role,
-                        content: turn.text,
-                        images: turn.imageURLs.map(UserInput.Image.url))
-                },
+                chat: try turns.map(chatMessage),
                 additionalContext: [
                     "enable_thinking": options.enableThinking,
                     "reasoning_effort": options.reasoningEffort,
@@ -1489,29 +1566,43 @@ public actor Qwen38Runtime {
             // conversation state used by the 27B path below.
             return try flashEngine.generateFromMessages(messages: messages, options: options)
         }
-        guard let lastUserIndex = messages.lastIndex(where: { $0.role == .user }) else {
+        guard let lastMessage = messages.last else {
             throw Qwen38RuntimeError.missingUserMessage
         }
-        guard lastUserIndex == messages.count - 1 else {
+        // B-4 (docs/bonsai2/plan.md, réponse "A-bis" à l'ASK) : trois cas sur
+        // le dernier rôle. `.user` : comportement historique. `.tool` : un
+        // tour d'outils sans nouveau texte utilisateur (le suivi standard
+        // OpenAI après un appel d'outil) — tout l'historique devient
+        // `conversationTurns`, `generate(newUserTurn: nil, …)` ne pousse rien
+        // de nouveau et laisse le gabarit produire lui-même l'invite de
+        // continuation (vérifié directement contre `chat_template.jinja` du
+        // pack : un message `.tool` final se rend comme un tour
+        // `<|im_start|>user\n<tool_response>…</tool_response><|im_end|>`
+        // synthétisé, rien à faire côté rendu). Tout autre dernier rôle
+        // (`.assistant`, `.system`) : rejeté — un historique fini par
+        // `.assistant` serait un préremplissage de réponse, hors périmètre.
+        let priorTurns: [Qwen38ConversationTurn]
+        let newUserTurn: Qwen38ConversationTurn?
+        switch lastMessage.role {
+        case .user:
+            priorTurns = messages.dropLast().map(conversationTurn)
+            newUserTurn = conversationTurn(lastMessage)
+        case .tool:
+            priorTurns = messages.map(conversationTurn)
+            newUserTurn = nil
+        case .assistant, .system:
             throw Qwen38RuntimeError.missingUserMessage
-        }
-        let priorTurns = messages[..<lastUserIndex].map {
-            Qwen38ConversationTurn(
-                role: Chat.Message.Role(rawValue: $0.role.rawValue) ?? .user,
-                text: $0.content,
-                imageURLs: $0.imageURLs)
         }
         let previousTurns = conversationTurns
         let previousCount = conversationTurnCount
         let previousDirectMode = directConversationMode
-        conversationTurns = Array(priorTurns)
+        conversationTurns = priorTurns
         conversationTurnCount = priorTurns.filter { $0.role == .user }.count
         directConversationMode = false
         do {
-            let last = messages[lastUserIndex]
             let stream = try await generate(
-                prompt: last.content,
-                imageURLs: last.imageURLs,
+                newUserTurn: newUserTurn,
+                systemPrompt: nil,
                 options: options,
                 forceConversationReplay: true)
             return AsyncThrowingStream { continuation in
@@ -1548,7 +1639,33 @@ public actor Qwen38Runtime {
         options: Qwen38GenerationOptions = .init(),
         forceConversationReplay: Bool = false
     ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        try await generate(
+            newUserTurn: Qwen38ConversationTurn(role: .user, text: prompt, imageURLs: imageURLs),
+            systemPrompt: systemPrompt,
+            options: options,
+            forceConversationReplay: forceConversationReplay)
+    }
+
+    /// B-4 (docs/bonsai2/plan.md): `newUserTurn` is `nil` when there is no
+    /// new user text — `generateStateless` uses this for a history that
+    /// already ends in `.tool` (a tool round trip with no new user turn
+    /// yet). `conversationTurns` is generated from exactly as given, and
+    /// the chat template's own `add_generation_prompt` produces the
+    /// assistant continuation (verified against `chat_template.jinja`
+    /// directly: it synthesizes the `<tool_response>`-wrapped user turn
+    /// itself). Branches that always need fresh user text (Flash-Next, the
+    /// non-replayed `ChatSession` path, local-MTP replay) say so with an
+    /// explicit guard instead of silently treating `nil` as an empty turn.
+    private func generate(
+        newUserTurn: Qwen38ConversationTurn?,
+        systemPrompt: String?,
+        options: Qwen38GenerationOptions,
+        forceConversationReplay: Bool
+    ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        let prompt = newUserTurn?.text ?? ""
+        let imageURLs = newUserTurn?.imageURLs ?? []
         if let flashEngine {
+            guard newUserTurn != nil else { throw Qwen38RuntimeError.missingUserMessage }
             // P11.1 : appliqué avant de générer, jamais après — voir le
             // commentaire de `Qwen38GenerationOptions.routedExpertCount`.
             if let requestedRoutedExpertCount = options.routedExpertCount {
@@ -1720,12 +1837,12 @@ public actor Qwen38Runtime {
                     : .unavailable,
                 engine: requestedMTP ? options.mtp.engine : nil)
 
-        let userTurn = Qwen38ConversationTurn(
-            role: .user, text: prompt, imageURLs: imageURLs)
         if conversationTurns.isEmpty, let systemPrompt {
             conversationTurns.append(.init(role: .system, text: systemPrompt, imageURLs: []))
         }
-        conversationTurns.append(userTurn)
+        if let newUserTurn {
+            conversationTurns.append(newUserTurn)
+        }
 
         // Start before message reconstruction, image preprocessing, target
         // prefill, and drafter initialization. Otherwise MTP would report a
@@ -1749,11 +1866,12 @@ public actor Qwen38Runtime {
         let generationStream: AsyncThrowingStream<Generation, Error>
         do {
             if canUseLocalMTP, let container, let activeDrafter {
+                guard let newUserTurn else { throw Qwen38RuntimeError.missingUserMessage }
                 var turns = m2ConversationTurns
                 if turns.isEmpty, let systemPrompt {
                     turns.append(.init(role: .system, text: systemPrompt, imageURLs: []))
                 }
-                turns.append(userTurn)
+                turns.append(newUserTurn)
                 generationStream = try await makeLocalMTPStream(
                     turns: turns,
                     targetContainer: container,
@@ -1764,19 +1882,14 @@ public actor Qwen38Runtime {
             } else if useDirectConversation, let container {
                 let turns = conversationTurns
                 let mtpStream = try await container.perform { context in
-                    let messages = turns.map { turn in
-                        Chat.Message(
-                            role: turn.role,
-                            content: turn.text,
-                            images: turn.imageURLs.map(UserInput.Image.url)
-                        )
-                    }
+                    let messages = try turns.map(chatMessage)
                     let input = UserInput(
                         chat: messages,
-                        additionalContext: [
-                            "enable_thinking": options.enableThinking,
-                            "reasoning_effort": options.reasoningEffort,
-                        ]
+                        tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary),
+                        additionalContext: Qwen4ExpPromptBuilder.templateContext(
+                            thinking: options.enableThinking,
+                            reasoningEffort: options.reasoningEffort,
+                            tools: options.tools.isEmpty ? nil : options.tools)
                     )
                     let preparedInput = try await context.processor.prepare(input: input)
                     if canUseMTP, let activeDrafter {
@@ -1805,6 +1918,7 @@ public actor Qwen38Runtime {
                     }
                 }
             } else {
+                guard newUserTurn != nil else { throw Qwen38RuntimeError.missingUserMessage }
                 generationStream = chatSession.streamDetails(to: prompt, images: images)
             }
         } catch {
@@ -1833,7 +1947,35 @@ public actor Qwen38Runtime {
                                 continuation.yield(.chunk(visibleText))
                             }
                         case .info(let info): completionInfo = info
-                        case .toolCall, .rejectedToolCall: break
+                        case .toolCall(let call):
+                            // B-4 (docs/bonsai2/plan.md): once `UserInput`
+                            // carries `tools`, MLXLMCommon's own
+                            // `TokenStreamDecoder` (Tool/TokenStreamDecoder.swift)
+                            // intercepts a well-formed `<tool_call>…</tool_call>`
+                            // span before it ever reaches `.chunk` — silently
+                            // discarding it here (the pre-B4 `break`) is why a
+                            // tools-enabled turn returned empty content. Put the
+                            // XML back on the wire exactly as the model would
+                            // have written it, so the server's own
+                            // `Qwen38ToolCallParser` — already used by
+                            // Flash-Next, already tested — stays the single
+                            // source of truth for every family.
+                            let text = reconstructedToolCallXML(call)
+                            outputText += text
+                            continuation.yield(.chunk(text))
+                        case .rejectedToolCall(let rejection):
+                            // A `<tool_call>` span the model never closed
+                            // (typically EOS mid-call, a Bonsai 2 quantization
+                            // quality symptom worth tracking in B-6, not a
+                            // wiring bug) — `rawTextPreview` is the verbatim
+                            // rejected output. Re-emitting it as plain text
+                            // matches the pre-B4 behavior a plain `.chunk`
+                            // would have given: `Qwen38ToolCallParser` sees an
+                            // unclosed tag and correctly leaves it as visible
+                            // text rather than guessing a call (see the parser's
+                            // own truncation-pitfall contract).
+                            outputText += rejection.rawTextPreview
+                            continuation.yield(.chunk(rejection.rawTextPreview))
                         }
                     }
                     profiler.end("Decode")
