@@ -576,3 +576,47 @@ Gabarit ASK (fiche bloquée) :
   `Qwen38CLI.swift`, non touché par cette fiche, apparaissent sur un build
   complet — hors périmètre B-1, à traiter séparément si besoin).
 - Pas d'agent : 1 (session courante) · appels d'outils : ~15.
+
+## B-2 — Les modules Hadamard et leur installation — 2026-09-18 — validée
+
+- Fait : nouveaux `Sources/Qwen38Core/Bonsai2/Qwen38HadamardModules.swift`
+  (`hadamardRotate`, `Qwen38HadamardQuantizedLinear`,
+  `Qwen38HadamardQuantizedEmbedding`) et
+  `Sources/Qwen38Core/Bonsai2/Qwen38Bonsai2Loader.swift` (lecture de
+  `config.json` → `modules[]`, lecture paresseuse des `.signs` via
+  `loadArrays`, validation ±1, remplacement des 402 modules via
+  `model.update(modules:)`) ; branchement dans `Qwen38Runtime.load` juste
+  après `loadContainer`, via `container!.perform { context in
+  installer.install(into: context.model) }` (pas `container!.update` : le
+  modèle est une référence de classe, `perform` suffit et évite de capturer
+  un `var` mutable dans la fermeture `@Sendable`).
+- Porte de sortie observée : `qwen38 generate --model-path "$BONSAI"
+  --temperature 0` sur les trois invites, avec `--max-tokens` relevé à
+  200–400 pour laisser la réflexion se dérouler (voir écart ci-dessous) :
+  1. « Dis bonjour en un mot. » → texte de réflexion cohérent puis
+     `Bonjour` — identique au mot produit par la référence en B-0.
+  2. « Écris une fonction Swift qui renvoie le carré d'un entier. » →
+     réflexion cohérente puis code Swift correct
+     (`func carré(_ nombre: Int) -> Int { return nombre * nombre }`).
+  3. « Quelle est la capitale de la France ? Réponds en un mot. » →
+     réflexion cohérente puis `Paris`.
+  Les trois réponses sont cohérentes et correctes — contraste net avec le
+  charabia de B-1, signe que la transformée Hadamard et l'ordre
+  signes/transformée (avant pour les projections, après pour l'embedding)
+  sont corrects. La fiche B-3 (parité logits) reste la seule preuve
+  quantitative ; ceci n'est qu'un premier repère qualitatif comme prévu par
+  le plan (§0 : « un texte plausible ne prouve rien »).
+- Écart au plan : la porte de sortie demandait une coïncidence mot pour mot
+  avec la sortie B-0 dès `--max-tokens 16`. La sous-commande CLI `generate`
+  (`Qwen38CLI.swift`, `struct Generate`) force `enableThinking: true`
+  inconditionnellement, alors que le script de référence B-0
+  (`chat_config` de `vision_artifact.py`) ne positionne pas
+  `enable_thinking` et obtient donc le défaut du gabarit (pas de réflexion
+  visible, 2 jetons générés). Les deux ne sont donc pas directement
+  comparables à budget de jetons égal : `--max-tokens 16` ne laissait que
+  la réflexion démarrer, sans jamais atteindre la réponse. Relancé à
+  200–400 jetons pour laisser `</think>` puis la réponse finale
+  apparaître ; la réponse finale de l'invite 1 coïncide bien avec la sortie
+  B-0 (`Bonjour`). Aucun changement de code motivé par cet écart — c'est un
+  problème de comparabilité des bancs d'essai, pas du chargeur Bonsai 2.
+- Pas d'agent : 1 (session courante) · appels d'outils : ~40.

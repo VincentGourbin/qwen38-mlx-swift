@@ -442,6 +442,19 @@ public actor Qwen38Runtime {
                 from: directory,
                 using: Qwen38TokenizerLoader()
             )
+            if info.isBonsai2 {
+                let installer = try Qwen38Bonsai2Loader(directory: directory)
+                // `context.model` is a class reference: mutating it in place via
+                // `perform` (not `update`) avoids capturing a `var` across the
+                // `@Sendable` closure boundary just to read the count back.
+                let replacedCount = await container!.perform { context in
+                    installer.install(into: context.model)
+                }
+                guard replacedCount == installer.expectedReplacementCount else {
+                    throw Qwen38Bonsai2LoaderError.unexpectedReplacementCount(
+                        expected: installer.expectedReplacementCount, actual: replacedCount)
+                }
+            }
             // Leave processing overrides empty so the Qwen processor uses the
             // checkpoint's own min/max pixel contract for each image.
             chatSession = ChatSession(container!, processing: .init())
