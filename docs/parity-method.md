@@ -253,7 +253,14 @@ test` directly instead of through `Scripts/run-tests.sh` — without
 parallelism deadlocks on MLX's GPU lock ordering):
 
 ```bash
-QWEN38_BONSAI_MODEL="$BONSAI" \
-QWEN38_BONSAI_FIXTURE=parity/bonsai2-reference.safetensors \
+TEST_RUNNER_QWEN38_BONSAI_MODEL="$BONSAI" \
+TEST_RUNNER_QWEN38_BONSAI_FIXTURE="$PWD/parity/bonsai2-reference.safetensors" \
 Scripts/run-tests.sh
 ```
+
+The `TEST_RUNNER_` prefix is required even through `Scripts/run-tests.sh`:
+`xcodebuild test` only forwards prefixed variables to the test process
+(verified 2026-09-18 — without it the suite passes in ~5 s because the
+checkpoint test silently skips; with it the test runs, ~25 s). Use an
+absolute fixture path, the test process does not run from the repository
+root.

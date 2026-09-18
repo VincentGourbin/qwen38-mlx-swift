@@ -638,7 +638,7 @@ public actor Qwen38InferenceServer {
         guard let lastMessageRole = input.messages.last?.role,
               lastMessageRole == "user" || lastMessageRole == "tool" || lastMessageRole == "assistant"
         else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user, tool (après un appel d'outil), ou assistant (pour continuer un tour interrompu).") }
-        let requestedTools = input.effectiveTools.map { $0.toSpec() }
+        let requestedTools = Self.orderedToolSpecs(input.effectiveTools.map { $0.toSpec() }, body: data)
         guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); await queue.acquire(); updateSession(id) { $0.status = .running }; defer { Task { await queue.release() } }
@@ -783,7 +783,7 @@ public actor Qwen38InferenceServer {
         guard let lastMessageRole = input.messages.last?.role,
               lastMessageRole == "user" || lastMessageRole == "tool" || lastMessageRole == "assistant"
         else { throw Qwen38ServerError.invalidRequest("Le dernier message doit avoir le rôle user, tool (après un appel d'outil), ou assistant (pour continuer un tour interrompu).") }
-        let requestedTools = input.effectiveTools.map { $0.toSpec() }
+        let requestedTools = Self.orderedToolSpecs(input.effectiveTools.map { $0.toSpec() }, body: data)
         guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); updateSession(id) { $0.status = .running }
@@ -1259,6 +1259,24 @@ public actor Qwen38InferenceServer {
     /// volontairement « exceeds the context window » : c'est un des motifs
     /// que pi reconnaît comme débordement de contexte, ce qui l'aiguille
     /// vers sa récupération bornée (une compaction, un seul réessai).
+    /// Rattache à chaque outil sa forme JSON telle que le client l'a
+    /// envoyée, ordre des membres compris : `JSONDecoder` perd cet ordre,
+    /// or le gabarit rend `{{ tool | tojson }}` et transformers — le rendu
+    /// d'entraînement du modèle — écrit les membres dans l'ordre reçu. Le
+    /// corps est relu une fois avec `Qwen38OrderedJSON` ; si sa liste
+    /// `tools` ne correspond pas (absente, autre longueur), on garde les
+    /// spécifications décodées, rendues alors à clés triées.
+    static func orderedToolSpecs(_ specs: [Qwen38ToolSpec], body: Data) -> [Qwen38ToolSpec] {
+        guard !specs.isEmpty, let root = try? Qwen38OrderedJSON.parse(body),
+            let ordered = root["tools"]?.arrayValue, ordered.count == specs.count
+        else { return specs }
+        return zip(specs, ordered).map { spec, entry in
+            Qwen38ToolSpec(
+                type: spec.type, name: spec.name, description: spec.description,
+                parameters: spec.parameters, orderedSpec: entry)
+        }
+    }
+
     static func resolvedMaxTokens(_ requested: Int?) throws -> Int {
         guard let requested else { return 256 }
         guard requested > 0 else {

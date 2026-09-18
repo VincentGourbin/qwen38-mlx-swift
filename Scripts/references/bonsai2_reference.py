@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import contextlib
 import hashlib
 import json
 import sys
@@ -27,57 +26,27 @@ from pathlib import Path
 import mlx.core as mx
 
 
-@contextlib.contextmanager
-def compact_tojson():
-    """`chat_template.jinja`'s `{{ tool | tojson }}` calls take no args, so
-    `transformers`' filter (chat_template_utils.py) falls back to
-    `json.dumps`'s own default separators — `", "` / `": "`, i.e. with
-    spaces. swift-jinja's `tojson` (Filters.swift) always encodes compact
-    (no spaces): Foundation's `JSONEncoder` never inserts them outside
-    `.prettyPrinted`. Same rendered bytes on both sides is what B-3 needs
-    (docs/bonsai2/plan.md) — not a model concern, a chat-template one
-    shared by the whole codebase — so patch `json.dumps` to match Swift's
-    compact style for the one call this reference makes.
-    """
-    original = json.dumps
-
-    def compact_dumps(*args, **kwargs):
-        # `chat_template_utils.tojson` always forwards `separators=None`
-        # explicitly, so `dict.setdefault` (key-absence only) would not
-        # override it — check the value itself.
-        if kwargs.get("separators") is None:
-            kwargs["separators"] = (",", ":")
-        return original(*args, **kwargs)
-
-    json.dumps = compact_dumps
-    try:
-        yield
-    finally:
-        json.dumps = original
-
-
-# Key order matters here: swift-jinja's `tojson` filter always
-# JSONEncoder.sortedKeys (Filters.swift), while Python's jinja2 `tojson`
-# preserves dict insertion order. To compare the same rendered prompt bytes
-# on both sides (docs/bonsai2/plan.md B-3 — token ids first, before any
-# numeric comparison), every level here is written in alphabetical key
-# order, matching what the Swift side (Qwen38ToolSpec.toolSpecDictionary)
-# produces after sorting. Not a model concern; a chat-template rendering
-# one shared by the whole codebase, out of scope for this fiche.
+# Written in the natural OpenAI order (type, function → name, description,
+# parameters → type, properties, required): transformers' `tojson` keeps
+# dict insertion order and `json.dumps` defaults, and since swift-jinja 2.5
+# plus `Qwen38OrderedJSON` (Qwen38Core) the Swift side renders the client's
+# bytes in the client's order the same way — no compensation on either side.
+# The Swift parity test (`bonsai2ParityAgainstPythonReference`) parses the
+# same JSON text; keep the two in sync.
 READ_FILE_TOOL = {
+    "type": "function",
     "function": {
-        "description": "Lit un fichier sous la racine choisie. Renvoie au plus 200 lignes.",
         "name": "read_file",
+        "description": "Lit un fichier sous la racine choisie. Renvoie au plus 200 lignes.",
         "parameters": {
+            "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "start_line": {"type": "integer"},
             },
             "required": ["path"],
-            "type": "object",
         },
     },
-    "type": "function",
 }
 
 PROMPTS = [
@@ -114,10 +83,9 @@ def main() -> None:
         kwargs = {"num_images": 0, "enable_thinking": False}
         if entry["tools"] is not None:
             kwargs["tools"] = entry["tools"]
-        with compact_tojson():
-            prompt_str = apply_chat_template(
-                processor, chat_config(config), entry["text"], **kwargs
-            )
+        prompt_str = apply_chat_template(
+            processor, chat_config(config), entry["text"], **kwargs
+        )
         prompt_ids = processor.tokenizer.encode(prompt_str, add_special_tokens=False)
 
         cache = lm.make_cache()

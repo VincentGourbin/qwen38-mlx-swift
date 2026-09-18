@@ -18,6 +18,11 @@ let package = Package(
         // Switch back to a tagged revision only once the Qwen MTP changes are released.
         .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
+        // Rendu des gabarits de chat : 2.5 aligne `tojson` sur `json.dumps`
+        // de Python (séparateurs, `/` non échappé, `ensure_ascii=False`),
+        // ce que transformers utilise — un `tojson` différent change les
+        // jetons du prompt outillé que le modèle voit.
+        .package(url: "https://github.com/huggingface/swift-jinja", from: "2.5.1"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
         .package(url: "https://github.com/VincentGourbin/swift-mlx-profiler", from: "1.5.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
@@ -32,6 +37,7 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "swift-jinja"),
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
             ]
         ),
@@ -67,7 +73,10 @@ let package = Package(
         ),
         .testTarget(
             name: "Qwen38Tests",
-            dependencies: ["Qwen38Core", "Qwen38Server", "Qwen38Agent"]
+            dependencies: [
+                "Qwen38Core", "Qwen38Server", "Qwen38Agent",
+                .product(name: "Jinja", package: "swift-jinja"),
+            ]
         ),
     ]
 )

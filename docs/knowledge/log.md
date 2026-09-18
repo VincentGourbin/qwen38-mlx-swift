@@ -6470,3 +6470,64 @@ sur 8 jetons **et** sur 64. Pic MLX inchangé (57,42 Go).
 
 En prime, `reduceHyperStreams` n'est plus calculé que sur une position au lieu
 de toutes : le préfill y gagne aussi du calcul, pas seulement de la mémoire.
+
+## 2026-09-18 — Le prompt outillé n'était pas celui de l'entraînement (`tojson`)
+
+### Le défaut, vu en parité Bonsai 2
+
+La fiche B-3 (`docs/bonsai2/plan.md`) compare d'abord les **ids du prompt**
+rendus par notre pile à ceux de transformers. L'invite outillée échouait :
+même gabarit, même tokenizer, mais pas les mêmes octets pour
+`{{ tool | tojson }}`. Vérifié dans les sources, à trois niveaux :
+
+| | transformers (`json.dumps`, rendu d'entraînement) | swift-jinja 2.4.2 |
+|---|---|---|
+| ordre des membres | ordre du client | **clés triées** (`JSONEncoder.sortedKeys`, et `Value.init(any:)` trie aussi) |
+| séparateurs | `", "` et `": "` | compacts, sans espace |
+| non-ASCII | brut (`ensure_ascii=False`) | **`é`** (`ensure_ascii` vrai par défaut) |
+| barre oblique | `/` | **`\/`** (`JSONEncoder` sans `.withoutEscapingSlashes`) |
+
+Sur un outil décrit en français avec un chemin de fichier, le modèle voyait
+donc `"description":"Lit un fichier du dépôt (ex. src\/main.swift)"`,
+clés dans le désordre, au lieu de `"description": "Lit un fichier du dépôt (ex. src/main.swift)"`.
+Même chose pour les arguments d'un `tool_calls` rejoué dans l'historique, que
+le gabarit parcourt avec `|items` : ordre alphabétique au lieu de l'ordre du
+fil. Cela concernait Flash-Next en production, pas seulement Bonsai 2 ; la
+première parité B-3 avait été rendue verte en **compensant côté Python**
+(clés alphabétiques, `json.dumps` compact), ce qui masquait l'écart.
+
+Il n'y a pas une seule « vérité » : llama.cpp (minja) rend compact et non
+échappé, jinja2 nu trie et échappe. La référence retenue est transformers,
+c'est le rendu des gabarits Qwen à l'entraînement et celui des évaluations
+(vLLM, BFCL).
+
+### Le correctif
+
+- **swift-jinja 2.4.2 → 2.5.1** (`Package.resolved`, dépendance déclarée dans
+  `Package.swift`) : depuis 2.5.0, `tojson` suit `json.dumps` — séparateurs,
+  `/` intact, `ensure_ascii=False` par défaut, ordre d'insertion. Trois des
+  quatre lignes du tableau tombent avec la montée de version.
+- **L'ordre des membres** ne peut pas venir d'un `Dictionary` Swift :
+  `JSONDecoder` le perd (`allKeys` sort en ordre de hachage, vérifié), et
+  `Value.init(any:)` trie ce qu'il reçoit. D'où `Qwen38OrderedJSON`
+  (`Sources/Qwen38Core/Qwen38OrderedJSON.swift`) : un parseur JSON qui garde
+  l'ordre du document et se convertit en `Jinja.Value` ordonné — que
+  `Value.init(any:)` laisse passer tel quel. Le serveur relit le corps de la
+  requête une fois et rattache à chaque `Qwen38ToolSpec` son `orderedSpec` ;
+  `Qwen38ToolSpec.templateContext` fournit la variable `tools` via
+  `additionalContext` (appliqué **après** le paramètre `tools:` par
+  swift-transformers, donc prioritaire) ; `hfMessage` rend les arguments
+  d'un `tool_calls` dans l'ordre du fil.
+- Le script de référence Python (`Scripts/references/bonsai2_reference.py`)
+  n'a plus aucune compensation ; le test unitaire
+  `toolTemplateValueRendersLikeTransformers` fixe le rendu attendu, vérifié
+  contre `json.dumps`.
+
+### Ce que ça change
+
+Le prompt d'une requête outillée change d'octets — donc de jetons — pour
+Flash-Next comme pour Bonsai 2, sans effet sur le cache de préfixe (il ne
+compare que des rendus produits par la même pile). L'effet sur la qualité
+d'appel d'outils n'a pas été mesuré séparément ; le bénéfice certain est
+que nos prompts sont désormais ceux des évaluations publiées, ce qui rend
+les comparaisons (BFCL 74,9 annoncé pour Bonsai 2) interprétables.

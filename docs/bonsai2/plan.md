@@ -345,7 +345,7 @@ Recopie les trois sorties dans le journal.
      identique ; une différence plus grande signale un vrai écart, pas du bruit).
 3. Documenter dans `docs/parity-method.md` (section « Bonsai 2 ») la commande
    de génération et la commande de test :
-   `QWEN38_BONSAI_MODEL="$BONSAI" QWEN38_BONSAI_FIXTURE=parity/bonsai2-reference.safetensors Scripts/run-tests.sh`.
+   `TEST_RUNNER_QWEN38_BONSAI_MODEL="$BONSAI" TEST_RUNNER_QWEN38_BONSAI_FIXTURE="$PWD/parity/bonsai2-reference.safetensors" Scripts/run-tests.sh   # préfixe TEST_RUNNER_ obligatoire, sinon le test saute`.
 
 **Porte de sortie** : `TESTS OK` avec le test Bonsai 2 exécuté (pas sauté),
 ids greedy 32/32 sur 4/4 invites. Si une invite échoue : STOP, journal, la
@@ -435,9 +435,17 @@ dans le journal comme d'habitude.
    changer le sens. Le gabarit du checkpoint n'utilise pas `tool_call_id`
    (réponses appariées par ordre), donc un identifiant vide est sans effet.
 4. **Runtime — déclarer les outils du tour courant.** Même endroit, dans
-   `UserInput(chat: messages, additionalContext: …)`, ajouter
-   `tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary)`.
-   Rien d'autre : le processeur fait le reste.
+   `UserInput(chat: messages, additionalContext: …)`, remplacer le
+   dictionnaire `additionalContext` par
+   `Qwen4ExpPromptBuilder.templateContext(thinking: options.enableThinking, reasoningEffort: options.reasoningEffort, tools: options.tools.isEmpty ? nil : options.tools)`
+   et ajouter `tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary)`.
+   `templateContext` (2026-09-18, voir `docs/knowledge/log.md`) place dans
+   `additionalContext["tools"]` une `Jinja.Value` **ordonnée** que
+   swift-transformers applique après son propre paramètre `tools:` — c'est
+   ce qui rend les outils dans l'ordre du client, comme transformers.
+   Limite connue sur ce chemin : les arguments d'un `tool_calls` rejoué
+   passent par `MLXLMCommon.ToolCall` (`[String: JSONValue]`, non ordonné)
+   et sortent donc à clés triées ; acceptable pour B-4, à noter au journal.
 5. **Les trois autres constructions de `Chat.Message`** (≈ lignes 1154, 1194,
    1313 : premier tour GUI et chemin M2/MTP) ne sont pas sur le chemin serveur
    de cette fiche ; laisse-les, mais fais-les passer par la même fonction
@@ -561,7 +569,7 @@ swift build 2>&1 | grep "warning:.*Sources/"       # doit être vide
 Scripts/build.sh                                   # Debug, .xcodebuild/Build/Products/Debug/qwen38
 Scripts/build-release.sh                           # Release
 Scripts/run-tests.sh                               # suite complète (les tests à checkpoint sautent sans variables)
-QWEN38_BONSAI_MODEL="$BONSAI" QWEN38_BONSAI_FIXTURE=parity/bonsai2-reference.safetensors Scripts/run-tests.sh
+TEST_RUNNER_QWEN38_BONSAI_MODEL="$BONSAI" TEST_RUNNER_QWEN38_BONSAI_FIXTURE="$PWD/parity/bonsai2-reference.safetensors" Scripts/run-tests.sh   # préfixe TEST_RUNNER_ obligatoire, sinon le test saute
 caffeinate -i .xcodebuild/Build/Products/Release/qwen38 serve --model-path "$BONSAI" --port 8848 --enable-thinking
 curl -s http://127.0.0.1:8848/healthz
 Scripts/pi-session-cost.py ~/Developpements/YuE2-mlx-swift/.pi/sessions
@@ -786,5 +794,12 @@ l'historique. Aucune revue intermédiaire : reprends B-4 avec la fiche
 révisée, journal comme d'habitude. Les modifications non commitées de
 `Qwen38Server.swift` / `Qwen38Runtime.swift` / `Qwen38FlashNextEngine.swift`
 (bloc `usage`, `cachedPromptTokens`, 400 sur `max_tokens`) appartiennent à
-un chantier séparé (issue #1) : ne les inclus pas dans tes commits, continue
-avec `git add -p` ; elles seront commitées à part.
+un chantier séparé (issue #1) : commitées à part le 2026-09-18 (`10e9c10`),
+l'arbre est propre.
+
+**Complément du 2026-09-18 (rendu `tojson`)** : l'écart Jinja relevé en B-3
+était réel et a été corrigé dans la pile (swift-jinja 2.5.1 +
+`Qwen38OrderedJSON`, voir `docs/knowledge/log.md`). La compensation Python
+(`compact_tojson`, clés alphabétiques) a été **retirée** de
+`Scripts/references/bonsai2_reference.py`, la fixture régénérée et la parité
+B-3 rejouée telle quelle. Pour B-4, suis l'étape 4 révisée ci-dessus.

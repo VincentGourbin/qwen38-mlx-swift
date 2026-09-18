@@ -3,6 +3,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 import MLXProfiler
+import Jinja
 import Testing
 import Tokenizers
 @testable import Qwen38Core
@@ -2387,20 +2388,16 @@ func bonsai2ParityAgainstPythonReference() async throws {
     // `Scripts/references/bonsai2_reference.py`'s `READ_FILE_TOOL` — the
     // three must render byte-identical `tools` JSON for prompt 3's ids to
     // match.
-    let readFileTool: ToolSpec = Qwen38ToolSpec(
+    // Parsed from JSON text, like the server does with the request body,
+    // so member order is the client's — the order transformers renders.
+    let readFileJSON = #"{"type": "function", "function": {"name": "read_file", "description": "Lit un fichier sous la racine choisie. Renvoie au plus 200 lignes.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}}, "required": ["path"]}}}"#
+    let readFileTool = Qwen38ToolSpec(
         name: "read_file",
         description: "Lit un fichier sous la racine choisie. Renvoie au plus 200 lignes.",
-        parameters: .object([
-            "type": .string("object"),
-            "properties": .object([
-                "path": .object(["type": .string("string")]),
-                "start_line": .object(["type": .string("integer")]),
-            ]),
-            "required": .array([.string("path")]),
-        ])
-    ).toolSpecDictionary
+        parameters: try Qwen38JSONValue.parse(#"{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"}},"required":["path"]}"#),
+        orderedSpec: try Qwen38OrderedJSON.parse(readFileJSON))
 
-    let prompts: [(text: String, tools: [ToolSpec]?)] = [
+    let prompts: [(text: String, tools: [Qwen38ToolSpec]?)] = [
         ("Dis bonjour en un mot.", nil),
         ("Écris une fonction Swift qui renvoie le carré d'un entier.", nil),
         ("Quelle est la capitale de la France ? Réponds en un mot.", nil),
@@ -2411,8 +2408,10 @@ func bonsai2ParityAgainstPythonReference() async throws {
         let messages: [Message] = [["role": "user", "content": entry.text]]
         let swiftPromptIDs = try tokenizer.applyChatTemplate(
             messages: messages,
-            tools: entry.tools,
-            additionalContext: ["enable_thinking": false]
+            tools: entry.tools?.map(\.toolSpecDictionary),
+            additionalContext: Qwen4ExpPromptBuilder.templateContext(
+                thinking: false, reasoningEffort: "low", tools: entry.tools)
+                .filter { $0.key != "reasoning_effort" }
         ).map(Int32.init)
 
         guard let pythonPromptIDsArray = fixture["prompt_ids_\(index)"] else {
@@ -4964,9 +4963,48 @@ func hfMessageRendersAssistantToolCallsAsArgumentObject() throws {
     // Le point qui casserait le rendu du gabarit (`|items` sur une chaîne) :
     // `arguments` doit être un dictionnaire, jamais la chaîne JSON du fil
     // OpenAI.
-    let arguments = try #require(function["arguments"] as? [String: any Sendable])
-    #expect(arguments["command"] as? String == "ls")
-    #expect(arguments["timeout"] as? Int == 300)
+    // … et un objet **ordonné** (`Jinja.Value`), dans l'ordre du fil OpenAI,
+    // parce que le gabarit boucle `|items` dessus et que le modèle a été
+    // entraîné sur l'ordre du client, pas sur des clés triées.
+    let arguments = try #require(function["arguments"] as? Jinja.Value)
+    guard case .object(let fields) = arguments else {
+        Issue.record("arguments : objet Jinja attendu, reçu \(arguments)")
+        return
+    }
+    #expect(Array(fields.keys) == [.string("command"), .string("timeout")])
+    #expect(fields[.string("command")] == .string("ls"))
+    #expect(fields[.string("timeout")] == .int(300))
+}
+
+@Test("P13.1 : un outil se rend comme transformers — ordre des membres, espaces, accents et / intacts")
+func toolTemplateValueRendersLikeTransformers() throws {
+    // Sent by a client with keys in this order; `json.dumps` (transformers)
+    // gives exactly the expected string below — verified against Python.
+    let json = #"{"type":"function","function":{"name":"read_file","description":"Lit un fichier du dépôt (ex. src/main.swift)","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}"#
+    let spec = Qwen38ToolSpec(name: "read_file", orderedSpec: try Qwen38OrderedJSON.parse(json))
+    let rendered = try Jinja.Template("{{ tools[0] | tojson }}")
+        .render(["tools": Qwen38ToolSpec.templateContext([spec])])
+    #expect(rendered == #"{"type": "function", "function": {"name": "read_file", "description": "Lit un fichier du dépôt (ex. src/main.swift)", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}"#)
+    // Without the client's bytes, the fallback is the sorted dictionary —
+    // still valid JSON for the template, just not the client's order.
+    let fallback = Qwen38ToolSpec(name: "read_file", description: "d")
+    let renderedFallback = try Jinja.Template("{{ tools[0] | tojson }}")
+        .render(["tools": Qwen38ToolSpec.templateContext([fallback])])
+    #expect(renderedFallback == #"{"function": {"description": "d", "name": "read_file"}, "type": "function"}"#)
+}
+
+@Test("P13.1 : Qwen38OrderedJSON garde l'ordre des membres et suit les nombres de json.dumps")
+func orderedJSONPreservesOrderAndNumbers() throws {
+    let parsed = try Qwen38OrderedJSON.parse(#"{"zeta": 1, "alpha": 2.0, "mid": [true, null, "éé\/x"], "beta": {"y": 1e3, "x": -7}}"#)
+    guard case .object(let members) = parsed else { Issue.record("objet attendu"); return }
+    #expect(members.map(\.key) == ["zeta", "alpha", "mid", "beta"])
+    #expect(parsed["zeta"] == .int(1))
+    #expect(parsed["alpha"] == .double(2.0))
+    #expect(parsed["mid"] == .array([.bool(true), .null, .string("éé/x")]))
+    #expect(parsed["beta"]?["y"] == .double(1000))
+    #expect(parsed["beta"]?["x"] == .int(-7))
+    #expect(throws: Qwen38OrderedJSONError.self) { try Qwen38OrderedJSON.parse(#"{"a": 1,}"#) }
+    #expect(throws: Qwen38OrderedJSONError.self) { try Qwen38OrderedJSON.parse(#"[1] 2"#) }
 }
 
 @Test("P13.1 : hfMessage rend un message tool avec son contenu, sans exiger d'identifiant")

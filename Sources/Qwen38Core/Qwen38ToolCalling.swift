@@ -1,4 +1,5 @@
 import Foundation
+import Jinja
 
 /// P13.1 : le socle pur (aucun tokenizer, aucun checkpoint) de l'appel
 /// d'outils au format OpenAI — voir PLAN.md, section "P13". Trois
@@ -156,15 +157,23 @@ public struct Qwen38ToolSpec: Sendable, Equatable {
     public let name: String
     public let description: String?
     public let parameters: Qwen38JSONValue?
+    /// The whole `tools[]` entry exactly as the client sent it, member
+    /// order included (`Qwen38OrderedJSON`), or `nil` for a spec built in
+    /// code. The template does `{{ tool | tojson }}`, and transformers —
+    /// the renderer the model was trained against — writes members in the
+    /// client's order; `toolSpecDictionary` alone can only offer sorted
+    /// keys (Swift dictionaries have no order). See `templateValue`.
+    public let orderedSpec: Qwen38OrderedJSON?
 
     public init(
         type: String = "function", name: String, description: String? = nil,
-        parameters: Qwen38JSONValue? = nil
+        parameters: Qwen38JSONValue? = nil, orderedSpec: Qwen38OrderedJSON? = nil
     ) {
         self.type = type
         self.name = name
         self.description = description
         self.parameters = parameters
+        self.orderedSpec = orderedSpec
     }
 
     /// The `Tokenizers.ToolSpec` (`[String: any Sendable]`) dictionary this
@@ -176,6 +185,25 @@ public struct Qwen38ToolSpec: Sendable, Equatable {
         if let description { function["description"] = description }
         if let parameters { function["parameters"] = parameters.sendableValue }
         return ["type": type, "function": function]
+    }
+
+    /// What the chat template should see for this tool: the client's bytes
+    /// in the client's order when we have them, the sorted dictionary
+    /// otherwise. Handed to `applyChatTemplate` through
+    /// `additionalContext["tools"]` (see `templateContext(_:)`) rather than
+    /// the `tools:` parameter, because swift-transformers converts the
+    /// latter with `Value.init(any:)`, which sorts dictionary keys — while
+    /// a ready-made `Jinja.Value` passes through untouched.
+    public var templateValue: Jinja.Value {
+        if let orderedSpec { return orderedSpec.jinjaValue }
+        return (try? Jinja.Value(any: toolSpecDictionary)) ?? .null
+    }
+
+    /// The `tools` template variable for a request: put it in
+    /// `additionalContext["tools"]`, which swift-transformers applies after
+    /// (and therefore over) its own `tools:` conversion.
+    public static func templateContext(_ tools: [Qwen38ToolSpec]) -> Jinja.Value {
+        .array(tools.map(\.templateValue))
     }
 }
 

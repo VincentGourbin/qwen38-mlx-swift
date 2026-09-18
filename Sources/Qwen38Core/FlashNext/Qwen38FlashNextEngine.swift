@@ -494,7 +494,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
                 tokenizer: tokenizer, configuration: configuration, directory: directory,
                 prompt: prompt, imageURL: imageURLs.first, thinking: options.enableThinking,
                 reasoningEffort: options.reasoningEffort, systemPrompt: systemPrompt,
-                tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
+                tools: options.tools.isEmpty ? nil : options.tools)
         }
         hasConversationHistory = true
 
@@ -524,7 +524,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         let built = try Qwen4ExpPromptBuilder.buildFromMessages(
             tokenizer: tokenizer, messages: hfMessages, thinking: options.enableThinking,
             reasoningEffort: options.reasoningEffort,
-            tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
+            tools: options.tools.isEmpty ? nil : options.tools)
         return built.tokenIDs
     }
 
@@ -592,7 +592,7 @@ public final class Qwen38FlashNextEngine: Qwen38FlashNextEngineProtocol, @unchec
         let built = try Qwen4ExpPromptBuilder.buildFromMessages(
             tokenizer: tokenizer, messages: hfMessages, thinking: options.enableThinking,
             reasoningEffort: options.reasoningEffort,
-            tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary))
+            tools: options.tools.isEmpty ? nil : options.tools)
         hasConversationHistory = true
         return try runGenerationStream(
             built: built, options: options, continueConversation: false,

@@ -57,7 +57,7 @@ public enum Qwen4ExpPromptBuilder {
         thinking: Bool,
         reasoningEffort: String = "low",
         systemPrompt: String? = nil,
-        tools: [ToolSpec]? = nil
+        tools: [Qwen38ToolSpec]? = nil
     ) throws -> Qwen4ExpBuiltPrompt {
         guard let imageURL else {
             var messages: [Message] = []
@@ -67,11 +67,9 @@ public enum Qwen4ExpPromptBuilder {
             messages.append(["role": "user", "content": prompt])
             let tokenIDs = try tokenizer.applyChatTemplate(
                 messages: messages,
-                tools: tools,
-                additionalContext: [
-                    "enable_thinking": thinking,
-                    "reasoning_effort": reasoningEffort,
-                ]
+                tools: tools?.map(\.toolSpecDictionary),
+                additionalContext: templateContext(
+                    thinking: thinking, reasoningEffort: reasoningEffort, tools: tools)
             ).map(Int32.init)
             return Qwen4ExpBuiltPrompt(tokenIDs: tokenIDs)
         }
@@ -127,17 +125,34 @@ public enum Qwen4ExpPromptBuilder {
         messages: [Message],
         thinking: Bool,
         reasoningEffort: String = "low",
-        tools: [ToolSpec]? = nil
+        tools: [Qwen38ToolSpec]? = nil
     ) throws -> Qwen4ExpBuiltPrompt {
         let tokenIDs = try tokenizer.applyChatTemplate(
             messages: messages,
-            tools: tools,
-            additionalContext: [
-                "enable_thinking": thinking,
-                "reasoning_effort": reasoningEffort,
-            ]
+            tools: tools?.map(\.toolSpecDictionary),
+            additionalContext: templateContext(
+                thinking: thinking, reasoningEffort: reasoningEffort, tools: tools)
         ).map(Int32.init)
         return Qwen4ExpBuiltPrompt(tokenIDs: tokenIDs)
+    }
+
+    /// The `additionalContext` every rendering site shares. `tools` goes in
+    /// here as a ready-made ordered `Jinja.Value` (`Qwen38ToolSpec.
+    /// templateContext`) so the template renders each tool in the client's
+    /// member order, like transformers does — the `tools:` parameter of
+    /// `applyChatTemplate` is still passed for completeness, but swift-
+    /// transformers applies `additionalContext` after it, so this wins.
+    public static func templateContext(
+        thinking: Bool, reasoningEffort: String, tools: [Qwen38ToolSpec]?
+    ) -> [String: any Sendable] {
+        var context: [String: any Sendable] = [
+            "enable_thinking": thinking,
+            "reasoning_effort": reasoningEffort,
+        ]
+        if let tools, !tools.isEmpty {
+            context["tools"] = Qwen38ToolSpec.templateContext(tools)
+        }
+        return context
     }
 
     /// P13.1 : convertit un `Qwen38ChatMessage` transport-neutre vers le
@@ -164,9 +179,12 @@ public enum Qwen4ExpPromptBuilder {
             var dict: Message = ["role": "assistant", "content": message.content]
             guard !message.toolCalls.isEmpty else { return dict }
             dict["tool_calls"] = message.toolCalls.map { call -> [String: any Sendable] in
+                // Ordered on purpose: the template loops `|items` over the
+                // arguments and the model was trained on the client's
+                // order, not on sorted keys (Qwen38OrderedJSON).
                 let arguments: any Sendable
-                if case .object(let fields)? = try? Qwen38JSONValue.parse(call.argumentsJSON) {
-                    arguments = fields.mapValues { $0.sendableValue }
+                if let parsed = try? Qwen38OrderedJSON.parse(call.argumentsJSON), parsed.isObject {
+                    arguments = parsed.jinjaValue
                 } else {
                     arguments = [String: any Sendable]()
                 }
