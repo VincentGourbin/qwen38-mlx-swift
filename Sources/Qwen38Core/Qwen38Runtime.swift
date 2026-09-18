@@ -427,6 +427,13 @@ public actor Qwen38Runtime {
             mtpAvailability = .unavailable
         case .qwen35:
             await Qwen38MTPRegistration.register()
+            if info.isBonsai2 {
+                await Qwen38Bonsai2.register()
+                // Belt and braces: the fused 4-way GDN projection cannot fuse
+                // mixed packed/float projections anyway (FusedQuantizedLinear
+                // returns ineligible), but never let it try on this checkpoint.
+                setenv("MLX_QWEN_FOUR_GDN", "0", 1)
+            }
             // The generic helper tries registered factories in order. The LLM
             // factory also accepts qwen3_5 and would silently load the text-only
             // implementation, dropping vision inputs. Select the VLM factory

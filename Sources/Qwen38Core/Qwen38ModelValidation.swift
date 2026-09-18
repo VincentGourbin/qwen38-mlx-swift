@@ -26,7 +26,15 @@ public struct Qwen38ModelInfo: Decodable, Sendable, Equatable {
     public let hiddenSize: Int?
     public let numHiddenLayers: Int?
 
-    public var family: Qwen38ModelFamily? { Qwen38ModelFamily(rawValue: modelType) }
+    /// `prism_hadamard_qwen35` (Bonsai 2, Prism ML) is Qwen3.8-27B with a
+    /// blockwise Hadamard rotation folded into 2-bit weights — same module
+    /// topology, so it is served by the `qwen35` family plus the Hadamard
+    /// modules installed by `Qwen38Bonsai2Loader` (docs/bonsai2/plan.md).
+    public var family: Qwen38ModelFamily? {
+        if modelType == Qwen38Bonsai2.modelType { return .qwen35 }
+        return Qwen38ModelFamily(rawValue: modelType)
+    }
+    public var isBonsai2: Bool { modelType == Qwen38Bonsai2.modelType }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
