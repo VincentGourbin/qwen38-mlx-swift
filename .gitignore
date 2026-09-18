@@ -27,3 +27,4 @@ parity/*.safetensors
 # Bytecode Python des scripts de référence (régénérable)
 __pycache__/
 *.pyc
+venv-bonsai2/

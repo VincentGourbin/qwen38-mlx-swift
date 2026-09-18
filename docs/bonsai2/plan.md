@@ -351,42 +351,111 @@ Recopie les trois sorties dans le journal.
 ids greedy 32/32 sur 4/4 invites. Si une invite échoue : STOP, journal, la
 suite du plan n'a pas de sens sans cette porte.
 
-### B-4 — Outils sur la famille 27B
+### B-4 — Outils sur la famille 27B — **révisée le 2026-09-18 après l'ASK**
 
-**Fichiers** : `Sources/Qwen38Server/Qwen38Server.swift` (≈ 648-656 et ≈ 794-800),
-`Sources/Qwen38Core/Qwen38Runtime.swift` (≈ 1596-1612 et le chemin `ChatSession`).
+**Décision (réponse à l'ASK B-4)** : pas de revue intermédiaire. L'incertitude
+« `ChatSession`/`UserInput` exposent-ils `tools` ? » est levée par lecture du
+code vendorisé, ci-dessous. Exécute la fiche telle quelle ; les écarts vont
+dans le journal comme d'habitude.
 
-1. Lire d'abord comment le chemin Flash-Next fait, c'est le modèle à copier :
-   `Qwen38Server.swift` (recherche `requestedTools`, `Qwen38ToolCallParser`,
-   `rememberConversation`) et `Sources/Qwen38Core/FlashNext/Qwen4ExpPromptBuilder.swift`
-   (`tools:` passé à `applyChatTemplate`).
-2. Remplacer la garde `guard await runtime.isFlashNextLoaded` par une garde
-   « famille sait rendre les outils » : Flash-Next **ou** Bonsai 2 (expose
-   `runtime.loadedModelInfo?.isBonsai2` ou un `var supportsTools: Bool` sur le
-   runtime). Le 27B ordinaire (`mlx-community/Qwen3.8-27B-4bit`) porte le même
-   gabarit : accepte-le aussi, la garde devient `family == .qwen35 || isFlashNextLoaded`,
-   et le message d'erreur 400 disparaît sauf si aucun modèle n'est chargé.
-3. Dans `Qwen38Runtime`, chemin `ChatSession` : passer `options.tools`
-   (déjà présent dans `Qwen38GenerationOptions`, ligne ≈ 67) au rendu du
-   gabarit. `ChatSession` de MLXLMCommon prend `additionalContext` ; vérifie
-   dans `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ChatSession.swift` s'il
-   expose `tools` sur `UserInput` (recherche `tools` dans ce fichier et dans
-   `UserInput.swift`). Si oui, passe-les là ; sinon rends le prompt toi-même
-   avec `tokenizer.applyChatTemplate(messages:tools:additionalContext:)` comme
-   le fait `Qwen4ExpPromptBuilder`, et donne les ids à la session. Ne duplique
-   pas l'analyse des `<tool_call>` : `Qwen38ToolCallParser` est déjà appelé
-   côté serveur sur le texte produit, indépendamment de la famille.
-4. Les messages `role: "tool"` de l'historique doivent traverser `prepare()`
-   (serveur, ≈ ligne 1034) jusqu'au gabarit sous la forme que le gabarit
-   attend (`<tool_response>` rendu par le gabarit lui-même à partir de
-   `role: tool`) — même chemin que Flash-Next.
+**Ce que le code vendorisé offre déjà (vérifié)** :
+- `UserInput(chat:tools:additionalContext:)` porte `tools: [ToolSpec]?` avec
+  `public typealias ToolSpec = [String: any Sendable]`
+  (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/Tool/Tool.swift` ligne 5).
+- Le processeur du type `qwen3_5` (`VLMProcessorLoadingRegistry.swift` ligne
+  146, même processeur que Qwen3-VL) transmet `input.tools` au gabarit :
+  `Qwen3VL.swift` lignes 112-114, `tokenizer.applyChatTemplate(messages:…, tools: input.tools, …)`.
+- `Chat.Message` (`MLXLMCommon/Chat.swift`) sait représenter l'historique
+  outillé : `Chat.Message(role:content:images:tool:)` avec
+  `tool: .calls([ToolCall])` sur un tour assistant et `.result(id:name:)` sur
+  un tour `role: .tool` ; la conversion en dictionnaire pour le gabarit rend
+  `tool_calls` (ligne 156) et `tool_call_id` (ligne 170). `ToolCall.Function`
+  = `name: String`, `arguments: [String: JSONValue]` (`Tool/ToolCall.swift`).
+- Le chemin que le serveur emprunte pour la famille 27B est
+  `Qwen38Runtime.generateStateless` (≈ ligne 1472) → `generate(prompt:…,
+  forceConversationReplay: true)` → branche `useDirectConversation`
+  (≈ ligne 1699) → `UserInput(chat: messages, additionalContext: …)` (≈ ligne
+  1774) → `context.processor.prepare(input:)` → `MLXLMCommon.generate`.
+  **C'est le seul endroit à modifier pour le rendu.** `Qwen38GenerationOptions.tools`
+  (`[Qwen38ToolSpec]`, ≈ ligne 67) et `Qwen38ToolSpec.toolSpecDictionary`
+  (`Qwen38ToolCalling.swift` ≈ ligne 174) existent déjà ; `Qwen38ChatMessage`
+  a déjà `role: .tool` et `toolCalls: [Qwen38ToolCall]` (≈ lignes 226-245).
+- Le parseur de sortie `Qwen38ToolCallParser` est appelé côté serveur sur le
+  texte produit dès que `options.tools` est non vide, quelle que soit la
+  famille (`makeJSONResponse` et le flux) : **rien à faire** de ce côté.
 
-**Porte de sortie** : avec le serveur lancé sur le pack
-(`qwen38 serve --model-path "$BONSAI" --port 8848 --enable-thinking`), un
-aller-retour complet outil → résultat → réponse finale réussit en
-**non-stream et en stream**, rejoué avec deux `curl` (le second renvoie
-l'historique avec le message `tool`). Recopie le `tool_calls` reçu et la
-réponse finale dans le journal.
+**Fichiers** : `Sources/Qwen38Core/Qwen38Runtime.swift`,
+`Sources/Qwen38Server/Qwen38Server.swift`.
+
+1. **Serveur — lever la garde.** Aux deux endroits (≈ lignes 651 et ≈ 797)
+   remplacer `guard await runtime.isFlashNextLoaded` par une garde « un
+   modèle est chargé et sa famille rend les outils », c'est-à-dire n'importe
+   quel modèle chargé aujourd'hui (Flash-Next, Qwen3.8-27B ordinaire,
+   Bonsai 2 partagent le même gabarit outillé). Garde le 400 uniquement pour
+   « aucun modèle chargé », et mets à jour le commentaire P13.1 au-dessus
+   (« la famille 27B n'a rien d'équivalent » n'est plus vrai : même
+   `chat_template.jinja`). Ne touche pas au routage autour du cache de
+   conversation Flash-Next qui suit : sur la famille 27B, la requête part
+   déjà vers `generateStateless` (≈ lignes 998 et 1012).
+2. **Runtime — porter les outils dans l'historique rejoué.** Étendre
+   `Qwen38ConversationTurn` (≈ ligne 288, `private struct`) de deux champs :
+   `toolCalls: [Qwen38ToolCall]` (tours assistant) et `toolName: String?`
+   (tours `tool`, nom de la fonction dont c'est le résultat, `nil` si
+   inconnu). Dans `generateStateless`, `priorTurns` les remplit depuis
+   `Qwen38ChatMessage` ; le rôle `.tool` doit devenir `Chat.Message.Role.tool`
+   (le `Chat.Message.Role(rawValue:)` actuel fonctionne : les deux enums ont
+   la valeur brute `"tool"`).
+3. **Runtime — rendre `Chat.Message` outillé.** Dans la branche
+   `useDirectConversation` (≈ lignes 1764-1781), construire chaque message
+   ainsi :
+   ```swift
+   func chatMessage(_ turn: Qwen38ConversationTurn) throws -> Chat.Message {
+       let images = turn.imageURLs.map(UserInput.Image.url)
+       switch turn.role {
+       case .assistant where !turn.toolCalls.isEmpty:
+           let calls = try turn.toolCalls.map { call in
+               ToolCall(function: .init(
+                   name: call.name,
+                   arguments: try JSONDecoder().decode(
+                       [String: JSONValue].self, from: Data(call.argumentsJSON.utf8))))
+           }
+           return Chat.Message(role: .assistant, content: turn.text, images: images,
+                               tool: .calls(calls))
+       case .tool:
+           return Chat.Message(role: .tool, content: turn.text, images: [],
+                               tool: .result(id: "", name: turn.toolName))
+       default:
+           return Chat.Message(role: turn.role, content: turn.text, images: images)
+       }
+   }
+   ```
+   Vérifie les initialiseurs exacts dans `Chat.swift` (lignes 23-60 et
+   95-105 : `Chat.Message.tool(...)` existe aussi comme constructeur
+   statique) et dans `Tool/ToolCall.swift` ; adapte les étiquettes sans
+   changer le sens. Le gabarit du checkpoint n'utilise pas `tool_call_id`
+   (réponses appariées par ordre), donc un identifiant vide est sans effet.
+4. **Runtime — déclarer les outils du tour courant.** Même endroit, dans
+   `UserInput(chat: messages, additionalContext: …)`, ajouter
+   `tools: options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary)`.
+   Rien d'autre : le processeur fait le reste.
+5. **Les trois autres constructions de `Chat.Message`** (≈ lignes 1154, 1194,
+   1313 : premier tour GUI et chemin M2/MTP) ne sont pas sur le chemin serveur
+   de cette fiche ; laisse-les, mais fais-les passer par la même fonction
+   `chatMessage(_:)` si c'est une substitution triviale (un tour sans outils
+   donne exactement le même `Chat.Message` qu'avant).
+6. Compiler (`swift build --product qwen38`, zéro avertissement dans les
+   fichiers touchés), `Scripts/build.sh`, puis relancer le serveur sur le pack.
+
+**Porte de sortie** : serveur lancé par
+`.xcodebuild/Build/Products/Debug/qwen38 serve --model-path "$BONSAI" --port 8848 --enable-thinking`,
+deux `curl` enchaînés sur `/v1/chat/completions` avec un outil
+`read_file(path)` : le premier (question « Lis le fichier README.md ») renvoie
+`finish_reason: "tool_calls"` et un `tool_calls[0].function.name == "read_file"` ;
+le second renvoie l'historique complet (assistant avec `tool_calls`, puis un
+message `role: "tool"` contenant un extrait) et obtient une réponse finale
+en texte. Rejouer les deux en `stream: true` (le `tool_calls` arrive en un
+seul fragment, puis `finish_reason`). Recopier `tool_calls` et la réponse
+finale dans le journal, pour le non-stream et pour le stream.
 
 ### B-5 — Cache de préfixe sur le chemin 27B
 
@@ -682,3 +751,40 @@ Gabarit ASK (fiche bloquée) :
      ici pour B-4/une fiche future si la qualité d'appel d'outils Bonsai 2
      s'avère sensible à cet ordre/formatage.
 - Pas d'agent : 1 (session courante) · appels d'outils : ~90.
+
+## ASK — B-4 — 2026-09-18
+
+- Contexte : B-0 à B-3 validées et committées (`3918c3f`, `ef68393`,
+  `b6c1715`, `d78cb4f`) ; B-3, la fiche bloquante, est verte (4/4 invites,
+  greedy 32/32, logits ~3-5e-5 sous tolérance). B-4 (outils sur la famille
+  27B) touche `Qwen38Server.swift` et `Qwen38Runtime.swift`, qui portent
+  chacun un chantier local non commité sans rapport avec Bonsai 2
+  (`cachedPromptTokens`/`usage.prompt_tokens_details.cached_tokens`) —
+  laissé de côté jusqu'ici via `git add -p` sélectif par hunk.
+- Ce que j'ai essayé : lancé un agent Plan pour relire l'incertitude propre
+  à B-4 (le plan ne sait pas si `ChatSession`/`UserInput` de MLXLMCommon
+  exposent `tools`) et proposer une méthode de rendu de prompt avant
+  d'écrire du code. Arrêté sur demande de Vincent : les revues/agents sont
+  lancés par lui, pas par l'agent d'exécution du plan.
+- Question : qui relance la revue de B-4 (et quand) ?
+- Options : A) Vincent lance lui-même la revue (agent Plan ou autre) puis
+  redonne le feu vert pour B-4. B) Vincent tranche directement
+  l'incertitude `ChatSession`/`tools` et l'agent d'exécution reprend B-4
+  sans revue intermédiaire. C) L'agent d'exécution documente son
+  investigation dans ce fichier au fil de B-4 (pas de revue à part) et
+  Vincent relit après coup, au commit.
+
+FICHE B-4 BLOQUÉE
+
+### Réponse — B-4 — 2026-09-18 (Vincent, via l'auteur du plan)
+
+Option **B**. L'incertitude est tranchée par lecture du code vendorisé (voir
+la fiche B-4 révisée ci-dessus, § « Ce que le code vendorisé offre déjà ») :
+`UserInput` accepte `tools`, le processeur `qwen3_5` les transmet au gabarit,
+et `Chat.Message` représente les appels et résultats d'outils de
+l'historique. Aucune revue intermédiaire : reprends B-4 avec la fiche
+révisée, journal comme d'habitude. Les modifications non commitées de
+`Qwen38Server.swift` / `Qwen38Runtime.swift` / `Qwen38FlashNextEngine.swift`
+(bloc `usage`, `cachedPromptTokens`, 400 sur `max_tokens`) appartiennent à
+un chantier séparé (issue #1) : ne les inclus pas dans tes commits, continue
+avec `git add -p` ; elles seront commitées à part.
