@@ -2338,6 +2338,155 @@ func flashTeacherForcedRegressionGuardV32() throws {
     #expect(Double(score.meanLogProbability) >= minLogProb)
 }
 
+/// A `LogitProcessor` that records the logits of its first call (the
+/// prompt's last-position logits, matching Python's `out.logits[0, -1, :]`)
+/// and otherwise passes them through unchanged so greedy decoding proceeds
+/// normally. Declared and consumed entirely inside a single
+/// `Qwen38Runtime.performRaw` closure, so it never crosses a `@Sendable`
+/// boundary and needs no `Sendable` conformance of its own.
+private final class Qwen38Bonsai2ParityLogitCapture: LogitProcessor {
+    private(set) var firstCallLogits: MLXArray?
+    func prompt(_ prompt: MLXArray) {}
+    func process(logits: MLXArray) -> MLXArray {
+        if firstCallLogits == nil {
+            firstCallLogits = logits
+        }
+        return logits
+    }
+    func didSample(token: MLXArray) {}
+}
+
+/// B-3 (docs/bonsai2/plan.md): numeric parity between the Bonsai 2 Hadamard
+/// port and `Scripts/references/bonsai2_reference.py` — the blocking gate
+/// before B-4 onward. Loads the pack through `Qwen38Runtime.load` (so B-1's
+/// registration and B-2's module replacement are both exercised, not a
+/// parallel path), renders the same four prompts with the same tokenizer +
+/// chat template + tools the server would use, and — first — asserts the
+/// token ids agree with Python before comparing anything numeric (a
+/// template/tokenizer drift would otherwise masquerade as a model bug).
+/// Greedy decoding and the last-position logits reuse `TokenIterator`, the
+/// same machinery `ChatSession` uses in production, via the
+/// `Qwen38Runtime.performRaw` escape hatch.
+@Test("B-3 : parité logits/greedy Bonsai 2 contre le runtime Python de référence")
+func bonsai2ParityAgainstPythonReference() async throws {
+    guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_BONSAI_MODEL"],
+        let fixturePath = ProcessInfo.processInfo.environment["QWEN38_BONSAI_FIXTURE"]
+    else {
+        return
+    }
+    let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+    let (fixture, _) = try loadArraysAndMetadata(url: URL(fileURLWithPath: fixturePath))
+
+    let runtime = Qwen38Runtime()
+    try await runtime.load(from: directory, preloadMTP: false)
+
+    let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+
+    // Same schema as `AgentToolCatalog.schema()`'s `read_file` entry
+    // (Sources/Qwen38Agent/AgentToolCatalog.swift) and
+    // `Scripts/references/bonsai2_reference.py`'s `READ_FILE_TOOL` — the
+    // three must render byte-identical `tools` JSON for prompt 3's ids to
+    // match.
+    let readFileTool: ToolSpec = Qwen38ToolSpec(
+        name: "read_file",
+        description: "Lit un fichier sous la racine choisie. Renvoie au plus 200 lignes.",
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string")]),
+                "start_line": .object(["type": .string("integer")]),
+            ]),
+            "required": .array([.string("path")]),
+        ])
+    ).toolSpecDictionary
+
+    let prompts: [(text: String, tools: [ToolSpec]?)] = [
+        ("Dis bonjour en un mot.", nil),
+        ("Écris une fonction Swift qui renvoie le carré d'un entier.", nil),
+        ("Quelle est la capitale de la France ? Réponds en un mot.", nil),
+        ("Lis le fichier README.md", [readFileTool]),
+    ]
+
+    for (index, entry) in prompts.enumerated() {
+        let messages: [Message] = [["role": "user", "content": entry.text]]
+        let swiftPromptIDs = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: entry.tools,
+            additionalContext: ["enable_thinking": false]
+        ).map(Int32.init)
+
+        guard let pythonPromptIDsArray = fixture["prompt_ids_\(index)"] else {
+            Issue.record("fixture: prompt_ids_\(index) absent")
+            continue
+        }
+        let pythonPromptIDs = pythonPromptIDsArray.asArray(Int32.self)
+        #expect(
+            swiftPromptIDs == pythonPromptIDs,
+            "invite \(index) : ids de prompt différents (gabarit/tokenizer) — Swift \(swiftPromptIDs.count) jetons, Python \(pythonPromptIDs.count)"
+        )
+        guard swiftPromptIDs == pythonPromptIDs else { continue }
+
+        struct Capture: Sendable {
+            let greedyIDs: [Int32]
+            let lastLogits: [Float]
+        }
+        let promptTokens = swiftPromptIDs
+        let capture = try await runtime.performRaw { model, _ -> Capture in
+            let processor = Qwen38Bonsai2ParityLogitCapture()
+            let input = LMInput(tokens: MLXArray(promptTokens))
+            var iterator = try TokenIterator(
+                input: input, model: model,
+                processor: processor, sampler: ArgMaxSampler(),
+                maxTokens: 32)
+            var ids: [Int32] = []
+            for _ in 0..<32 {
+                guard let token = iterator.next() else { break }
+                ids.append(Int32(token))
+            }
+            guard let logits = processor.firstCallLogits else {
+                fatalError("aucun logit capturé pour l'invite \(index)")
+            }
+            let flat = logits.asType(.float32).flattened()
+            eval(flat)
+            return Capture(greedyIDs: ids, lastLogits: flat.asArray(Float.self))
+        }
+
+        guard let pythonGreedyArray = fixture["greedy_ids_\(index)"],
+            let pythonLogitsArray = fixture["last_logits_\(index)"]
+        else {
+            Issue.record("fixture: greedy_ids_\(index)/last_logits_\(index) absent")
+            continue
+        }
+        let pythonGreedy = pythonGreedyArray.asArray(Int32.self)
+        let pythonLogits = pythonLogitsArray.asType(.float32).asArray(Float.self)
+
+        #expect(capture.greedyIDs.count == 32)
+        #expect(pythonGreedy.count == 32)
+        let hits = zip(capture.greedyIDs, pythonGreedy).filter { $0 == $1 }.count
+        print(
+            "B-3 invite \(index) : greedy \(hits)/32 identiques, "
+                + "logits maxAbsErr=\(bonsai2MaxAbsoluteError(capture.lastLogits, pythonLogits)), "
+                + "cosine=\(bonsai2CosineSimilarity(capture.lastLogits, pythonLogits))"
+        )
+        #expect(
+            capture.greedyIDs == pythonGreedy,
+            "invite \(index) : ids greedy différents de la référence Python")
+        #expect(bonsai2MaxAbsoluteError(capture.lastLogits, pythonLogits) <= 2e-2)
+        #expect(bonsai2CosineSimilarity(capture.lastLogits, pythonLogits) >= 0.9999)
+    }
+}
+
+private func bonsai2MaxAbsoluteError(_ a: [Float], _ b: [Float]) -> Float {
+    zip(a, b).map { abs($0 - $1) }.max() ?? .infinity
+}
+
+private func bonsai2CosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+    let dot = zip(a, b).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+    let normA = Foundation.sqrt(a.reduce(Float(0)) { $0 + $1 * $1 })
+    let normB = Foundation.sqrt(b.reduce(Float(0)) { $0 + $1 * $1 })
+    return normA > 0 && normB > 0 ? dot / (normA * normB) : 0
+}
+
 @Test("Le générateur streamé Flash-Next égale le greedy, respecte le contrat de flux et la continuation (H2)")
 func qwen4ExpStreamingGeneratorMatchesGreedyAndStreams() async throws {
     guard let modelPath = ProcessInfo.processInfo.environment["QWEN38_FLASH_MODEL"] else {

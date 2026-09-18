@@ -620,3 +620,65 @@ Gabarit ASK (fiche bloquée) :
   B-0 (`Bonjour`). Aucun changement de code motivé par cet écart — c'est un
   problème de comparabilité des bancs d'essai, pas du chargeur Bonsai 2.
 - Pas d'agent : 1 (session courante) · appels d'outils : ~40.
+
+## B-3 — Parité contre le runtime Python du pack — 2026-09-18 — validée
+
+- Fait : nouveau `Scripts/references/bonsai2_reference.py` (venv-bonsai2,
+  charge via `runtime/vision_artifact.py`, rend les 4 invites avec
+  `enable_thinking=False`, sauve `prompt_ids_i`/`last_logits_i`/`greedy_ids_i`
+  dans `parity/bonsai2-reference.safetensors`, non commité — git-ignoré
+  comme les fixtures Flash-Next) ; nouveau test Swift
+  `bonsai2ParityAgainstPythonReference` (`Tests/Qwen38Tests/Qwen38Tests.swift`)
+  gardé par `QWEN38_BONSAI_MODEL`/`QWEN38_BONSAI_FIXTURE` ; nouvel accesseur
+  `Qwen38Runtime.performRaw` (expose `(any LanguageModel, Tokenizer)` du
+  container chargé — seule façon d'atteindre les logits bruts, aucune API
+  publique de `ChatSession` ne les expose) ; section « Bonsai 2 » ajoutée à
+  `docs/parity-method.md`.
+- Méthode : le test charge le pack par `Qwen38Runtime.load` (donc B-1+B-2,
+  pas un chemin parallèle), rend les 4 invites avec le même tokenizer +
+  gabarit + `tools` que le serveur utiliserait, **compare d'abord les ids de
+  prompt** à ceux de Python (échoue immédiatement sinon, avant tout calcul
+  numérique — piège explicitement prévu par le plan), puis construit un
+  `TokenIterator` (la même machinerie que `ChatSession` en production) avec
+  un `LogitProcessor` qui capture les logits du premier appel (= dernière
+  position du prompt) et un `ArgMaxSampler` pour 32 jetons greedy.
+- Porte de sortie observée : `TESTS OK` — `Test run with 231 tests in 0
+  suites passed after 30.218 seconds` (`** TEST SUCCEEDED **`), test B-3
+  exécuté (pas sauté) et vert sur 4/4 invites :
+  ```
+  B-3 invite 0 : greedy 32/32 identiques, logits maxAbsErr=3.4809113e-05, cosine=1.0000001
+  B-3 invite 1 : greedy 32/32 identiques, logits maxAbsErr=3.385544e-05, cosine=1.0000006
+  B-3 invite 2 : greedy 32/32 identiques, logits maxAbsErr=3.6239624e-05, cosine=1.0000002
+  B-3 invite 3 : greedy 32/32 identiques, logits maxAbsErr=5.2452087e-05, cosine=1.0000001
+  ```
+  Trois ordres de grandeur sous les tolérances (2e-2 / cosinus ≥ 0,9999) —
+  quasi bit-exact, cohérent avec « transformée float32 + matmul 2 bits
+  identiques des deux côtés ».
+- Écart au plan : deux allers-retours avant le vert, aucun des deux dans le
+  port Hadamard lui-même.
+  1. **Exécution des tests** : `xcodebuild test` sans
+     `TEST_RUNNER_SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=1` (mis
+     par `Scripts/run-tests.sh`, oublié dans un premier essai manuel avec
+     `-only-testing`) fait tourner les tests en parallèle et bloque
+     indéfiniment sur le verrou MLX (0 % CPU, RSS ~200 Mo après plus de 2
+     minutes — jamais un chargement de modèle normal). Toujours passer par
+     `Scripts/run-tests.sh`, jamais `xcodebuild test` nu.
+  2. **Rendu JSON des outils** : l'invite 4 (« Lis le fichier README.md »,
+     outil `read_file`) échouait sur la comparaison d'ids (piège attrapé
+     comme prévu), pour deux raisons cumulées, aucune liée au modèle :
+     (a) `swift-jinja` (`Filters.swift`) trie toujours les clés
+     (`JSONEncoder.sortedKeys`) alors que le `tojson` Python
+     (`transformers/utils/chat_template_utils.py`) préserve l'ordre
+     d'insertion du dict — corrigé en écrivant `READ_FILE_TOOL` en ordre
+     alphabétique côté Python (le rendu Swift, lui, ne peut pas faire
+     autrement) ; (b) `swift-jinja` sérialise compact (`JSONEncoder` sans
+     `.prettyPrinted` n'ajoute jamais d'espace) alors que `json.dumps`
+     Python par défaut ajoute un espace après `:`/`,` — corrigé par un
+     patch temporaire de `json.dumps` (`compact_tojson()` dans le script de
+     référence, `separators=(",", ":")` quand l'appelant passe
+     `separators=None`) pour la durée du rendu. Les deux écarts sont des
+     caractéristiques partagées par tout le pipeline Jinja du dépôt (donc
+     par Flash-Next aussi, déjà en production) — hors périmètre B-3, notés
+     ici pour B-4/une fiche future si la qualité d'appel d'outils Bonsai 2
+     s'avère sensible à cet ordre/formatage.
+- Pas d'agent : 1 (session courante) · appels d'outils : ~90.

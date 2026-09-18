@@ -189,3 +189,71 @@ of the suite still runs — that is the mode CI-style runs use.
 
 Every command also exists standalone on the CLI (`qwen38 flash-*-parity`),
 which is the form used while debugging a single seam.
+
+## Bonsai 2
+
+The same method, applied to `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`
+(docs/bonsai2/plan.md, fiche B-3): does our Hadamard-rotated 2-bit port
+(`Sources/Qwen38Core/Bonsai2/`) compute the same thing as the pack's own
+reference runtime?
+
+- **Reference**: `Scripts/references/bonsai2_reference.py`, run under a
+  **separate** venv — `venv-bonsai2` (`mlx==0.32.0`, `mlx-vlm==0.6.3`), not
+  `venv617`, because the pack pins different versions. Loads through the
+  pack's own `runtime/vision_artifact.py`, renders four prompts (three
+  plain text, one with a `read_file` tool call) with `enable_thinking=False`,
+  and for each records `prompt_ids_i`, the last-position logits
+  (`last_logits_i`, float32), and 32 greedy continuation ids
+  (`greedy_ids_i`, argmax + re-inject, no EOS stopping) into
+  `parity/bonsai2-reference.safetensors` (git-ignored, like the Flash-Next
+  fixtures).
+- **Swift check**: `bonsai2ParityAgainstPythonReference()` in
+  `Tests/Qwen38Tests/Qwen38Tests.swift`, guarded by `QWEN38_BONSAI_MODEL`
+  and `QWEN38_BONSAI_FIXTURE`. Loads the pack through `Qwen38Runtime.load`
+  (so both B-1's registration and B-2's Hadamard module installation are
+  exercised, not a parallel path), renders each prompt with the same
+  tokenizer, chat template and `tools`, and **first** asserts the prompt
+  ids agree with Python — a template or tokenizer drift would otherwise
+  masquerade as a model bug. Only then does it build a `TokenIterator`
+  (the same machinery `ChatSession` uses in production) with a capturing
+  `LogitProcessor` and `ArgMaxSampler`, via `Qwen38Runtime.performRaw` — the
+  one escape hatch to the loaded container's raw model/tokenizer, since no
+  public generation API exposes logits directly.
+- **What "same" means**: 32/32 greedy ids identical and, on the logits,
+  max absolute error ≤ 2e-2 and cosine similarity ≥ 0.9999. Measured
+  2026-09-18: ~3–5e-5 max absolute error, cosine ≈ 1.0000001–1.0000006 on
+  all four prompts — three orders of magnitude inside tolerance, near
+  bit-exact (float32 Hadamard transform + identical 2-bit matmul on both
+  sides).
+- **A shared, unrelated gotcha this method caught**: the tool-call prompt
+  initially failed the *ids* gate, before any numeric comparison — not a
+  model bug. `swift-jinja`'s `tojson` filter (`Filters.swift`) always
+  `JSONEncoder.sortedKeys` and never inserts whitespace, while Python's
+  `json.dumps` (via `transformers/utils/chat_template_utils.py`, called
+  with no explicit `separators`) preserves dict insertion order and adds a
+  space after `:`/`,`. Both are pre-existing characteristics of this
+  repository's whole Jinja stack — they also apply to Flash-Next's
+  already-shipped tool calling — not something specific to Bonsai 2.
+  `bonsai2_reference.py` works around it for the fixture (alphabetical key
+  order in its tool dict, plus a `compact_tojson()` context manager that
+  temporarily patches `json.dumps` to compact separators) so both sides
+  render the same prompt bytes; nothing in the Swift port changed.
+
+Regenerating the fixture:
+
+```bash
+export BONSAI=/path/to/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit
+venv-bonsai2/bin/python Scripts/references/bonsai2_reference.py \
+  --model-dir "$BONSAI" --output parity/bonsai2-reference.safetensors
+```
+
+Running the check (note the `TEST_RUNNER_` prefix if invoking `xcodebuild
+test` directly instead of through `Scripts/run-tests.sh` — without
+`SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=1`, Swift Testing's default
+parallelism deadlocks on MLX's GPU lock ordering):
+
+```bash
+QWEN38_BONSAI_MODEL="$BONSAI" \
+QWEN38_BONSAI_FIXTURE=parity/bonsai2-reference.safetensors \
+Scripts/run-tests.sh
+```

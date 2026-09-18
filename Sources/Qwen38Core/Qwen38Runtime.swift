@@ -375,6 +375,23 @@ public actor Qwen38Runtime {
 
     public var isLoaded: Bool { container != nil || flashEngine != nil }
 
+    /// Parity / test escape hatch (docs/bonsai2/plan.md, fiche B-3): exposes
+    /// the loaded 27B-family container's model and tokenizer directly, so a
+    /// caller can build a `TokenIterator` with its own `LogitProcessor` to
+    /// capture raw logits — there is no other way to reach them through the
+    /// generation API. Throws `.modelNotLoaded` outside the `.qwen35`
+    /// family (`container == nil`, e.g. Flash-Next resident).
+    public func performRaw<R: Sendable>(
+        _ action: @Sendable (any LanguageModel, Tokenizer) throws -> sending R
+    ) async throws -> sending R {
+        guard let container else {
+            throw Qwen38RuntimeError.modelNotLoaded
+        }
+        return try await container.perform { context in
+            try action(context.model, context.tokenizer)
+        }
+    }
+
     public func load(
         from directory: URL,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in },
