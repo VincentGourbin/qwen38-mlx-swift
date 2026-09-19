@@ -248,3 +248,10 @@ npx -y langwatch open                        # ouvre le projet dans le navigateu
 - Question : <fermée si possible>
 - Options : A) … B) …
 ```
+
+### Journal
+
+## L-0 — Serveur et agent en ligne — 2026-09-19 — validée
+- Fait : serveur Release sur Bonsai 2 (`Ternary-Bonsai-2-27B-mlx-2bit`, port 8848, `--enable-thinking`) via `nohup caffeinate`, puis `agent.py` connecté dans `bench-m3max` avec le venv du banc.
+- Porte de sortie observée : `LANGWATCH_NO_DAEMON=1 npx -y langwatch agent list` → `qwen38-bench  bench-m3max  online  connected  agent_16a72fa0423f42a4bc4e1`
+- Écart au plan : aucun. `curl /healthz` a répondu `"model_loaded":true` dès le premier sondage ; `/v1/models` confirme `Ternary-Bonsai-2-27B-mlx-2bit` avec `loaded:true`.
