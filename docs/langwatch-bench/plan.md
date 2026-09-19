@@ -57,12 +57,23 @@ coût du modèle local (LangWatch ne connaît pas de prix pour lui ; la ligne
 | Clé projet LangWatch | `bench/langwatch/.env` → `LANGWATCH_API_KEY` | présente |
 | Environnement d'agent | `.env` → `LANGWATCH_AGENT_ENVIRONMENT=bench-m3max` | l'agent apparaît comme `qwen38-bench · bench-m3max` |
 
-Ce que Vincent doit fournir avant L-3 : **une clé d'un fournisseur du marché**
-pour le juge et le simulateur, activée sur LangWatch (Settings → Model
-Providers, OpenAI ou Anthropic), et la même clé dans `.env`
-(`OPENAI_API_KEY` ou `ANTHROPIC_API_KEY`) pour les cibles `gpt-*` /
-`claude-*`. Sans elle, seul `model=local` peut tourner, et aucun juge ne peut
-noter.
+Ce que Vincent doit fournir avant L-3 : **un modèle du marché joignable par
+LangWatch** pour le juge et le simulateur, activé dans Settings → Model
+Providers. Trois voies, toutes sans carte bancaire :
+- **Ollama Cloud** (compte ollama.com existant) : fournisseur « Custom
+  (OpenAI-compatible) », base URL `https://ollama.com/v1`, clé créée sur
+  ollama.com/settings/keys, puis le modèle (par exemple `gpt-oss:120b`) ajouté
+  sous **Custom Models** et choisi dans **Default Models** comme modèle par
+  défaut du projet. `run.sh` n'a alors besoin d'aucun `JUDGE_MODEL`. Éviter un
+  juge de la famille Qwen (candidat testé).
+- **Groq** ou **Google AI Studio** : clé gratuite, fournisseur natif
+  (`JUDGE_MODEL=groq/openai/gpt-oss-120b` ou `gemini/gemini-2.5-flash`).
+- Une clé OpenAI/Anthropic payante, si elle existe un jour.
+Les cibles du marché (`gpt-*`, `claude-*`) demandent en plus la clé
+correspondante dans `.env` ; sans elle, on ne compare que `local`, ce qui
+suffit pour noter Bonsai 2 puis Flash-Next. Consommation côté juge :
+30 à 50 k jetons par conversation, soit 300 à 400 k pour une passe de la
+suite ; commencer par `REPEAT=1` et lire la page usage du fournisseur.
 
 ## 3. Fiches
 
