@@ -1096,3 +1096,35 @@ et la ligne exacte de la garde ajoutée dans chaque branche.
   réimplémenter à la main ce qu'il fait déjà. `swift build --product qwen38`
   propre, zéro avertissement dans les fichiers touchés.
 - Pas d'agent : 1 (session courante) · appels d'outils : ~60.
+
+## B-6 — Mesures et décision — 2026-09-19 — validée (portée réduite)
+
+- Fait : à la demande explicite de Vincent, la fiche T-2.1 YuE2/`pi`
+  (§3 point 3 du plan) est **reportée** — hors du périmètre « porter
+  Bonsai 2 » pour cette session. Débit (1 k/10 k/30 k), mémoire et
+  comparaison à Flash-Next mesurés en entier, Release + `caffeinate -i`,
+  profil d'énergie haute performance. Entrée complète dans
+  `docs/knowledge/log.md`, « 2026-09-19 — Bonsai 2 : débit et mémoire ne
+  passent pas à l'échelle ».
+- Porte de sortie observée : tableau dans `docs/knowledge/log.md`, terminé
+  par une ligne Go/No-go argumentée. Ligne retenue : **No-go en l'état** —
+  74 Go de mémoire pic à 30 k jetons (mesuré via `footprint`, pas `ps`),
+  contre 57,4 Go pour Flash-Next 3-bit (125 B MoE, dix fois plus gros sur
+  disque) ; 100 k non tenté, jugé non sûr sur cette machine (96 Go, swap
+  déjà à 18/18 Go à 30 k). Débit seul comparable à Flash-Next à prompt
+  court (24,2 tok/s chauffe vs 12,9 tok/s référence), mais dégradation plus
+  marquée avec le contexte (8,0 tok/s à 30 k).
+- Écart au plan : (1) mesures de réflexion par tour non chiffrées
+  (dépendaient du chantier YuE2/`pi` reporté — noté comme observation
+  qualitative seulement dans `docs/knowledge/log.md`) ; (2) 100 k non
+  mesuré, remplacé par une extrapolation documentée de la courbe 1 k→30 k
+  et une justification de sécurité machine (swap déjà saturé à 30 k) ; (3)
+  incident de méthode découvert et corrigé en cours de route : un process
+  externe (`gemma4-cli`, 74 Go résident) contaminait la première passe de
+  mesures (décodage à 5 tok/s même à 1 012 jetons) — toutes les mesures
+  retenues viennent d'une repasse propre après son arrêt (confirmé par
+  Vincent) ; (4) hypothèse `Memory.cacheLimit` absent sur le chemin
+  `.qwen35` notée mais **non vérifiée** (aucun changement de code : hors
+  périmètre mesure) — à traiter dans une fiche dédiée avant un No-go
+  définitif si la piste se confirme.
+- Pas d'agent : 1 (session courante) · appels d'outils : ~50.

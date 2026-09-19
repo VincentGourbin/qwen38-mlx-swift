@@ -6531,3 +6531,99 @@ compare que des rendus produits par la même pile). L'effet sur la qualité
 d'appel d'outils n'a pas été mesuré séparément ; le bénéfice certain est
 que nos prompts sont désormais ceux des évaluations publiées, ce qui rend
 les comparaisons (BFCL 74,9 annoncé pour Bonsai 2) interprétables.
+
+## 2026-09-19 — Bonsai 2 : débit et mémoire ne passent pas à l'échelle (B-6)
+
+### Méthode
+
+Serveur Release (`Scripts/build-release.sh`) sous `caffeinate -i`, profil
+d'énergie haute performance sur secteur. Quatre invites construites par
+concaténation de fichiers `.swift` du dépôt, tokenisées puis **tronquées
+exactement** au nombre de jetons visé avec le tokenizer du pack (aucune
+approximation caractères/jeton) : 1 012, 10 010 et 30 012 jetons de prompt,
+greedy, 128 jetons générés. Le premier appel après démarrage (compilation
+Metal à froid) est écarté par un appel de chauffe ; TTFT et débit de
+décodage mesurés côté client sur le flux `stream: true` (horodatage du
+premier `delta.content`), recoupés avec la ligne stderr du serveur. Mémoire
+lue via `footprint -p <pid>` (`phys_footprint`), pas `ps`/RSS qui sous-compte
+la mémoire Metal unifiée.
+
+**Incident de méthode** : la première passe (contaminée) montrait un
+décodage à 5 tok/s même à 1 012 jetons — un process `gemma4-cli` tournait en
+parallèle avec **74 Go** de résident, provoquant une contention GPU/mémoire
+sévère (swap monté à 18 Go/18 Go). Toutes les mesures ci-dessous viennent
+d'une repasse propre, ce process terminé.
+
+### Résultats Bonsai 2 (Ternary-Bonsai-2-27B-mlx-2bit, 2 bits)
+
+| Prompt | Jetons prompt | TTFT (préfill) | Débit préfill | Débit décodage | Mémoire (`phys_footprint`) |
+|---|---:|---:|---:|---:|---:|
+| froid (chauffe) | 14 | — | — | 24,2 tok/s | 9,1 Go |
+| 1 k | 1 012 | 12,7 s | 79,4 tok/s | 10,4 tok/s | 13 Go |
+| 10 k | 10 010 | 101,9 s | 98,3 tok/s | 13,3 tok/s | 40 Go |
+| 30 k | 30 012 | 506,7 s | 59,2 tok/s | 8,0 tok/s | **74 Go** |
+| 100 k | — | **non testé** | — | — | — |
+
+100 k jetons **non tenté** : la machine (96 Go de mémoire unifiée) a déjà
+son swap presque saturé (18/18 Go) à 30 k, et la progression mesurée
+(9 → 13 → 40 → 74 Go) n'est pas linéaire avec le nombre de jetons — le
+premier delta (+4 Go pour 1 012 jetons) et le second (+27 Go pour ~9 000
+jetons de plus) sont hors de proportion avec un cache KV pur (16 couches
+d'attention pleine × 4 têtes kv × 256 × 2 × 2 octets ≈ 64 Kio/jeton, donc
+≈ 640 Mio pour 10 k jetons — pas 27 Go). Extrapoler cette courbe à 100 k
+dépasserait très probablement la mémoire disponible ; le risque de geler ou
+de faire planter la machine (déjà en tension avec Xcode, Terminal, Teams
+ouverts) n'était pas justifié pour un chiffre qu'on peut déjà disqualifier
+sans lui.
+
+**Hypothèse, non vérifiée** (aucun changement de code fait pour la
+confirmer — hors périmètre de cette fiche) : le chemin `.qwen35` de
+`Qwen38Runtime.load` ne borne jamais `Memory.cacheLimit`, contrairement au
+chemin Flash-Next qui le fixe explicitement à 8 Go (« Netflix-void pattern »,
+`Qwen38Runtime.swift` ≈ ligne 558, H3.3). Sans plafond, l'allocateur Metal de
+MLX peut garder en cache des tampons intermédiaires (transformée Hadamard
+en float32 sur 402 modules × 64 couches, à chaque bloc de préremplissage)
+plutôt que de les libérer — cohérent avec une mémoire qui grimpe bien plus
+vite que le cache KV seul, et qui redescend proprement dès que le process
+se termine (pas de fuite entre requêtes, juste un plafond absent). À vérifier
+dans une fiche dédiée avant toute conclusion définitive sur la mémoire.
+
+### Comparaison à Flash-Next 3 bits (référence `BENCHMARKS.md`, 2026-09-11)
+
+| | Flash-Next 3-bit g64+F7 (125 B MoE, 6 B actifs) | Bonsai 2 2-bit (27 B dense) |
+|---|---:|---:|
+| Checkpoint sur disque | 84 Go | 8,6 Go |
+| Débit décodage (greedy, prompt court) | 12,9 tok/s | 24,2 tok/s (chauffe, 14 jetons) |
+| Débit décodage (contexte plus long) | — | 8,0-13,3 tok/s à 10-30 k |
+| Débit préfill | 77,6 tok/s (n-gram local) | 59,2-98,3 tok/s |
+| Mémoire pic mesurée | **57,4 Go** | **74 Go à 30 k seulement** |
+
+Un modèle dense 27 B, dix fois plus petit sur disque que le MoE 125 B déjà
+en production, consomme **plus** de mémoire pic dès 30 k de contexte. Le
+débit lui-même reste dans le même ordre de grandeur que Flash-Next à
+prompt court, mais se dégrade sensiblement plus vite avec le contexte
+(8-13 tok/s à 30 k contre 12,9 tok/s toutes conditions confondues pour la
+référence Flash-Next, elle-même mesurée à prompt court).
+
+### Réflexion (jetons par tour)
+
+Non mesurée séparément dans cette fiche (portée réduite au débit/mémoire à
+la demande de Vincent — le chantier YuE2/`pi` qui devait la chiffrer est
+reporté). Observation qualitative en passant (B-4, B-2) : le pack réfléchit
+même sous `enable_thinking: false` transmis à un tour qui n'en a pas besoin
+si `--enable-thinking` est actif au démarrage du serveur — cohérent avec le
+README du pack (« `low` n'est pas honoré, comportement proche de `xhigh` »),
+à quantifier si une fiche future rouvre ce chantier.
+
+### Go / No-go
+
+**No-go en l'état.** Le débit est comparable à Flash-Next sur prompt court
+mais se dégrade avec le contexte, et surtout la mémoire — 74 Go à seulement
+30 k jetons pour un modèle dix fois plus petit sur disque que le MoE 125 B
+déjà en production — rend un contexte long (la boucle d'agent pi vise
+262 k) irréaliste sur une machine à 96 Go sans un correctif ciblé. Le
+débit seul ne disqualifierait pas Bonsai 2 ; la mémoire, telle que mesurée
+aujourd'hui, si. Avant de refermer le dossier : vérifier l'hypothèse
+`Memory.cacheLimit` ci-dessus dans une fiche courte et dédiée — si elle
+confirme un plafond absent plutôt qu'un coût intrinsèque au modèle, la
+conclusion mérite d'être rejouée avant un No-go définitif.

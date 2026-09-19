@@ -4696,3 +4696,19 @@ jours ; P14.6, une soirée de mesures.
 la qualité annoncée est 98,2 % du FP16 avec le recul concentré sur
 connaissances/raisonnement et l'appel d'outils (BFCL 76,7 → 74,9) ; le
 `reasoning_effort: low` non honoré peut allonger chaque tour d'agent.
+
+**P14.1 à P14.6 livrés le 2026-09-19** (journal complet, fiches B-0 à B-6 :
+`docs/bonsai2/plan.md`). Parité (P14.3) verte, quasi bit-exacte (logits
+~3-5e-5 sous tolérance, greedy 32/32 sur 4/4 invites). Outils (P14.4) et
+cache de préfixe (P14.5) fonctionnels de bout en bout sur le serveur réel.
+**P14.6, portée réduite à la demande de Vincent** (la fiche T-2.x YuE2/`pi`
+est reportée, hors périmètre « porter Bonsai 2 ») : débit et mémoire mesurés
+et comparés à Flash-Next 3-bit — **No-go en l'état**
+(`docs/knowledge/log.md`, 2026-09-19) : 74 Go de mémoire pic à seulement
+30 k jetons de contexte (contre 57,4 Go pour le MoE 125 B Flash-Next, dix
+fois plus gros sur disque), 100 k jugé non sûr à mesurer sur cette machine
+(96 Go, swap déjà saturé à 30 k). Piste non vérifiée avant de clore
+définitivement : `Memory.cacheLimit` n'est jamais borné sur le chemin
+`.qwen35`, contrairement à Flash-Next (P5.1, 8 Go) — à essayer dans une
+fiche dédiée avant un no-go final. P14.7 (optionnel) sans objet tant que
+P14.6 n'est pas un Go.
