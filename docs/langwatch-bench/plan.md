@@ -60,12 +60,17 @@ coût du modèle local (LangWatch ne connaît pas de prix pour lui ; la ligne
 Ce que Vincent doit fournir avant L-3 : **un modèle du marché joignable par
 LangWatch** pour le juge et le simulateur, activé dans Settings → Model
 Providers. Trois voies, toutes sans carte bancaire :
-- **Ollama Cloud** (compte ollama.com existant) : fournisseur « Custom
-  (OpenAI-compatible) », base URL `https://ollama.com/v1`, clé créée sur
-  ollama.com/settings/keys, puis le modèle (par exemple `gpt-oss:120b`) ajouté
-  sous **Custom Models** et choisi dans **Default Models** comme modèle par
-  défaut du projet. `run.sh` n'a alors besoin d'aucun `JUDGE_MODEL`. Éviter un
-  juge de la famille Qwen (candidat testé).
+- **Ollama Cloud** — **c'est la voie en place** : fournisseur « Custom
+  (OpenAI-compatible) » enregistré le 2026-09-19 (base URL
+  `https://ollama.com/v1`, clé ollama.com/settings/keys). `run.sh` utilise par
+  défaut `custom/deepseek-v4.1-flash` comme juge et simulateur, vérifié sur un
+  scénario réel : verdict cohérent, 3 critères sur 3, raisonnement qui cite la
+  trace. `glm-5.3-flash` convient aussi. **Ne pas utiliser `gpt-oss:120b`** :
+  son raisonnement disait « tout est satisfait » et son verdict classait les
+  trois critères en non satisfaits. Éviter tout juge de la famille Qwen
+  (candidat testé). Les noms valides sont ceux de
+  `curl https://ollama.com/api/tags` (`deepseek-v4.1-flash`, `kimi-k3`,
+  `mistral-large-3:675b`, `glm-5.3`, `gemma4:31b`…).
 - **Groq** ou **Google AI Studio** : clé gratuite, fournisseur natif
   (`JUDGE_MODEL=groq/openai/gpt-oss-120b` ou `gemini/gemini-2.5-flash`).
 - Une clé OpenAI/Anthropic payante, si elle existe un jour.
@@ -138,11 +143,14 @@ liste dans l'app (Agent Testing → Scenarios → Agent de code).
    passer à `run.sh` par `JUDGE_MODEL=<fournisseur/modèle>` ; sans cette
    variable, LangWatch prend le modèle par défaut du projet.
 3. Passe de fumée : `REPEAT=1 bench/langwatch/run.sh local` (une seule cible,
-   une passe). Lire le résultat dans l'app (lien imprimé par la commande) ou
+   une passe). Un scénario isolé se relance avec
+   `langwatch run-plan run --scenario <id> --target 'connected:qwen38-bench@bench-m3max?model=local' --judge-model custom/deepseek-v4.1-flash --simulator-model custom/deepseek-v4.1-flash --wait 15`
+   (`scenario run` n'accepte pas le choix du juge). Lire le résultat dans l'app (lien imprimé par la commande) ou
    par `langwatch simulation-run list`.
 
 **Porte de sortie** : 8 runs terminés (aucun `stalled`), au moins un critère
-de trace passé (le juge cite un span dans son raisonnement), et pour chaque
+de trace passé (le juge cite un span dans son raisonnement — déjà observé le
+2026-09-19 sur le scénario « Hors dépôt »), et pour chaque
 scénario échoué, la raison recopiée en une ligne.
 
 ### L-4 — La comparaison

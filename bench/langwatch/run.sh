@@ -12,7 +12,11 @@ set -a; [ -f .env ] && . ./.env; set +a
 ENV_NAME="${LANGWATCH_AGENT_ENVIRONMENT:-development}"
 SUITE="Agent de code"
 REPEAT="${REPEAT:-3}"
-JUDGE="${JUDGE_MODEL:-}"
+# Juge et simulateur : le fournisseur « custom » (Ollama Cloud, https://ollama.com/v1)
+# enregistré sur le projet le 2026-09-19. deepseek-v4.1-flash et glm-5.3-flash rendent des
+# verdicts cohérents ; gpt-oss:120b non (raisonnement « tout est satisfait », verdict
+# « échec », tous les critères classés non satisfaits). Surcharger avec JUDGE_MODEL=….
+JUDGE="${JUDGE_MODEL:-custom/deepseek-v4.1-flash}"
 targets=("$@"); [ ${#targets[@]} -eq 0 ] && targets=(local gpt-5-mini)
 args=()
 for t in "${targets[@]}"; do args+=(--target "connected:qwen38-bench@${ENV_NAME}?model=${t}"); done

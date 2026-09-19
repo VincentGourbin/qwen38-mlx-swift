@@ -143,7 +143,10 @@ def main():
     suite_id = ensure_suite()
     existing = {s["name"]: s for s in items(call("GET", "/api/scenarios")) if s.get("testSuiteId") == suite_id}
     for scenario in SCENARIOS:
-        body = {**scenario, "testSuiteId": suite_id}
+        # Le simulateur d'utilisateur suit la langue de la situation de façon
+        # inégale (observé : question posée en anglais) ; on le fixe.
+        body = {**scenario, "situation": scenario["situation"] + " Tu écris toujours en français.",
+                "testSuiteId": suite_id}
         if scenario["name"] in existing:
             call("PATCH", f"/api/scenarios/{existing[scenario['name']]['id']}", body)
             print(f"mis à jour : {scenario['name']}")
