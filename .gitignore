@@ -28,3 +28,9 @@ parity/*.safetensors
 __pycache__/
 *.pyc
 venv-bonsai2/
+
+# Banc LangWatch (bench/langwatch) : venv, clés et espaces de travail par conversation
+bench/langwatch/.venv/
+bench/langwatch/.env
+bench/langwatch/workspaces/
+bench/langwatch/fixture/.build/
