@@ -1107,7 +1107,7 @@ et la ligne exacte de la garde ajoutée dans chaque branche.
   `docs/knowledge/log.md`, « 2026-09-19 — Bonsai 2 : débit et mémoire ne
   passent pas à l'échelle ».
 - Porte de sortie observée : tableau dans `docs/knowledge/log.md`, terminé
-  par une ligne Go/No-go argumentée. Ligne retenue : **No-go en l'état** —
+  par une ligne Go/No-go argumentée. Ligne initiale : **No-go en l'état** —
   74 Go de mémoire pic à 30 k jetons (mesuré via `footprint`, pas `ps`),
   contre 57,4 Go pour Flash-Next 3-bit (125 B MoE, dix fois plus gros sur
   disque) ; 100 k non tenté, jugé non sûr sur cette machine (96 Go, swap
@@ -1116,15 +1116,26 @@ et la ligne exacte de la garde ajoutée dans chaque branche.
   marquée avec le contexte (8,0 tok/s à 30 k).
 - Écart au plan : (1) mesures de réflexion par tour non chiffrées
   (dépendaient du chantier YuE2/`pi` reporté — noté comme observation
-  qualitative seulement dans `docs/knowledge/log.md`) ; (2) 100 k non
-  mesuré, remplacé par une extrapolation documentée de la courbe 1 k→30 k
-  et une justification de sécurité machine (swap déjà saturé à 30 k) ; (3)
-  incident de méthode découvert et corrigé en cours de route : un process
-  externe (`gemma4-cli`, 74 Go résident) contaminait la première passe de
-  mesures (décodage à 5 tok/s même à 1 012 jetons) — toutes les mesures
-  retenues viennent d'une repasse propre après son arrêt (confirmé par
-  Vincent) ; (4) hypothèse `Memory.cacheLimit` absent sur le chemin
-  `.qwen35` notée mais **non vérifiée** (aucun changement de code : hors
-  périmètre mesure) — à traiter dans une fiche dédiée avant un No-go
-  définitif si la piste se confirme.
-- Pas d'agent : 1 (session courante) · appels d'outils : ~50.
+  qualitative seulement dans `docs/knowledge/log.md`) ; (2) incident de
+  méthode découvert et corrigé en cours de route : un process externe
+  (`gemma4-cli`, 74 Go résident) contaminait la première passe de mesures
+  (décodage à 5 tok/s même à 1 012 jetons) — toutes les mesures retenues
+  viennent d'une repasse propre après son arrêt (confirmé par Vincent).
+- **Correctif et conclusion rejouée (même jour)** : Vincent a relancé la
+  question directement (« ça devrait avoir une empreinte réduite, comprendre
+  l'écart, ASK si besoin »). L'hypothèse `Memory.cacheLimit` laissée ouverte
+  ci-dessus s'est vérifiée immédiatement (`Memory.snapshot()` : 27 Go de
+  `cacheMemory` réclamable sur 40 Go de `phys_footprint` à 10 k jetons,
+  chemin `.qwen35` jamais borné contrairement à Flash-Next). Correctif
+  d'une ligne dans `Qwen38Runtime.load()` (`Memory.cacheLimit = 8 Go`,
+  même motif que Flash-Next H3.3). Repasse complète Release, 233 tests
+  rejoués (aucune régression), mesures propres 1 k/10 k/30 k **et 100 k**
+  (rendu possible par le correctif — non tenté avant, jugé trop risqué) :
+  mémoire divisée par 2,5 à 10 k, par 4,4 à 30 k ; 19 Go résident / 35 Go de
+  pic à 100 k jetons, débit inchangé. Détail complet et tableau final dans
+  `docs/knowledge/log.md`, section « Correctif (même jour) ». **Aucun ASK
+  nécessaire** — gap compris et corrigé dans la session, pas transmis à
+  l'agent expert. **Conclusion rejouée : Go** (mémoire réglée, seul motif du
+  No-go initial ; Bonsai 2 tient désormais sa promesse d'empreinte réduite
+  face à Flash-Next à toutes les tailles de contexte testées).
+- Pas d'agent : 1 (session courante) · appels d'outils : ~65.

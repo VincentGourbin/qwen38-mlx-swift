@@ -6627,3 +6627,80 @@ aujourd'hui, si. Avant de refermer le dossier : vérifier l'hypothèse
 `Memory.cacheLimit` ci-dessus dans une fiche courte et dédiée — si elle
 confirme un plafond absent plutôt qu'un coût intrinsèque au modèle, la
 conclusion mérite d'être rejouée avant un No-go définitif.
+
+### Correctif (même jour) — l'hypothèse `Memory.cacheLimit` confirmée, conclusion rejouée
+
+Vincent, en relisant ce constat : « pourtant c'est censé avoir une empreinte
+mémoire plus réduite — il faut comprendre l'écart avec la promesse ». Repris
+immédiatement plutôt que déposé en ASK, l'hypothèse ci-dessus était
+vérifiable directement.
+
+**Diagnostic.** Ajout temporaire d'un relevé `Memory.snapshot()`
+(`activeMemory` / `cacheMemory` / `peakMemory`, MLX) juste après la fin d'un
+tour, sur le chemin non corrigé. À 10 k jetons de prompt :
+`active=8,97 Go` mais `cache=28,98 Go` — l'essentiel des 40 Go de
+`phys_footprint` mesurés n'était pas de la mémoire de travail réellement
+occupée, mais un tampon d'allocateur Metal jamais borné. Le doc-comment de
+`Memory.swift` (mlx-swift) décrit exactement ce mode de défaillance : sans
+`Memory.cacheLimit`, l'allocateur garde chaque tampon intermédiaire de
+taille différente au lieu de le réutiliser ou de le libérer — cohérent avec
+des blocs de préremplissage Hadamard (402 modules × 64 couches) de tailles
+variables selon la longueur du prompt.
+
+**Correctif.** Une ligne dans `Qwen38Runtime.load()`, cas `.qwen35`, avant
+`Qwen38MTPRegistration.register()` :
+
+```swift
+Memory.cacheLimit = 8 * 1024 * 1024 * 1024
+```
+
+Le même « Netflix-void pattern » que Flash-Next applique déjà pour sa
+propre famille (H3.3) — jamais hérité sur le chemin `.qwen35`/Bonsai 2.
+
+**Repasse propre, serveur Release, même méthode (jetons exacts, greedy,
+`footprint -p <pid>`, un `caffeinate -i` par run) :**
+
+| Prompt | Jetons prompt | TTFT (préfill) | Débit préfill | Débit décodage | Mémoire (`phys_footprint`) | Pic |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 k | 1 012 | 8,2 s | 123,1 tok/s | 16,7 tok/s | 13 Go | 13 Go |
+| 10 k | 10 010 | 96,2 s | 104,0 tok/s | 11,4 tok/s | **16 Go** (avant : 40 Go) | 20 Go |
+| 30 k | 30 012 | 549,0 s | 54,7 tok/s | 8,7 tok/s | **17 Go** (avant : 74 Go) | 23 Go |
+| 100 k | 100 012 | 1 951,6 s | 51,2 tok/s | 5,3 tok/s | **19 Go** (avant : non tenté) | 35 Go |
+
+Mémoire divisée par **2,5 à 10 k** et par **4,4 à 30 k**, débit inchangé
+aux erreurs de mesure près (le léger tassement du préfill à 30 k, 59,2 →
+54,7 tok/s, est dans le bruit habituel d'une seule mesure, pas un effet
+mesuré du plafond — `active` ne bouge pas entre avant/après). Le swap
+système, saturé à 18/18 Go pendant la campagne contaminée, redescend à
+4,9/6,1 Go pendant cette repasse — et **reste stable à ce niveau jusqu'à
+100 k jetons** (4,8/6,1 Go), la taille jugée trop risquée pour être tentée
+avant le correctif. 100 k jetons de prompt : 32,5 min de préfill (51,2
+tok/s, cohérent avec 30 k), 19 Go résident / 35 Go de pic pendant la passe
+Hadamard, décodage 5,3 tok/s. Aucune dérive mémoire supplémentaire au-delà
+de 30 k : le plafond tient sur toute la plage testée.
+
+**233 tests** (`Scripts/run-tests.sh` avec `QWEN38_BONSAI_MODEL`/
+`QWEN38_BONSAI_FIXTURE`) rejoués après le correctif : **aucune régression**.
+
+**Cause du constat initial : un défaut de configuration, pas un coût
+intrinsèque au modèle.** La promesse d'une empreinte réduite pour Bonsai 2
+(27 B dense, 2 bits) était correcte ; le chemin `.qwen35` ne l'exprimait
+simplement pas faute d'avoir repris le plafond déjà posé pour Flash-Next.
+Aucun ASK nécessaire — la piste laissée ouverte dans le constat du dessus
+a suffi à trouver et vérifier le correctif en une session.
+
+### Go/No-go rejoué
+
+**Go.** La mémoire, seul motif du No-go initial, est réglée : 19 Go résident
+à 100 k jetons de prompt (35 Go de pic pendant le préremplissage), sur une
+machine à 96 Go — loin de la saturation qui rendait 100 k trop risqué à
+tenter avant le correctif. Le débit reste dans le même ordre de grandeur
+que Flash-Next sur prompt court et se dégrade avec le contexte comme prévu
+pour un modèle dense sans MoE (5,3 tok/s en décodage à 100 k), mais ce
+n'était pas, seul, un motif de No-go dans le constat initial. Comparaison à
+Flash-Next (57,4 Go de pic mesuré, `BENCHMARKS.md`) : Bonsai 2 tient
+désormais sa promesse d'empreinte réduite — un modèle dense dix fois plus
+petit sur disque consomme maintenant nettement moins de mémoire pic, à
+toutes les tailles de contexte testées (1 k à 100 k), au lieu d'en
+consommer davantage comme le montrait la mesure contaminée par le plafond
+absent.

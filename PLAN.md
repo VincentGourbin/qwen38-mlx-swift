@@ -4703,12 +4703,19 @@ connaissances/raisonnement et l'appel d'outils (BFCL 76,7 → 74,9) ; le
 cache de préfixe (P14.5) fonctionnels de bout en bout sur le serveur réel.
 **P14.6, portée réduite à la demande de Vincent** (la fiche T-2.x YuE2/`pi`
 est reportée, hors périmètre « porter Bonsai 2 ») : débit et mémoire mesurés
-et comparés à Flash-Next 3-bit — **No-go en l'état**
-(`docs/knowledge/log.md`, 2026-09-19) : 74 Go de mémoire pic à seulement
-30 k jetons de contexte (contre 57,4 Go pour le MoE 125 B Flash-Next, dix
-fois plus gros sur disque), 100 k jugé non sûr à mesurer sur cette machine
-(96 Go, swap déjà saturé à 30 k). Piste non vérifiée avant de clore
-définitivement : `Memory.cacheLimit` n'est jamais borné sur le chemin
-`.qwen35`, contrairement à Flash-Next (P5.1, 8 Go) — à essayer dans une
-fiche dédiée avant un no-go final. P14.7 (optionnel) sans objet tant que
-P14.6 n'est pas un Go.
+et comparés à Flash-Next 3-bit. Constat initial **No-go en l'état** (74 Go
+de mémoire pic à 30 k jetons) **corrigé le jour même** : `Memory.cacheLimit`
+n'était en effet jamais borné sur le chemin `.qwen35`, contrairement à
+Flash-Next (P5.1, 8 Go) — Vincent a demandé d'élucider l'écart avec la
+promesse d'empreinte réduite plutôt que de clore, la piste laissée ouverte
+s'est confirmée en quelques minutes (`Memory.snapshot()` : 27 Go de
+`cacheMemory` réclamable sur 40 Go à 10 k jetons), corrigée d'une ligne
+(même motif que Flash-Next H3.3), vérifiée sans régression (233 tests) et
+remesurée intégralement Release, 1 k/10 k/30 k **et 100 k** (rendu possible
+par le correctif, non tenté avant) : 19 Go résident / 35 Go de pic à
+100 k jetons, mémoire divisée par 4,4 à 30 k, débit inchangé. **Conclusion
+rejouée : Go** (`docs/knowledge/log.md`, 2026-09-19, section « Correctif »)
+— Bonsai 2 tient sa promesse d'empreinte réduite face à Flash-Next à toutes
+les tailles de contexte testées. P14.7 (optionnel) sans objet : le débit
+mesuré (5,3-16,7 tok/s décodage selon le contexte) n'appelait pas
+d'optimisation supplémentaire dans le périmètre retenu pour cette session.

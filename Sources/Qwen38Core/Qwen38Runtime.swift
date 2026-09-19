@@ -564,6 +564,18 @@ public actor Qwen38Runtime {
             // snapshot taken here — see the `mtpState` getter below.
             mtpAvailability = .unavailable
         case .qwen35:
+            // B-6 (docs/bonsai2/plan.md): the same Netflix-void bound as
+            // Flash-Next above — never applied here before, and it shows:
+            // `Memory.snapshot()` on a 10k-token prefill measured
+            // `activeMemory` ≈ 8.4 Go (barely above the resident weights)
+            // against `cacheMemory` ≈ 27 Go, unreclaimed MLX buffer-pool
+            // growth from prefill chunks of varying sizes (see MLX's own
+            // `Memory` doc comment: unconstrained cache keeps every
+            // differently-sized intermediate buffer instead of reusing a
+            // fixed one). `phys_footprint` (74 Go at 30k jetons,
+            // docs/knowledge/log.md 2026-09-19) was measuring mostly this
+            // reclaimable cache, not genuine working memory.
+            Memory.cacheLimit = 8 * 1024 * 1024 * 1024
             await Qwen38MTPRegistration.register()
             if info.isBonsai2 {
                 await Qwen38Bonsai2.register()
