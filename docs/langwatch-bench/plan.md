@@ -255,3 +255,8 @@ npx -y langwatch open                        # ouvre le projet dans le navigateu
 - Fait : serveur Release sur Bonsai 2 (`Ternary-Bonsai-2-27B-mlx-2bit`, port 8848, `--enable-thinking`) via `nohup caffeinate`, puis `agent.py` connecté dans `bench-m3max` avec le venv du banc.
 - Porte de sortie observée : `LANGWATCH_NO_DAEMON=1 npx -y langwatch agent list` → `qwen38-bench  bench-m3max  online  connected  agent_16a72fa0423f42a4bc4e1`
 - Écart au plan : aucun. `curl /healthz` a répondu `"model_loaded":true` dès le premier sondage ; `/v1/models` confirme `Ternary-Bonsai-2-27B-mlx-2bit` avec `loaded:true`.
+
+## L-1 — Un tour par la plateforme — 2026-09-19 — validée
+- Fait : `agent run` sur `agent_16a72fa0423f42a4bc4e1` (question « Que fait la fonction slugify ? ») ; réponse en 41 588 ms citant `Sources/Calc/Slug.swift:9-23`, minuscules/accents (`folding`, ligne 10), tirets (lignes 13-21), troncature à `maxLength` (lignes 25-30) et les deux exemples de tests.
+- Porte de sortie observée : `langwatch trace get 54cef514bbcf75a40000` → `[2ce41f2e] qwen38-bench (41.50s)` racine avec, dessous, `chat.completions (8.43s)` (span.type: llm), `search`, `chat.completions`, `read_file (0ms)` (span.type: tool, `Sources/Calc/Slug.swift`) et `chat.completions (24.20s)`.
+- Écart au plan : aucun. `trace search` affichait `{"value":"\n"}` pour la sortie, mais l'output réel du span racine est bien la réponse complète (l'agent renvoie `choice.content` qui commence par un saut de ligne). Préfixe `LANGWATCH_NO_DAEMON=1` utilisé comme prescrit.
