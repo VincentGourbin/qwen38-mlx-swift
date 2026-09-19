@@ -156,19 +156,24 @@ scénario échoué, la raison recopiée en une ligne.
 ### L-4 — La comparaison
 
 ```bash
-bench/langwatch/run.sh local gpt-5-mini        # 8 scénarios × 2 cibles × 3 passes
+bench/langwatch/run.sh local                   # 8 scénarios × 3 passes, un scénario à la fois
 ```
-Puis, si la clé Anthropic est là : `bench/langwatch/run.sh local claude-sonnet-5`.
-Chaque commande attend la fin (`--wait 45`) et sort non-zéro si un run échoue :
-c'est normal quand un modèle rate un scénario, ce n'est pas une erreur du banc.
+Avec une clé du marché dans `.env` : `bench/langwatch/run.sh local gpt-5-mini`.
+Le script lance **un scénario à la fois** (`run-plan run --scenario`, `--wait`) :
+lancer la suite d'un bloc (`test-suite run`) fait tourner les 8 scénarios en
+parallèle, le modèle local n'en sert qu'un, et les autres échouent en
+`agent_busy` après 90 s de réessais (observé le 2026-09-19 : 7 runs sur 8 en
+ERROR). Tous les runs d'une cible rejoignent le plan « Agent de code : local ».
+Un scénario raté par un modèle est un résultat, pas une erreur du banc ; un
+run en **ERROR** en est une (lire `simulation-run get <id>`).
 
 Pendant le run, noter les lignes `qwen38 serve · usage` du serveur : elles
 donnent les jetons et le débit réels du modèle local, que LangWatch ne
 chiffre pas.
 
-**Porte de sortie** : le tableau de comparaison de l'app (une colonne par
-cible : taux de réussite, latence moyenne de réponse, coût) recopié dans le
-journal, avec le nom du run.
+**Porte de sortie** : sur la page Results, le plan « Agent de code : local »
+avec ses 24 runs (8 scénarios × 3 passes), aucun en ERROR ; taux de
+réussite, latence moyenne et scénarios ratés recopiés dans le journal.
 
 ### L-5 — Flash-Next, même banc
 
@@ -214,9 +219,12 @@ L-2 peut se faire avant L-0 (elle ne touche pas au serveur).
 6. **Cache de préfixe** : les lignes `usage` montrent `dont 0 en cache` sur
    les tours outillés du chemin 27B. C'est une mesure, pas une erreur du banc ;
    à consigner, pas à corriger ici.
-7. **Concurrence** : l'agent accepte une conversation à la fois
-   (`concurrency=1`), un run de 8 scénarios × 3 passes se déroule donc en
-   série côté local. Compter environ 2 à 4 minutes par conversation locale.
+7. **Concurrence** : le modèle local ne sert qu'une conversation à la fois
+   (verrou `LOCAL_TURN` dans `agent.py`) ; `run.sh` lance donc les scénarios
+   en série. Ne jamais lancer `test-suite run` sur la suite entière avec une
+   cible locale. Compter environ 2 à 4 minutes par conversation locale.
+8. **Après toute modification de `agent.py`**, relancer le processus : la
+   plateforme lit ses paramètres et sa concurrence à la connexion.
 
 ## 6. Commandes de référence
 

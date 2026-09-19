@@ -141,6 +141,12 @@ def ensure_suite():
 
 def main():
     suite_id = ensure_suite()
+    if "--ids" in sys.argv:
+        by_name = {s["name"]: s["id"] for s in items(call("GET", "/api/scenarios")) if s.get("testSuiteId") == suite_id}
+        for scenario in SCENARIOS:
+            if scenario["name"] in by_name:
+                print(by_name[scenario["name"]])
+        return
     existing = {s["name"]: s for s in items(call("GET", "/api/scenarios")) if s.get("testSuiteId") == suite_id}
     for scenario in SCENARIOS:
         # Le simulateur d'utilisateur suit la langue de la situation de façon

@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Annotated
@@ -253,11 +254,20 @@ def chat_turn(client: OpenAI, model_id: str, messages: list[dict], extra: dict):
         return choice
 
 
+# Un seul modèle local à la fois : le serveur sert une conversation après
+# l'autre, et un appel refusé (`agent_busy`) fait échouer le run côté
+# plateforme après ~90 s de réessais (observé 2026-09-19 : 7 runs sur 8 en
+# ERROR). D'où : accepter plusieurs appels (une cible du marché peut tourner
+# en parallèle) mais sérialiser les tours du modèle local derrière ce verrou,
+# et lancer les scénarios un par un (voir run.sh).
+LOCAL_TURN = threading.Lock()
+
+
 @langwatch.connect_agent(
     name="qwen38-bench",
     sticky=True,          # une conversation reste sur cette instance : l'espace de travail y vit
-    timeout=300,          # `swift test` compris
-    concurrency=1,        # un seul modèle local, une conversation à la fois
+    timeout=300,          # `swift test` compris — plafond de la plateforme
+    concurrency=4,        # les appels en attente du verrou comptent ici
 )
 def qwen38_bench(
     messages: list[dict],
@@ -274,7 +284,11 @@ def qwen38_bench(
     with langwatch.trace(name="qwen38-bench", metadata={"model": model, "thinking": thinking,
                                                         "platform_trace_id": trace_id or ""}) as trace:
         span = trace.root_span if hasattr(trace, "root_span") else None
-        reply = run_turn(messages, thread_id, model, thinking, max_steps)
+        if model == "local":
+            with LOCAL_TURN:
+                reply = run_turn(messages, thread_id, model, thinking, max_steps)
+        else:
+            reply = run_turn(messages, thread_id, model, thinking, max_steps)
         if span is not None:
             try:
                 span.update(output=reply)
