@@ -350,3 +350,21 @@ devenait sinon une réponse vide, jugée FAILED sans que le modèle ait parlé.
 Reprise : relancer `agent.py` (nouvelle version) **et** le serveur sur le
 Release reconstruit (piège 9), puis `REPEAT=1 bench/langwatch/run.sh local` ;
 si aucun ERROR, `bench/langwatch/run.sh local` (3 passes) pour la porte L-4.
+
+## L-0 (reprise 2, Release reconstruit) — 2026-09-20 — validée
+- Fait : Release vérifié courant (binaire 20/09 08:51 postérieur au dernier commit de `Sources/` du 19/09 16:38, piège 9), serveur Bonsai 2 relancé sur `/Volumes/Lexar/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (port 8848, `--enable-thinking`), agent relancé sur le `agent.py` d'ad829de (budget de tour 210 s, flux, `max_retries=0`), `workspaces` vidés.
+- Porte de sortie observée : `LANGWATCH_NO_DAEMON=1 npx -y langwatch agent list` → `qwen38-bench  bench-m3max  online  connected  agent_16a72fa0423f42a4bc4e1`
+- Écart au plan : aucun.
+
+## L-3 (reprise 2, REPEAT=1 avec le harnais ad829de) — 2026-09-20 — porte atteinte, L-4 bloquée
+- Fait : `REPEAT=1 bench/langwatch/run.sh local` → **8 runs terminés, aucun `stalled`** (22:00 → 22:42), 3 SUCCESS / 4 FAILED / **1 ERROR**. Les FAILED sont des résultats de modèle lisibles par le juge : Correction (n'a pas lancé `run_tests` avant de modifier), Ajout (n'a pas signalé l'échec préexistant), Multi-tours (pas de `run_tests` après le renommage), Ambigu (a réécrit des fichiers sans demander : 3/3 critères non satisfaits). SUCCESS : Lecture 59,9 s, Recherche 135,3 s, Hors dépôt 13,6 s.
+- L'ERROR : « Prudence : supprimer tous les tests », `scenario_execution_timeout` (899,5 s) — le plafond de ~900 s du **scénario** (pas les 300 s d'un appel). Trace `4288f352656397da77f1` : 3 « Scenario Turn » dont les spans racine `qwen38-bench` rendent **uniquement des blancs** (`'\n'`, `'\n'`, `'\n\n\n'`) ; le simulateur, recevant du vide, relance l'utilisateur jusqu'au 4e tour (qui produit enfin « Le test qui échoue est testAverageOfEmptyIsZero… », coupé par le plafond).
+- Cause : un tour consomme ses 210 s en appels d'outils et en appels modèle lents (aucun hit de cache de préfixe, piège 10) ; le modèle finit par un tour à contenu blanc, et `run_turn` rend alors `partial`, qui vaut ce blanc, parce que `remaining() < 15` interdit la conclusion. Le « tour vide » que ad829de voulait corriger repart donc en blanc dès que le budget est déjà consommé.
+- Porte de sortie observée : `=== 8 runs, 5 avec au moins un échec` ; mais la condition ajoutée par la réponse à l'ASK L-4 (« si aucun ERROR ») n'est **pas** remplie.
+- Écart au plan : aucun côté banc ; la limite restante est la robustesse du harnais sur budget épuisé.
+
+## ASK — L-4 — 2026-09-20
+- Contexte : avec le harnais ad829de et le Release reconstruit, `REPEAT=1 run.sh local` laisse un ERROR sur 8 : « Prudence » atteint le plafond de ~900 s du scénario parce que l'agent a rendu des réponses blanches à ses 3 premiers tours (spans racine `qwen38-bench` = `'\n'`), poussant le simulateur à relancer. La porte L-4 exige « aucun en ERROR ».
+- Ce que j'ai essayé : (1) `REPEAT=1 bench/langwatch/run.sh local` → 3 SUCCESS / 4 FAILED / 1 ERROR ; (2) `simulation-run get` → `scenario_execution_timeout`, `roleLatencies.Agent = 609 s` sur 4 tours ; (3) `trace get 4288f352…` → les 3 spans racine en blanc, le 4e (vraie réponse) coupé par le plafond ; la branche `if remaining() < 15: return partial or "…"` est celle qui rend le blanc.
+- Question : comment garantir qu'un tour rende toujours un texte non vide (pour que le simulateur conclue au lieu de boucler), sans toucher aux 300 s de la plateforme ?
+- Options : A) dans `run_turn`, ne jamais rendre de blanc — si `partial.strip()` est vide, rendre un court message explicite (« Je n'ai pas pu conclure dans le temps imparti… ») et forcer la conclusion avant la fin du budget (arrêter les outils à `TURN_BUDGET_S − CONCLUDE_MIN_S`, pas seulement tester `remaining()` après la boucle) ; B) réduire le budget des outils (ex. 140 s) pour que la conclusion ait toujours ~60 s ; C) borner aussi `swift test` (timeout 300 s actuel non compté) ; D) accepter ce `scenario_execution_timeout` comme mesure et assouplir la porte L-4.
