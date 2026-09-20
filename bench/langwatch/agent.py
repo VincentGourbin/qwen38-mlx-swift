@@ -47,7 +47,18 @@ MAX_READ_LINES = 200
 MAX_TOOL_OUTPUT = 6000  # caractères renvoyés au modèle par appel d'outil
 
 MODEL_OPTIONS = ["local", "gpt-5-mini", "gpt-5", "claude-sonnet-5"]
-THINKING_OPTIONS = ["low", "medium", "xhigh"]
+THINKING_OPTIONS = ["off", "low", "medium", "xhigh"]
+
+# La plateforme plafonne un tour d'agent à 300 s. Le tour est chronométré dès
+# son entrée (attente du verrou comprise) : chaque appel modèle reçoit un
+# `max_tokens` proportionnel au temps restant, et passé TURN_BUDGET_S l'agent
+# conclut sans outil au lieu de laisser la plateforme couper (ERROR). Une
+# conclusion forcée peut être jugée FAILED : c'est un résultat, pas une erreur
+# du banc (ASK L-4, 2026-09-19 : une génération de 3 739 jetons ≈ 250 s).
+TURN_BUDGET_S = 210.0
+TOKENS_PER_S = 12.0        # débit local prudent (Bonsai 2 ≈ 15-20, Flash-Next ≈ 13)
+CONCLUDE_MIN_S = 45.0      # en dessous, plus d'appel d'outil : on conclut
+MAX_CALL_TOKENS = 3072
 
 SYSTEM_PROMPT = """Tu es un assistant de programmation qui travaille dans un petit dépôt Swift.
 Tu disposes d'outils pour lister, lire, chercher, écrire des fichiers et lancer les tests.
@@ -212,46 +223,116 @@ def local_model_id(client: OpenAI) -> str:
 
 def make_client(model: str) -> tuple[OpenAI, str, dict]:
     """(client, id du modèle sur le fil, extra_body) pour une valeur du paramètre `model`."""
+    # max_retries=0 : le client OpenAI réessaie deux fois par défaut après un
+    # délai dépassé, soit trois générations complètes pour un seul tour.
     if model == "local":
-        client = OpenAI(base_url=os.environ.get("QWEN38_BASE_URL", "http://127.0.0.1:8848/v1"), api_key="local")
+        client = OpenAI(base_url=os.environ.get("QWEN38_BASE_URL", "http://127.0.0.1:8848/v1"),
+                        api_key="local", max_retries=0)
         return client, local_model_id(client), {}
     if model.startswith("gpt-"):
-        return OpenAI(), model, {}
+        return OpenAI(max_retries=0), model, {}
     if model.startswith("claude-"):
-        client = OpenAI(base_url="https://api.anthropic.com/v1/", api_key=os.environ["ANTHROPIC_API_KEY"])
+        client = OpenAI(base_url="https://api.anthropic.com/v1/", api_key=os.environ["ANTHROPIC_API_KEY"],
+                        max_retries=0)
         return client, model, {}
     raise ValueError(f"modèle inconnu : {model}")
 
 
 def reasoning_kwargs(model: str, thinking: str) -> dict:
     if model == "local":
-        # Le gabarit Qwen n'accepte que low / medium / xhigh.
+        # Le gabarit Qwen n'accepte que low / medium / xhigh ; "off" coupe la
+        # réflexion (`enable_thinking: false`).
+        if thinking == "off":
+            return {"extra_body": {"enable_thinking": False}}
         return {"extra_body": {"reasoning_effort": thinking}}
     if model.startswith("gpt-"):
-        return {"reasoning_effort": {"low": "low", "medium": "medium", "xhigh": "high"}[thinking]}
+        return {"reasoning_effort": {"off": "low", "low": "low", "medium": "medium", "xhigh": "high"}[thinking]}
     return {}
+
+
+def clamp(value: float, low: int, high: int) -> int:
+    return max(low, min(high, int(value)))
+
+
+def no_thinking(model: str, extra: dict) -> dict:
+    """Variante de `extra` sans réflexion, pour une conclusion courte : avec la
+    réflexion active, un petit `max_tokens` est entièrement consommé par le
+    bloc <think> et le contenu revient vide."""
+    if model == "local":
+        return {"extra_body": {"enable_thinking": False}}
+    if model.startswith("gpt-"):
+        return {"reasoning_effort": "low"}
+    return extra
+
+
+class Turn:
+    """Résultat d'un appel modèle, accumulé depuis le flux."""
+
+    def __init__(self):
+        self.content = ""
+        self.tool_calls: dict[int, dict] = {}
+        self.finish_reason = None
+        self.usage = None
+        self.aborted = False
+
+    @property
+    def calls(self) -> list[dict]:
+        return [self.tool_calls[i] for i in sorted(self.tool_calls)]
 
 
 # --- la boucle d'agent ------------------------------------------------------
 
-def chat_turn(client: OpenAI, model_id: str, messages: list[dict], extra: dict):
+def chat_turn(client: OpenAI, model_id: str, messages: list[dict], extra: dict,
+              *, max_tokens: int, deadline: float, with_tools: bool = True) -> Turn:
+    """Un appel modèle en flux. À l'échéance, le flux est fermé : le serveur
+    local annule alors la génération (chemin diffusé), au lieu de la finir
+    dans le vide et de bloquer la file pour le tour suivant."""
     with langwatch.span(type="llm", name="chat.completions", model=model_id, input=messages) as span:
         started = time.monotonic()
-        response = client.chat.completions.create(
-            model=model_id, messages=messages, tools=TOOLS, tool_choice="auto",
-            temperature=0.7, max_tokens=4096, **extra,
+        tool_kwargs = {"tools": TOOLS, "tool_choice": "auto"} if with_tools else {}
+        turn = Turn()
+        stream = client.chat.completions.create(
+            model=model_id, messages=messages, temperature=0.7, max_tokens=max_tokens,
+            stream=True, timeout=90, **tool_kwargs, **extra,
         )
-        choice = response.choices[0].message
-        usage = response.usage
+        try:
+            for chunk in stream:
+                if time.monotonic() > deadline:
+                    turn.aborted = True
+                    break
+                if getattr(chunk, "usage", None):
+                    turn.usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if delta and delta.content:
+                    turn.content += delta.content
+                for tc in (delta.tool_calls or []) if delta else []:
+                    slot = turn.tool_calls.setdefault(tc.index or 0, {"id": None, "name": "", "arguments": ""})
+                    if tc.id:
+                        slot["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+                if choice.finish_reason:
+                    turn.finish_reason = choice.finish_reason
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
         metrics = {}
-        if usage:
-            metrics = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
+        if turn.usage:
+            metrics = {"prompt_tokens": turn.usage.prompt_tokens, "completion_tokens": turn.usage.completion_tokens}
         span.update(
-            output=choice.content or json.dumps([c.model_dump() for c in (choice.tool_calls or [])]),
+            output=turn.content or json.dumps(turn.calls, ensure_ascii=False),
             metrics=metrics or None,
-            params={"latency_ms": int((time.monotonic() - started) * 1000)},
+            params={"latency_ms": int((time.monotonic() - started) * 1000), "max_tokens": max_tokens,
+                    "aborted": turn.aborted},
         )
-        return choice
+        return turn
 
 
 # Un seul modèle local à la fois : le serveur sert une conversation après
@@ -281,14 +362,15 @@ def qwen38_bench(
     # Un seul trace LangWatch par tour, sous le contexte adopté par le relais :
     # sans cet enveloppement, chaque span (llm, tool) partait comme un trace
     # orphelin et le juge ne voyait aucun appel d'outil (vérifié 2026-09-19).
+    deadline = time.monotonic() + TURN_BUDGET_S   # l'attente du verrou compte
     with langwatch.trace(name="qwen38-bench", metadata={"model": model, "thinking": thinking,
                                                         "platform_trace_id": trace_id or ""}) as trace:
         span = trace.root_span if hasattr(trace, "root_span") else None
         if model == "local":
             with LOCAL_TURN:
-                reply = run_turn(messages, thread_id, model, thinking, max_steps)
+                reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline)
         else:
-            reply = run_turn(messages, thread_id, model, thinking, max_steps)
+            reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline)
         if span is not None:
             try:
                 span.update(output=reply)
@@ -297,34 +379,66 @@ def qwen38_bench(
         return reply
 
 
-def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, max_steps: int) -> str:
+def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, max_steps: int,
+             deadline: float) -> str:
     root = workspace_for(thread_id)
     client, model_id, extra = make_client(model)
     extra = {**extra, **reasoning_kwargs(model, thinking)}
 
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     history += [{"role": m["role"], "content": m.get("content", "")} for m in messages if m.get("role") in ("user", "assistant")]
+    partial = ""   # dernier texte visible, rendu si le budget s'épuise
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
 
     for _ in range(max_steps):
-        choice = chat_turn(client, model_id, history, extra)
-        if not choice.tool_calls:
-            return choice.content or ""
+        if remaining() < CONCLUDE_MIN_S:
+            break
+        try:
+            turn = chat_turn(
+                client, model_id, history, extra,
+                max_tokens=clamp(remaining() * TOKENS_PER_S - 200, 256, MAX_CALL_TOKENS),
+                deadline=deadline - 12)
+        except Exception as error:   # délai réseau, serveur : on rend ce qu'on a
+            return partial or f"(réponse interrompue : {type(error).__name__})"
+        if turn.content:
+            partial = turn.content
+        if turn.aborted:
+            return partial or "(réponse partielle : budget de temps du tour épuisé)"
+        if not turn.calls:
+            if turn.content.strip():
+                return turn.content
+            # Réponse vide (le modèle a émis sa fin de tour sans texte, observé
+            # sur Bonsai 2 après des appels d'outils sur une demande vague) :
+            # une relance, la même pour toutes les cibles, sans réflexion.
+            break
         history.append({
-            "role": "assistant", "content": choice.content or "",
-            "tool_calls": [c.model_dump() for c in choice.tool_calls],
+            "role": "assistant", "content": turn.content or "",
+            "tool_calls": [{"id": c["id"] or f"call_{i}", "type": "function",
+                            "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                           for i, c in enumerate(turn.calls)],
         })
-        for call in choice.tool_calls:
+        for i, call in enumerate(turn.calls):
             try:
-                arguments = json.loads(call.function.arguments or "{}")
+                arguments = json.loads(call["arguments"] or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            result = run_tool(root, call.function.name, arguments)
-            history.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            result = run_tool(root, call["name"], arguments)
+            history.append({"role": "tool", "tool_call_id": call["id"] or f"call_{i}", "content": result})
 
-    # Budget d'outils épuisé : on demande une conclusion sans outil.
-    history.append({"role": "user", "content": "Conclus maintenant en une réponse, sans nouvel appel d'outil."})
-    choice = chat_turn(client, model_id, history, extra)
-    return choice.content or "(pas de réponse après épuisement du budget d'outils)"
+    # Budget d'outils ou de temps épuisé : une conclusion courte, sans outil.
+    if remaining() < 15:
+        return partial or "(réponse partielle : budget de temps du tour épuisé)"
+    history.append({"role": "user", "content": "Réponds maintenant à l'utilisateur en une réponse brève et concrète, sans nouvel appel d'outil."})
+    try:
+        turn = chat_turn(
+            client, model_id, history, no_thinking(model, extra), with_tools=False,
+            max_tokens=clamp(remaining() * TOKENS_PER_S - 100, 128, 400),
+            deadline=deadline - 3)
+        return turn.content or partial or "(pas de réponse après épuisement du budget)"
+    except Exception as error:
+        return partial or f"(réponse interrompue : {type(error).__name__})"
 
 
 if __name__ == "__main__":

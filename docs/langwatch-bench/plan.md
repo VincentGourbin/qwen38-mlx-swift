@@ -225,6 +225,17 @@ L-2 peut se faire avant L-0 (elle ne touche pas au serveur).
    cible locale. Compter environ 2 à 4 minutes par conversation locale.
 8. **Après toute modification de `agent.py`**, relancer le processus : la
    plateforme lit ses paramètres et sa concurrence à la connexion.
+9. **Le serveur doit être le Release courant** : `ls -la
+   .xcodebuild/Build/Products/Release/qwen38` doit être postérieur au dernier
+   commit de `Sources/` (le 19/09 au soir, le serveur tournait sur un binaire
+   d'avant le correctif B-6 de `Memory.cacheLimit`). Sinon
+   `Scripts/build-release.sh` puis relancer le serveur.
+10. **Cache de préfixe : aucun hit sur les requêtes outillées du chemin 27B**
+   (mesuré le 20/09 : `cached_tokens = 0` même en rejouant une requête à
+   l'identique, avec ou sans flux). Chaque appel modèle repréremplit tout
+   l'historique (700 à 4 000 jetons à ~100 jetons/s), d'où 20 à 60 s par
+   appel et des tours proches du budget. C'est une mesure du serveur, à
+   consigner en L-6 ; pas à corriger dans le banc.
 
 ## 6. Commandes de référence
 
@@ -300,3 +311,42 @@ npx -y langwatch open                        # ouvre le projet dans le navigateu
 - Ce que j'ai essayé : (1) `run.sh local` corrigé (b5a1302) → 8 runs séquentiels, 4 SUCCESS / 4 ERROR `agent_call_timeout` ; (2) `--param max_steps=8` sur les 4 scénarios fautifs → 2 SUCCESS, 1 FAILED jugé, 1 ERROR ; (3) lecture des `usage` du serveur → sortie 3739 jetons sur un appel, ~250 s, d'où le dépassement. La plateforme plafonne l'appel d'agent à 300 s (plafond aussi du SDK) : impossible de l'augmenter.
 - Question : comment borner le tour local pour que L-4 n'ait aucun ERROR ?
 - Options : A) chronométrer le tour dans `agent.py` (~240 s) et forcer une conclusion sans outil avant le plafond (règle identique pour toutes les cibles, garantit l'absence d'ERROR ; un scénario peut alors être jugé FAILED, ce que L-4 accepte) ; B) borner `max_tokens` sur le chemin local (ex. 2048) pour raccourcir les générations (risque de troncature des `write_file`) ; C) `max_steps` plus bas (6) — déjà essayé à 8, insuffisant pour Ambigu ; D) accepter les ERROR comme mesure et retirer « aucun en ERROR » de la porte L-4.
+
+### Réponse — L-4 — 2026-09-20 (Vincent, via l'auteur du plan)
+
+Option **A, complétée par B** — les deux vont ensemble, et c'est fait dans
+`agent.py` (relancer le processus pour le charger) :
+- le tour est **chronométré dès son entrée** (`TURN_BUDGET_S = 240`, attente du
+  verrou comprise) ; chaque appel modèle reçoit un `max_tokens` proportionnel
+  au temps restant (`12 jetons/s`, plafond 3 072) et un `timeout` HTTP égal à
+  ce temps ; sous 45 s restantes, plus d'appel d'outil : une conclusion brève
+  sans outil (≤ 512 jetons) ; sous 15 s, le dernier texte visible est rendu tel
+  quel. Une exception réseau rend aussi le dernier texte. Plus aucun tour ne
+  peut atteindre le plafond de la plateforme.
+- règle identique pour toutes les cibles, donc comparable ; un scénario que
+  la conclusion forcée fait rater est **jugé FAILED** — un résultat, comme la
+  porte L-4 le dit. `max_steps` revient à sa valeur par défaut (12) : c'est le
+  temps qui borne, pas le nombre d'outils.
+- nouveauté pour comprendre les 3 739 jetons d'un coup : `thinking` accepte
+  `off` (`enable_thinking: false` sur le chemin local). Le README de Bonsai 2
+  prévient que `low` n'est pas honoré ; L-4 se lance d'abord tel quel, puis, si
+  « Ambigu » ou « Prudence » restent FAILED par conclusion forcée, une passe
+  `--param thinking=off` sur ces deux scénarios seulement, notée au journal
+  comme variante, pas comme résultat principal.
+- Option D refusée : un ERROR n'est pas une mesure de Bonsai.
+
+Complément (20/09 matin, après mesure) : les tours longs n'étaient **pas**
+des réflexions géantes mais des appels modèle de 20 à 110 s chacun pour
+quelques dizaines de jetons — repréremplissage complet à chaque appel, aucun
+hit de cache de préfixe sur les requêtes outillées du chemin 27B (piège 10).
+Le harnais est donc passé en **flux** (`stream=True`) : à l'échéance il ferme
+le flux et le serveur annule la génération au lieu de la finir dans le vide ;
+`max_retries=0` (le client OpenAI relançait deux fois un appel expiré) ;
+budget ramené à 210 s ; et une **relance sans réflexion** quand le modèle
+rend un tour vide après ses appels d'outils (observé sur « optimise le
+code », en `low` comme en `off` : fin de tour à 1 jeton). Un tour vide
+devenait sinon une réponse vide, jugée FAILED sans que le modèle ait parlé.
+
+Reprise : relancer `agent.py` (nouvelle version) **et** le serveur sur le
+Release reconstruit (piège 9), puis `REPEAT=1 bench/langwatch/run.sh local` ;
+si aucun ERROR, `bench/langwatch/run.sh local` (3 passes) pour la porte L-4.
