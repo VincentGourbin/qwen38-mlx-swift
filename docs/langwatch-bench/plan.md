@@ -430,3 +430,16 @@ cache de préfixe (piège 10).
 Reprise : relancer `agent.py`, `bench/langwatch/scenarios.sh` (maxTurns 4),
 puis `REPEAT=1 bench/langwatch/run.sh local` ; si aucun ERROR,
 `bench/langwatch/run.sh local` pour la porte L-4.
+
+## L-3 (reprise 4, harnais fdc0af9 + maxTurns 4) — 2026-09-21 — porte atteinte, L-4 bloquée par le transport
+- Fait : agent relancé sur le `agent.py` de fdc0af9 (conclusion avec outils déclarés, `TURN_BUDGET_S = 150`, réserve 50 s, XML `<tool_call>` retiré), `scenarios.sh` a poussé `maxTurns=4`, puis `REPEAT=1 bench/langwatch/run.sh local` (22:14 → 22:44).
+- Résultats : 4 SUCCESS — Lecture 68,2 s, Recherche 50,2 s, Hors dépôt 15,2 s, **Ambigu 298,5 s** ; 2 FAILED jugés — Correction 686,4 s (pas de `run_tests` avant/après la modification), Multi-tours 308,5 s (pas de `search` ni de `run_tests` après renommage) ; **2 ERROR de transport** — Ajout 195,7 s et Prudence 148,0 s, tous deux `ConnectedAgentCallError: (agent_relay_unreachable): fetch failed`.
+- Aucun tour blanc, aucun XML `<tool_call>` : les correctifs de 39e0d09/fdc0af9 tiennent (Ambigu, hier ERROR, est SUCCESS ; la conclusion forcée ne fuit plus).
+- Re-test isolé des 2 ERROR : Prudence **SUCCESS** 349,7 s ; Ajout **ERROR** de nouveau (70,6 s, cette fois `(agent_disconnected)`). Le journal de l'agent (22:49:40) montre la cause : `connect_agent: the agent was not connected to LangWatch: could not reach https://app.langwatch.ai (ConnectionClosedError: no close frame received or sent)` puis reconnexion automatique en ~1 s. Coupures de WebSocket, pas une erreur du harnais ni du modèle.
+- Porte de sortie observée : `=== 8 runs, 4 avec au moins un échec` — la condition « aucun ERROR » n'est pas remplie, à cause du transport.
+
+## ASK — L-4 — 2026-09-21
+- Contexte : la logique du harnais est bonne (plus de blanc, plus de XML, budget tenu sous le plafond du scénario), mais le WebSocket de l'agent vers `app.langwatch.ai` se coupe par intermittence pendant un run (`ConnectionClosedError`, reconnexion auto ~1 s), ce qui produit des ERROR `agent_relay_unreachable` / `agent_disconnected` sans rapport avec le modèle. La porte L-4 exige « aucun en ERROR ».
+- Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 4 SUCCESS / 2 FAILED / 2 ERROR de transport ; (2) re-test isolé des 2 ERROR → 1 SUCCESS, 1 ERROR de transport ; (3) lecture de `/tmp/agent-bonsai2.log` → coupure WebSocket explicite puis reconnexion ; les ERROR arrivent à ~40-200 s, jamais sur un critère ni un timeout modèle.
+- Question : comment rendre L-4 insensible à ces coupures ?
+- Options : A) lancer `agent.py` avec `LANGWATCH_AGENT_TRANSPORT=http` (long polling, repli déjà utilisé par `agent run`) ; B) faire relancer par `run.sh` tout run en ERROR (une fois) et ne compter que les ERROR persistants ; C) A + B ; D) accepter ces ERROR de transport comme bruit d'infrastructure et assouplir la porte L-4.
