@@ -55,10 +55,11 @@ THINKING_OPTIONS = ["off", "low", "medium", "xhigh"]
 # conclut sans outil au lieu de laisser la plateforme couper (ERROR). Une
 # conclusion forcée peut être jugée FAILED : c'est un résultat, pas une erreur
 # du banc (ASK L-4, 2026-09-19 : une génération de 3 739 jetons ≈ 250 s).
-TURN_BUDGET_S = 210.0
+TURN_BUDGET_S = 180.0      # un scénario multi-tours (≤ 6 tours) doit tenir sous le plafond de ~900 s
 TOKENS_PER_S = 12.0        # débit local prudent (Bonsai 2 ≈ 15-20, Flash-Next ≈ 13)
-CONCLUDE_MIN_S = 45.0      # en dessous, plus d'appel d'outil : on conclut
+CONCLUDE_RESERVE_S = 60.0  # réservé à la conclusion : les outils s'arrêtent avant
 MAX_CALL_TOKENS = 3072
+BLANK_REPLY = "Je n'ai pas pu formuler de réponse dans le temps imparti ; reformule ou précise la demande."
 
 SYSTEM_PROMPT = """Tu es un assistant de programmation qui travaille dans un petit dépôt Swift.
 Tu disposes d'outils pour lister, lire, chercher, écrire des fichiers et lancer les tests.
@@ -177,10 +178,10 @@ def tool_write_file(root: Path, path: str, content: str) -> str:
 def tool_run_tests(root: Path) -> str:
     try:
         completed = subprocess.run(
-            ["swift", "test"], cwd=root, capture_output=True, text=True, timeout=300,
+            ["swift", "test"], cwd=root, capture_output=True, text=True, timeout=120,
         )
     except subprocess.TimeoutExpired:
-        return "swift test : délai de 300 s dépassé"
+        return "swift test : délai de 120 s dépassé"
     output = (completed.stdout + completed.stderr).splitlines()
     tail = "\n".join(output[-60:])
     verdict = "TESTS OK" if completed.returncode == 0 else f"TESTS FAILED (code {completed.returncode})"
@@ -392,20 +393,30 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
     def remaining() -> float:
         return deadline - time.monotonic()
 
+    def spoken(text: str) -> str:
+        """Jamais de tour blanc : un blanc relance le simulateur en boucle
+        jusqu'au plafond du scénario (observé sur « Prudence », 2026-09-20)."""
+        return text if text.strip() else BLANK_REPLY
+
+    # Les outils ne dépassent jamais `deadline - CONCLUDE_RESERVE_S` : la
+    # conclusion a toujours sa place, quel que soit le temps pris par les
+    # appels (préremplissage compris, qui n'est pas compté par TOKENS_PER_S).
+    tools_deadline = deadline - CONCLUDE_RESERVE_S
     for _ in range(max_steps):
-        if remaining() < CONCLUDE_MIN_S:
+        if time.monotonic() > tools_deadline - 20:
             break
         try:
             turn = chat_turn(
                 client, model_id, history, extra,
-                max_tokens=clamp(remaining() * TOKENS_PER_S - 200, 256, MAX_CALL_TOKENS),
-                deadline=deadline - 12)
-        except Exception as error:   # délai réseau, serveur : on rend ce qu'on a
-            return partial or f"(réponse interrompue : {type(error).__name__})"
-        if turn.content:
+                max_tokens=clamp((tools_deadline - time.monotonic()) * TOKENS_PER_S - 100, 256, MAX_CALL_TOKENS),
+                deadline=tools_deadline)
+        except Exception as error:   # délai réseau, serveur : on conclut avec ce qu'on a
+            partial = partial or f"(appel interrompu : {type(error).__name__})"
+            break
+        if turn.content.strip():
             partial = turn.content
         if turn.aborted:
-            return partial or "(réponse partielle : budget de temps du tour épuisé)"
+            break
         if not turn.calls:
             if turn.content.strip():
                 return turn.content
@@ -427,18 +438,19 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
             result = run_tool(root, call["name"], arguments)
             history.append({"role": "tool", "tool_call_id": call["id"] or f"call_{i}", "content": result})
 
-    # Budget d'outils ou de temps épuisé : une conclusion courte, sans outil.
+    # Budget d'outils épuisé, tour vide ou appel coupé : une conclusion courte,
+    # sans outil ni réflexion, dans la réserve.
     if remaining() < 15:
-        return partial or "(réponse partielle : budget de temps du tour épuisé)"
+        return spoken(partial)
     history.append({"role": "user", "content": "Réponds maintenant à l'utilisateur en une réponse brève et concrète, sans nouvel appel d'outil."})
     try:
         turn = chat_turn(
             client, model_id, history, no_thinking(model, extra), with_tools=False,
             max_tokens=clamp(remaining() * TOKENS_PER_S - 100, 128, 400),
             deadline=deadline - 3)
-        return turn.content or partial or "(pas de réponse après épuisement du budget)"
-    except Exception as error:
-        return partial or f"(réponse interrompue : {type(error).__name__})"
+        return spoken(turn.content) if turn.content.strip() else spoken(partial)
+    except Exception:
+        return spoken(partial)
 
 
 if __name__ == "__main__":

@@ -368,3 +368,26 @@ si aucun ERROR, `bench/langwatch/run.sh local` (3 passes) pour la porte L-4.
 - Ce que j'ai essayé : (1) `REPEAT=1 bench/langwatch/run.sh local` → 3 SUCCESS / 4 FAILED / 1 ERROR ; (2) `simulation-run get` → `scenario_execution_timeout`, `roleLatencies.Agent = 609 s` sur 4 tours ; (3) `trace get 4288f352…` → les 3 spans racine en blanc, le 4e (vraie réponse) coupé par le plafond ; la branche `if remaining() < 15: return partial or "…"` est celle qui rend le blanc.
 - Question : comment garantir qu'un tour rende toujours un texte non vide (pour que le simulateur conclue au lieu de boucler), sans toucher aux 300 s de la plateforme ?
 - Options : A) dans `run_turn`, ne jamais rendre de blanc — si `partial.strip()` est vide, rendre un court message explicite (« Je n'ai pas pu conclure dans le temps imparti… ») et forcer la conclusion avant la fin du budget (arrêter les outils à `TURN_BUDGET_S − CONCLUDE_MIN_S`, pas seulement tester `remaining()` après la boucle) ; B) réduire le budget des outils (ex. 140 s) pour que la conclusion ait toujours ~60 s ; C) borner aussi `swift test` (timeout 300 s actuel non compté) ; D) accepter ce `scenario_execution_timeout` comme mesure et assouplir la porte L-4.
+
+### Réponse — L-4 (réponses blanches) — 2026-09-21 (Vincent, via l'auteur du plan)
+
+Option **A, avec le principe de B** — fait dans `agent.py` et `scenarios.py`
+(relancer `agent.py`, puis `scenarios.sh` pour pousser `maxTurns`) :
+- **jamais de tour blanc** : tout texte vide ou fait d'espaces devient une
+  phrase fixe (« Je n'ai pas pu formuler de réponse dans le temps imparti ;
+  reformule ou précise la demande. »), identique pour toutes les cibles. Le
+  simulateur a alors quelque chose à quoi répondre et le juge note un vrai
+  échec au lieu d'un scénario qui tourne à vide ;
+- **la conclusion a sa place réservée** : les outils s'arrêtent à
+  `budget − 60 s` quoi qu'il arrive (appel coupé compris) ; sous cette
+  réserve, une conclusion courte sans outil ni réflexion. La branche qui
+  rendait `partial` brut sous 15 s ne rend plus que du texte non vide ;
+- **budget ramené à 180 s** et `maxTurns = 6` sur chaque scénario : six tours
+  de 180 s restent sous le plafond d'exécution du scénario (~900 s) ;
+- `swift test` borné à 120 s au lieu de 300.
+La porte L-4 reste « aucun ERROR » ; un scénario que la phrase fixe fait
+rater est un FAILED, donc un résultat.
+
+Reprise : relancer `agent.py`, `bench/langwatch/scenarios.sh`, puis
+`REPEAT=1 bench/langwatch/run.sh local` ; si aucun ERROR,
+`bench/langwatch/run.sh local` pour la porte L-4.
