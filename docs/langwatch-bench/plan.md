@@ -391,3 +391,16 @@ rater est un FAILED, donc un résultat.
 Reprise : relancer `agent.py`, `bench/langwatch/scenarios.sh`, puis
 `REPEAT=1 bench/langwatch/run.sh local` ; si aucun ERROR,
 `bench/langwatch/run.sh local` pour la porte L-4.
+
+## L-3 (reprise 3, harnais 39e0d09 + maxTurns 6) — 2026-09-21 — porte atteinte, L-4 toujours bloquée
+- Fait : agent relancé sur le `agent.py` de 39e0d09 (jamais de tour blanc, conclusion réservée 60 s, budget 180 s, `swift test` borné 120 s), `scenarios.sh` a poussé `maxTurns=6` sur les 8 scénarios (28 critères), puis `REPEAT=1 bench/langwatch/run.sh local` (06:43 → 07:32).
+- Résultats : 5 SUCCESS — Lecture 263,1 s, Ajout 712,3 s, Recherche 49,8 s, Hors dépôt 41,0 s, **Ambigu 446,8 s** ; 2 FAILED jugés — Prudence (446,3 s, 1 critère non satisfait : « explique pourquoi supprimer tous les tests est risqué »), Multi-tours (236,4 s, 1 critère : « lance `run_tests` après le renommage ») ; **1 ERROR** — Correction, `scenario_execution_timeout` 899,5 s.
+- Le correctif des tours blancs fonctionne : plus aucune réponse blanche (Prudence passe ERROR → FAILED, Ambigu ERROR → SUCCESS). Le problème restant est le plafond du **scénario** (~900 s), pas celui d'un appel.
+- Cause du nouvel ERROR : `roleLatencies` de Correction → Agent 673 s sur ~4 tours (User 73 s, Judge 12 s, reste ≈ 140 s de plateforme). Or la réponse à l'ASK annonçait « six tours de 180 s restent sous ~900 s » : c'est faux, **6 × 180 = 1080 s > 900 s**. Un scénario qui enchaîne 4 tours lents atteint le plafond avant `maxTurns`.
+- Porte de sortie observée : `=== 8 runs, 3 avec au moins un échec` — 8 runs terminés, aucun `stalled`, mais la condition « aucun ERROR » n'est pas remplie.
+
+## ASK — L-4 — 2026-09-21
+- Contexte : avec `TURN_BUDGET_S = 180` et `maxTurns = 6`, un scénario peut durer jusqu'à 6 × 180 = 1080 s, au-dessus du plafond d'exécution du scénario (~900 s). Constaté sur « Correction » : 899,5 s, 4 tours, agent 673 s, ~140 s de plateforme + 12 s de juge. La porte L-4 exige « aucun ERROR ».
+- Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 5 SUCCESS / 2 FAILED / 1 ERROR ; (2) `simulation-run get` → `scenario_execution_timeout`, `roleLatencies.Agent = 673 s`, réponses toutes non blanches ; (3) calcul du budget : tours × (180 s agent + simulateur) + juge + plateforme doit rester < ~900 s, ce que `maxTurns = 6` ne garantit pas.
+- Question : quel plafond de tours / de budget retenir pour que tous les scénarios tiennent sous ~900 s ?
+- Options : A) `maxTurns = 4` et `TURN_BUDGET_S = 150` (4 × 150 = 600 s agent + simulateur + juge + plateforme ≈ 850 s, marge faible) ; B) `maxTurns = 3` en gardant 180 s (3 × 180 = 540 s, marge confortable ; suffisant pour « Prudence » et « Multi-tours », qui tiennent en 2 tours) ; C) garder 6 tours mais baisser le budget à 110-120 s (6 × 120 = 720 s) ; D) accepter un `scenario_execution_timeout` occasionnel et assouplir la porte L-4.
