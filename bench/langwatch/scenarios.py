@@ -153,9 +153,10 @@ def main():
         # inégale (observé : question posée en anglais) ; on le fixe.
         body = {**scenario, "situation": scenario["situation"] + " Tu écris toujours en français.",
                 "testSuiteId": suite_id,
-                # 6 tours × 180 s de budget agent restent sous le plafond
-                # d'exécution du scénario (~900 s), vu sur « Prudence ».
-                "maxTurns": 6}
+                # 4 tours × 150 s de budget agent + simulateur + juge restent
+                # sous le plafond d'exécution du scénario (~900 s) ; 6 × 180
+                # le dépassait (« Correction », 2026-09-21).
+                "maxTurns": 4}
         if scenario["name"] in existing:
             call("PATCH", f"/api/scenarios/{existing[scenario['name']]['id']}", body)
             print(f"mis à jour : {scenario['name']}")

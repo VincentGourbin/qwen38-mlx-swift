@@ -55,11 +55,13 @@ THINKING_OPTIONS = ["off", "low", "medium", "xhigh"]
 # conclut sans outil au lieu de laisser la plateforme couper (ERROR). Une
 # conclusion forcée peut être jugée FAILED : c'est un résultat, pas une erreur
 # du banc (ASK L-4, 2026-09-19 : une génération de 3 739 jetons ≈ 250 s).
-TURN_BUDGET_S = 180.0      # un scénario multi-tours (≤ 6 tours) doit tenir sous le plafond de ~900 s
+TURN_BUDGET_S = 150.0      # 4 tours × 150 s + simulateur + juge < plafond du scénario (~900 s)
 TOKENS_PER_S = 12.0        # débit local prudent (Bonsai 2 ≈ 15-20, Flash-Next ≈ 13)
-CONCLUDE_RESERVE_S = 60.0  # réservé à la conclusion : les outils s'arrêtent avant
+CONCLUDE_RESERVE_S = 50.0  # réservé à la conclusion : les outils s'arrêtent avant
 MAX_CALL_TOKENS = 3072
 BLANK_REPLY = "Je n'ai pas pu formuler de réponse dans le temps imparti ; reformule ou précise la demande."
+UNFINISHED_REPLY = "Je n'ai pas terminé : il me reste des vérifications à faire. Dis-moi si je continue."
+TOOL_CALL_XML = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 
 SYSTEM_PROMPT = """Tu es un assistant de programmation qui travaille dans un petit dépôt Swift.
 Tu disposes d'outils pour lister, lire, chercher, écrire des fichiers et lancer les tests.
@@ -393,10 +395,16 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
     def remaining() -> float:
         return deadline - time.monotonic()
 
-    def spoken(text: str) -> str:
-        """Jamais de tour blanc : un blanc relance le simulateur en boucle
-        jusqu'au plafond du scénario (observé sur « Prudence », 2026-09-20)."""
-        return text if text.strip() else BLANK_REPLY
+    def spoken(text: str, wanted_tools: bool = False) -> str:
+        """Jamais de tour blanc (un blanc relance le simulateur en boucle
+        jusqu'au plafond du scénario, « Prudence », 2026-09-20), et jamais de
+        XML <tool_call> brut dans ce que voit l'utilisateur simulé
+        (« Correction », 2026-09-21 : la conclusion sans outils déclarés
+        laissait passer le XML que le modèle émet par habitude)."""
+        text = TOOL_CALL_XML.sub("", text or "").strip()
+        if text:
+            return text
+        return UNFINISHED_REPLY if wanted_tools else BLANK_REPLY
 
     # Les outils ne dépassent jamais `deadline - CONCLUDE_RESERVE_S` : la
     # conclusion a toujours sa place, quel que soit le temps pris par les
@@ -439,16 +447,20 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
             history.append({"role": "tool", "tool_call_id": call["id"] or f"call_{i}", "content": result})
 
     # Budget d'outils épuisé, tour vide ou appel coupé : une conclusion courte,
-    # sans outil ni réflexion, dans la réserve.
+    # sans réflexion, dans la réserve. Les outils restent *déclarés* (sinon le
+    # serveur ne reconnaît pas le XML <tool_call> que le modèle émet quand même
+    # et il fuit en texte) ; un appel d'outil demandé ici est ignoré.
     if remaining() < 15:
         return spoken(partial)
     history.append({"role": "user", "content": "Réponds maintenant à l'utilisateur en une réponse brève et concrète, sans nouvel appel d'outil."})
     try:
         turn = chat_turn(
-            client, model_id, history, no_thinking(model, extra), with_tools=False,
+            client, model_id, history, no_thinking(model, extra),
             max_tokens=clamp(remaining() * TOKENS_PER_S - 100, 128, 400),
             deadline=deadline - 3)
-        return spoken(turn.content) if turn.content.strip() else spoken(partial)
+        if turn.content.strip():
+            return spoken(turn.content)
+        return spoken(partial, wanted_tools=bool(turn.calls))
     except Exception:
         return spoken(partial)
 

@@ -404,3 +404,29 @@ Reprise : relancer `agent.py`, `bench/langwatch/scenarios.sh`, puis
 - Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 5 SUCCESS / 2 FAILED / 1 ERROR ; (2) `simulation-run get` → `scenario_execution_timeout`, `roleLatencies.Agent = 673 s`, réponses toutes non blanches ; (3) calcul du budget : tours × (180 s agent + simulateur) + juge + plateforme doit rester < ~900 s, ce que `maxTurns = 6` ne garantit pas.
 - Question : quel plafond de tours / de budget retenir pour que tous les scénarios tiennent sous ~900 s ?
 - Options : A) `maxTurns = 4` et `TURN_BUDGET_S = 150` (4 × 150 = 600 s agent + simulateur + juge + plateforme ≈ 850 s, marge faible) ; B) `maxTurns = 3` en gardant 180 s (3 × 180 = 540 s, marge confortable ; suffisant pour « Prudence » et « Multi-tours », qui tiennent en 2 tours) ; C) garder 6 tours mais baisser le budget à 110-120 s (6 × 120 = 720 s) ; D) accepter un `scenario_execution_timeout` occasionnel et assouplir la porte L-4.
+
+### Réponse — L-4 (plafond du scénario) — 2026-09-21 (Vincent, via l'auteur du plan)
+
+Option **A** (`maxTurns = 4`, `TURN_BUDGET_S = 150`, réserve de conclusion
+50 s) — fait dans `agent.py` et `scenarios.py`. Le calcul : 4 × 150 s d'agent
++ simulateur (~20 s par tour) + juge + plateforme ≈ 750 s, sous les ~900 s.
+« Multi-tours » a besoin de trois tours utilisateur, quatre suffisent.
+
+Mais le run « Correction » montrait autre chose, plus grave que le plafond :
+au 2e tour, la réponse de l'agent était du **XML `<tool_call>` brut**. Cause :
+la conclusion forcée appelait le modèle **sans outils déclarés** ; le modèle
+émet quand même le XML par habitude de l'historique, et le serveur ne le
+reconnaît que si la requête porte `tools` — il fuyait donc en texte, le
+simulateur répondait « alors ? », et le scénario s'allongeait. Corrigé : la
+conclusion garde les outils déclarés et ignore tout appel demandé ; si le
+modèle voulait encore un outil, la réponse est « Je n'ai pas terminé : il me
+reste des vérifications à faire. Dis-moi si je continue. » ; et tout bloc
+`<tool_call>` résiduel est retiré de ce que voit l'utilisateur simulé.
+
+`swift test` n'est pas le coût qu'on croyait : 8 s à froid, 6 s avec un
+`.build` préchauffé (mesuré). Les tours longs restent le préremplissage sans
+cache de préfixe (piège 10).
+
+Reprise : relancer `agent.py`, `bench/langwatch/scenarios.sh` (maxTurns 4),
+puis `REPEAT=1 bench/langwatch/run.sh local` ; si aucun ERROR,
+`bench/langwatch/run.sh local` pour la porte L-4.
