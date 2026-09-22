@@ -96,7 +96,10 @@ suite ; commencer par `REPEAT=1` et lire la page usage du fournisseur.
    ```bash
    cd bench/langwatch && set -a && . ./.env && set +a && .venv/bin/python agent.py
    ```
-   La ligne `qwen38-bench : connecté (bench-m3max)` s'affiche.
+   La ligne `qwen38-bench : connecté (bench-m3max)` s'affiche. `.env` porte
+   `LANGWATCH_AGENT_TRANSPORT=http` (long polling) depuis le 2026-09-22 : en
+   WebSocket, la connexion coupait en cours de run (`agent_relay_unreachable`,
+   `agent_disconnected`), reconnexion en une seconde mais run perdu.
 3. Vérifier : `npx -y langwatch agent list` montre `qwen38-bench` en ligne
    dans l'environnement `bench-m3max`.
 
@@ -443,3 +446,21 @@ puis `REPEAT=1 bench/langwatch/run.sh local` ; si aucun ERROR,
 - Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 4 SUCCESS / 2 FAILED / 2 ERROR de transport ; (2) re-test isolé des 2 ERROR → 1 SUCCESS, 1 ERROR de transport ; (3) lecture de `/tmp/agent-bonsai2.log` → coupure WebSocket explicite puis reconnexion ; les ERROR arrivent à ~40-200 s, jamais sur un critère ni un timeout modèle.
 - Question : comment rendre L-4 insensible à ces coupures ?
 - Options : A) lancer `agent.py` avec `LANGWATCH_AGENT_TRANSPORT=http` (long polling, repli déjà utilisé par `agent run`) ; B) faire relancer par `run.sh` tout run en ERROR (une fois) et ne compter que les ERROR persistants ; C) A + B ; D) accepter ces ERROR de transport comme bruit d'infrastructure et assouplir la porte L-4.
+
+### Réponse — L-4 (coupures WebSocket) — 2026-09-22 (Vincent, via l'auteur du plan)
+
+Option **C**. Deux étages, parce qu'aucun des deux ne suffit seul :
+- `LANGWATCH_AGENT_TRANSPORT=http` dans `bench/langwatch/.env` (relire le
+  fichier au lancement de `agent.py`, comme d'habitude) : le SDK passe en long
+  polling au lieu du WebSocket, transport que la documentation du SDK réserve
+  aux réseaux qui coupent les WebSockets — c'est notre cas de fait ;
+- `run.sh` relance **une fois** tout run en ERROR dont la cause est le
+  transport (`agent_relay_unreachable`, `agent_disconnected`), sous le même
+  plan avec la note « relance transport ». Un ERROR d'une autre cause n'est
+  pas relancé, un FAILED jamais.
+Option D refusée : sur 24 runs, un ERROR d'infrastructure non rejoué
+fausserait le taux de réussite.
+
+Reprise : relancer `agent.py` (il lit le nouveau transport), vérifier
+`langwatch agent list` (en ligne), puis `REPEAT=1 bench/langwatch/run.sh local` ;
+si aucun ERROR, `bench/langwatch/run.sh local` pour la porte L-4.
