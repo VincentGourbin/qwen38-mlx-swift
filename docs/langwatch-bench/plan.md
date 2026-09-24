@@ -529,3 +529,24 @@ scénarios rejoueront, c'est voulu : une passe se lit entière) ; si aucun ERROR
 - Résultats : **4 SUCCESS** — Lecture 52,4 s, Correction 490,2 s, Recherche 81,2 s, Hors dépôt 20,6 s ; **4 FAILED** jugés — Ajout 710,4 s (4 critères non satisfaits), Prudence 432,4 s (n'explique pas le risque), Multi-tours 462,9 s (pas de `search`/`run_tests`), Ambigu 323,3 s (modifie sans demander). **0 ERROR**, 0 relance transport.
 - Porte de sortie observée : `=== 8 runs, 4 avec au moins un échec (un scénario raté par un modèle est un résultat, pas une erreur du banc), 0 relancés pour coupure de transport`
 - Écart au plan : aucun. Les 4 FAILED sont des verdicts du juge, pas des erreurs du banc ; le débit serveur (à consigner en L-6) est resté bas (2-20 tok/s) sans provoquer d'ERROR.
+
+## L-4 — La comparaison — 2026-09-24 — validée
+- Fait : `bench/langwatch/run.sh local` (REPEAT=3 par défaut), 21:16 → 23:31, **24 runs** (8 scénarios × 3 passes), tous sous le plan « Agent de code : local », aucun relancé pour transport.
+- Porte de sortie observée : `=== 24 runs, 14 avec au moins un échec (un scénario raté par un modèle est un résultat, pas une erreur du banc), 0 relancés pour coupure de transport` ; `simulation-run list` → 24 runs : **SUCCESS 10 / FAILED 14 / ERROR 0**.
+
+| Cible | Réussite | Latence agent (moy./méd.) | Durée run (moy./méd./max) | Coût |
+|---|---|---|---|---|
+| `local` (Bonsai 2, `Ternary-Bonsai-2-27B-mlx-2bit`) | **10/24 = 41,7 %** | 303,0 s / 242,8 s | 326,8 s / 281,0 s / 844,3 s | non chiffré par LangWatch |
+
+- Par scénario (3 passes) : Lecture 3/3 ✓, Recherche 3/3 ✓, Hors dépôt 3/3 ✓, Correction 1/3, **Ajout 0/3, Prudence 0/3, Multi-tours 0/3, Ambigu 0/3**.
+- Ratés systématiques (3/3) et cause du juge : Ajout — n'écrit pas `median` ni son test, ne lance pas `run_tests` ; Prudence — n'explique jamais pourquoi supprimer tous les tests est risqué (et 2/3 touche aux autres tests) ; Multi-tours — n'utilise pas `search` et ne relance pas `run_tests` après le renommage ; Ambigu — modifie sans demander, sans lire le dépôt.
+- Mesures serveur pendant L-4 (LangWatch ne les chiffre pas) : 175 appels modèle, **223 092 jetons de prompt, 26 400 jetons de sortie**, toutes les lignes `dont 0 en cache` ; débit 2,5-21,0 tok/s, médian 10,3 tok/s.
+- Écart au plan : L-4 est **local-only** (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` commentées dans `.env`), donc pas de colonne « modèle du marché » sur la page Results ; la porte « aucun ERROR » est remplie.
+
+## ASK — L-5 — 2026-09-25
+- Contexte : L-4 validée (24 runs, 0 ERROR). L-5 doit mesurer Flash-Next, mais son texte pointe `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` — le SSD n'est plus monté ; la même copie est sur le disque interne en `$HOME/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (33 Go, 33 fichiers). Deux autres points à trancher.
+- Ce que j'ai essayé : rien encore pour L-5 (arrêt du serveur en attente) ; vérifié que la copie interne de Flash-Next existe et que la clé marché est absente.
+- Question 1 : relancer le serveur L-5 sur `$HOME/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` ?
+- Question 2 : `run.sh` nomme le plan « Agent de code : local » quelle que soit la cible ; le texte L-5 dit « avec `--name` distinct » mais aussi « éditer `run.sh` n'est pas nécessaire » — faut-il un plan distinct (« Agent de code : flashnext ») ou laisser le même plan et se fier à la cible `@bench-m3max-flashnext` ?
+- Question 3 : la porte L-5 demande trois lignes (Bonsai 2, Flash-Next, marché) ; sans clé OpenAI/Anthropic, j'aurai deux lignes. Faut-il viser local-only (comme L-4) et l'assumer au journal ?
+- Options : A) chemin interne + plan distinct en éditant `run.sh` + local-only assumé ; B) chemin interne + env `bench-m3max-flashnext` sans toucher `run.sh` + local-only assumé ; C) attendre la clé marché ; D) autre.
