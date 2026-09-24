@@ -31,24 +31,18 @@ ids=$(.venv/bin/python scenarios.py --ids)
 # Un run en ERROR dont la cause est le transport (agent_relay_unreachable,
 # agent_disconnected : coupures WebSocket observées le 2026-09-21) est relancé
 # une fois ; un ERROR d'une autre cause, ou un FAILED (verdict), ne l'est pas.
-infra_error() {   # $1 = sortie JSON de run-plan run → 0 si un run est en ERROR de transport
-  printf '%s' "$1" | .venv/bin/python -c '
-import json, sys, subprocess, os
-try:
-    d = json.loads(sys.stdin.read().strip().splitlines()[-1])
-except Exception:
-    sys.exit(1)
-env = dict(os.environ, LANGWATCH_NO_DAEMON="1")
-for r in d.get("results", []):
-    if r.get("status") != "ERROR":
-        continue
-    detail = subprocess.run(["npx", "-y", "langwatch", "simulation-run", "get", r["scenarioRunId"], "-o", "json"],
-                            capture_output=True, text=True, env=env).stdout
-    text = json.dumps(json.loads(detail).get("results") or {}) if detail.strip().startswith("{") else detail
-    if any(k in text for k in ("agent_relay_unreachable", "agent_disconnected", "relay", "unreachable")):
-        print(f"ERROR de transport sur {r[\"scenarioRunId\"]} : relance", file=sys.stderr)
-        sys.exit(0)
-sys.exit(1)'
+# La détection vit dans run_helpers.py (pas de Python en ligne : les guillemets
+# échappés y faisaient un SyntaxError permanent, constaté le 2026-09-24).
+infra_error() { printf '%s' "$1" | .venv/bin/python run_helpers.py transport-error; }
+
+# `run-plan run --wait` sort non nul dès qu'un run est FAILED : c'est un verdict,
+# pas une erreur du banc. Avec `set -e`, `out=$(…)` arrêtait donc le script au
+# premier échec jugé (3 scénarios sur 8 exécutés le 2026-09-24). D'où le `|| status=$?`.
+launch() {   # $@ = arguments de run-plan run ; imprime la sortie, renvoie 0 ou le code
+  status=0
+  out=$(npx -y langwatch run-plan run "$@" -o json) || status=$?
+  printf '%s\n' "$out" | tail -1
+  return "$status"
 }
 
 failed=0; total=0; retried=0
@@ -56,18 +50,14 @@ for pass in $(seq 1 "$REPEAT"); do
   for id in $ids; do
     total=$((total+1))
     echo "=== passe $pass · scénario $id"
-    out=$(npx -y langwatch run-plan run --scenario "$id" "${args[@]}" \
-        --judge-model "$JUDGE" --simulator-model "$JUDGE" \
-        --name "$name" --note "$note" --wait 15 -o json) ; status=$?
-    printf '%s\n' "$out" | tail -1
+    launch --scenario "$id" "${args[@]}" --judge-model "$JUDGE" --simulator-model "$JUDGE" \
+        --name "$name" --note "$note" --wait 15 || true
     if infra_error "$out"; then
       retried=$((retried+1))
-      out=$(npx -y langwatch run-plan run --scenario "$id" "${args[@]}" \
-          --judge-model "$JUDGE" --simulator-model "$JUDGE" \
-          --name "$name" --note "$note (relance transport)" --wait 15 -o json) ; status=$?
-      printf '%s\n' "$out" | tail -1
+      launch --scenario "$id" "${args[@]}" --judge-model "$JUDGE" --simulator-model "$JUDGE" \
+          --name "$name" --note "$note (relance transport)" --wait 15 || true
     fi
-    [ "$status" -ne 0 ] && failed=$((failed+1))
+    if [ "$status" -ne 0 ]; then failed=$((failed+1)); fi
   done
 done
 echo "=== $total runs, $failed avec au moins un échec (un scénario raté par un modèle est un résultat, pas une erreur du banc), $retried relancés pour coupure de transport"

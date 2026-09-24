@@ -498,3 +498,28 @@ si aucun ERROR, `bench/langwatch/run.sh local` pour la porte L-4.
 - Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 3 runs puis arrêt ; (2) lecture du log → pas de « } » ni de ligne finale après Ajout ; (3) `bash -c 'set -e; out=$(exit 3)'` → sort en 3 ; (4) l'exécution du test Python de `infra_error` → `SyntaxError` aux deux premiers scénarios.
 - Question : corriger ces deux défauts de `run.sh` (par ex. `if ! out=$(npx …); then status=$?; … else status=0; fi`, et des guillemets simples dans la f-string) avant de reprendre le banc ?
 - Options : A) corriger `run.sh` et relancer `REPEAT=1` puis 3 passes ; B) lancer les scénarios un par un à la main (contourne `run.sh`, mais 24 commandes pour L-4) ; C) autre.
+
+### Réponse — L-3 (run.sh s'arrête au premier FAILED) — 2026-09-24 (Vincent, via l'auteur du plan)
+
+Option **A**, les deux défauts relevés étaient réels et sont corrigés dans
+`run.sh` (`bench/langwatch/run_helpers.py` est nouveau) :
+- `run-plan run --wait` sort non nul sur un verdict FAILED, et sous `set -e`
+  l'affectation `out=$(…)` tuait le script au premier échec jugé. Le lancement
+  passe par une fonction `launch` qui capture le code (`|| status=$?`) ; la
+  boucle continue et compte les échecs. Vérifié hors ligne : deux lancements
+  qui sortent en 3 → boucle terminée, 2 échecs comptés.
+- la détection des ERROR de transport est un fichier Python
+  (`run_helpers.py transport-error`) au lieu d'un programme en ligne : les
+  guillemets échappés dans une chaîne bash à guillemets simples faisaient un
+  SyntaxError permanent. Vérifié hors ligne : un FAILED seul → code 1 (pas de
+  relance).
+Rien ne change pour l'agent ni le serveur.
+
+La mesure annexe (débit tombé de ~20 à 2-12 tok/s pendant « Ajout », RSS
+8,7 Go) est à consigner en L-6 avec l'heure et la longueur des prompts : c'est
+une observation serveur (préremplissage sans cache de préfixe, piège 10, ou
+thermique), pas un défaut du banc.
+
+Reprise : `REPEAT=1 bench/langwatch/run.sh local` (les trois premiers
+scénarios rejoueront, c'est voulu : une passe se lit entière) ; si aucun ERROR,
+`bench/langwatch/run.sh local` pour la porte L-4.
