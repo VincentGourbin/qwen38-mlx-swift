@@ -87,11 +87,14 @@ suite ; commencer par `REPEAT=1` et lire la page usage du fournisseur.
 1. Serveur, en Release, sur le pack à mesurer (Bonsai 2 par défaut) :
    ```bash
    caffeinate -i .xcodebuild/Build/Products/Release/qwen38 serve \
-     --model-path /Volumes/Lexar/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit \
+     --model-path $HOME/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit \
      --port 8848 --enable-thinking
    ```
    dans un terminal dédié (ou `nohup … &`). Attendre `"model_loaded":true`
-   sur `curl -s http://127.0.0.1:8848/healthz`.
+   sur `curl -s http://127.0.0.1:8848/healthz`. Le pack vit sur le disque
+   interne depuis le 2026-09-24 (copie de Lexar) : plus de dépendance au
+   disque externe, dont le débranchement avait vidé le catalogue du serveur
+   en cours de route (`/v1/models` → `[]`, runs en erreur en 2 s).
 2. Agent, dans un second terminal :
    ```bash
    cd bench/langwatch && set -a && . ./.env && set +a && .venv/bin/python agent.py
@@ -473,7 +476,7 @@ si aucun ERROR, `bench/langwatch/run.sh local` pour la porte L-4.
 - Bug de harnais découvert au passage (indépendant du disque) : le nouveau `run.sh` fait `out=$(npx … run-plan run …) ; status=$?` sous `set -euo pipefail`. La substitution renvoie le code non nul d'un run FAILED/ERROR, donc `set -e` arrête le script au premier échec (vérifié : `bash -c 'set -e; out=$(exit 3)'` sort en 3 sans continuer). `infra_error` n'est donc jamais atteint pour relancer un transport, et L-4 (24 runs, des FAILED attendus) s'arrêterait au premier.
 
 ## ASK — L-0 — 2026-09-24
-- Contexte : le banc ne peut plus servir Bonsai 2 : le SSD qui portait `/Volumes/Lexar/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` n'est plus monté. Le serveur en mémoire ne suffit pas (catalogue vide → inférence refusée). Deuxième blocage, à corriger avant L-4 : `run.sh` s'arrête au premier run non nul à cause de `out=$(…)` sous `set -e`.
+- Contexte : le banc ne peut plus servir Bonsai 2 : le SSD qui portait `$HOME/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` n'est plus monté. Le serveur en mémoire ne suffit pas (catalogue vide → inférence refusée). Deuxième blocage, à corriger avant L-4 : `run.sh` s'arrête au premier run non nul à cause de `out=$(…)` sous `set -e`.
 - Ce que j'ai essayé : (1) `agent.py` avec `LANGWATCH_AGENT_TRANSPORT=http` → connexion HTTP long polling OK ; (2) `REPEAT=1 run.sh local` → 1er run ERROR en 1,9 s `aucun modèle` ; (3) `curl /v1/models` → `{"data":[]}`, `curl /v1/chat/completions` → `Modèle indisponible dans le catalogue local` ; (4) recherche d'une copie interne de Bonsai 2 → aucune (cache HF vide) ; Flash-Next est présent sur le disque interne.
 - Question 1 : rebrancher le SSD Lexar (et confirmer que le serveur se remet à servir, ou le relancer) — puis-je reprendre ?
 - Question 2 : corriger `run.sh` pour qu'un run FAILED/ERROR ne fasse pas sortir le script (par ex. `if ! out=$(npx …); then status=$?; …`, ou `out=$(npx …) || status=$?` avec `set +e` local), pour que la relance transport de `infra_error` serve à quelque chose.
