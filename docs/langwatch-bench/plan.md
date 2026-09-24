@@ -464,3 +464,17 @@ fausserait le taux de réussite.
 Reprise : relancer `agent.py` (il lit le nouveau transport), vérifier
 `langwatch agent list` (en ligne), puis `REPEAT=1 bench/langwatch/run.sh local` ;
 si aucun ERROR, `bench/langwatch/run.sh local` pour la porte L-4.
+
+## L-0 (reprise 3, transport HTTP) — 2026-09-24 — bloquée : SSD Lexar absent
+- Fait : agent relancé, `bench/langwatch/.env` porte `LANGWATCH_AGENT_TRANSPORT=http` → journal `connect_agent: connected over HTTP long polling, 1 agent(s) online` ; `agent list` → `qwen38-bench  bench-m3max  online  connected  agent_16a72fa0423f42a4bc4e1`.
+- Blocage : **`/Volumes/Lexar` n'est plus monté** (absent de `/Volumes` et de `diskutil list`). Le serveur du 20/09 tourne encore (pid 3429) : `/healthz` dit toujours `"model_loaded":true`, mais `/v1/models` renvoie `{"data":[]}` — le catalogue est reconstruit par scan du disque (`refreshModelCatalog`) — et `/v1/chat/completions` refuse : `Modèle indisponible dans le catalogue local : Ternary-Bonsai-2-27B-mlx-2bit`.
+- Aucune copie de Bonsai 2 sur le disque interne (cache HuggingFace `models--prism-ml--Ternary-Bonsai-2-27B-mlx-2bit` vide, 4 Ko). Seul Flash-Next est présent sur le disque interne : `/Users/vincent/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` (33 Go, 33 fichiers).
+- Conséquence : le 1er run de `REPEAT=1 bench/langwatch/run.sh local` échoue en 1,9 s (`RuntimeError: aucun modèle sur le serveur local`, journal de l'agent) et le script s'arrête ; aucun autre run lancé.
+- Bug de harnais découvert au passage (indépendant du disque) : le nouveau `run.sh` fait `out=$(npx … run-plan run …) ; status=$?` sous `set -euo pipefail`. La substitution renvoie le code non nul d'un run FAILED/ERROR, donc `set -e` arrête le script au premier échec (vérifié : `bash -c 'set -e; out=$(exit 3)'` sort en 3 sans continuer). `infra_error` n'est donc jamais atteint pour relancer un transport, et L-4 (24 runs, des FAILED attendus) s'arrêterait au premier.
+
+## ASK — L-0 — 2026-09-24
+- Contexte : le banc ne peut plus servir Bonsai 2 : le SSD qui portait `/Volumes/Lexar/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` n'est plus monté. Le serveur en mémoire ne suffit pas (catalogue vide → inférence refusée). Deuxième blocage, à corriger avant L-4 : `run.sh` s'arrête au premier run non nul à cause de `out=$(…)` sous `set -e`.
+- Ce que j'ai essayé : (1) `agent.py` avec `LANGWATCH_AGENT_TRANSPORT=http` → connexion HTTP long polling OK ; (2) `REPEAT=1 run.sh local` → 1er run ERROR en 1,9 s `aucun modèle` ; (3) `curl /v1/models` → `{"data":[]}`, `curl /v1/chat/completions` → `Modèle indisponible dans le catalogue local` ; (4) recherche d'une copie interne de Bonsai 2 → aucune (cache HF vide) ; Flash-Next est présent sur le disque interne.
+- Question 1 : rebrancher le SSD Lexar (et confirmer que le serveur se remet à servir, ou le relancer) — puis-je reprendre ?
+- Question 2 : corriger `run.sh` pour qu'un run FAILED/ERROR ne fasse pas sortir le script (par ex. `if ! out=$(npx …); then status=$?; …`, ou `out=$(npx …) || status=$?` avec `set +e` local), pour que la relance transport de `infra_error` serve à quelque chose.
+- Options : A) rebrancher Lexar + corriger `run.sh`, reprendre L-3/L-4 sur Bonsai 2 ; B) basculer le banc sur Flash-Next (interne) et reporter Bonsai 2 ; C) autre.
