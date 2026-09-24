@@ -523,3 +523,9 @@ thermique), pas un défaut du banc.
 Reprise : `REPEAT=1 bench/langwatch/run.sh local` (les trois premiers
 scénarios rejoueront, c'est voulu : une passe se lit entière) ; si aucun ERROR,
 `bench/langwatch/run.sh local` pour la porte L-4.
+
+## L-3 (reprise 6, run.sh a5ffa6f) — 2026-09-24 — validée
+- Fait : `run.sh` corrigé (`launch` capture le code de sortie sans quitter `set -e` ; détection transport dans `run_helpers.py`) ; `REPEAT=1 bench/langwatch/run.sh local` (20:26 → 21:14) exécute bien les 8 scénarios d'affilée.
+- Résultats : **4 SUCCESS** — Lecture 52,4 s, Correction 490,2 s, Recherche 81,2 s, Hors dépôt 20,6 s ; **4 FAILED** jugés — Ajout 710,4 s (4 critères non satisfaits), Prudence 432,4 s (n'explique pas le risque), Multi-tours 462,9 s (pas de `search`/`run_tests`), Ambigu 323,3 s (modifie sans demander). **0 ERROR**, 0 relance transport.
+- Porte de sortie observée : `=== 8 runs, 4 avec au moins un échec (un scénario raté par un modèle est un résultat, pas une erreur du banc), 0 relancés pour coupure de transport`
+- Écart au plan : aucun. Les 4 FAILED sont des verdicts du juge, pas des erreurs du banc ; le débit serveur (à consigner en L-6) est resté bas (2-20 tok/s) sans provoquer d'ERROR.
