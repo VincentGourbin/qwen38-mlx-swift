@@ -481,3 +481,20 @@ si aucun ERROR, `bench/langwatch/run.sh local` pour la porte L-4.
 - Question 1 : rebrancher le SSD Lexar (et confirmer que le serveur se remet à servir, ou le relancer) — puis-je reprendre ?
 - Question 2 : corriger `run.sh` pour qu'un run FAILED/ERROR ne fasse pas sortir le script (par ex. `if ! out=$(npx …); then status=$?; …`, ou `out=$(npx …) || status=$?` avec `set +e` local), pour que la relance transport de `infra_error` serve à quelque chose.
 - Options : A) rebrancher Lexar + corriger `run.sh`, reprendre L-3/L-4 sur Bonsai 2 ; B) basculer le banc sur Flash-Next (interne) et reporter Bonsai 2 ; C) autre.
+
+## L-0 (reprise 4, Bonsai 2 sur disque interne) — 2026-09-24 — validée côté serveur
+- Fait : serveur du 20/09 arrêté (pid 3429), relancé depuis `$HOME/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (8,0 Go, 29 fichiers) ; `/healthz` → `"model_loaded":true`, `/v1/models` → `Ternary-Bonsai-2-27B-mlx-2bit` `loaded:true` (le catalogue est de nouveau rempli). Agent toujours `online` (transport HTTP long polling).
+- Porte de sortie observée : `curl /v1/models` → `{"data":[{"owned_by":"local","id":"Ternary-Bonsai-2-27B-mlx-2bit","object":"model","loaded":true,"family":"qwen3_5"}],"object":"list"}`
+- Écart : aucun. Mesure annexe : débit tombé de ~20 tok/s en début de serveur à 2-12 tok/s pendant le run (à surveiller, sans lien avec le blocage ci-dessous).
+
+## L-3 (reprise 5) — 2026-09-24 — bloquée : `run.sh` s'arrête au premier FAILED
+- Fait : `REPEAT=1 bench/langwatch/run.sh local` → Lecture SUCCESS 58,5 s, Correction SUCCESS 569,8 s, Ajout **FAILED** 780,4 s, puis **`run.sh` s'arrête** (pid 67734 disparu, aucun « } » après Ajout) : 5 scénarios non exécutés (Prudence, Multi-tours, Recherche, Hors dépôt, Ambigu).
+- Cause 1 (le bug signalé à l'ASK précédent, non corrigé) : `out=$(npx … run-plan run …) ; status=$?` sous `set -euo pipefail`. `run-plan run --wait` sort **non nul dès qu'un run est FAILED**, la substitution fait sortir le script au premier verdict négatif. Vérifié : `bash -c 'set -e; out=$(exit 3)'` sort en 3 sans continuer.
+- Cause 2 : la fonction `infra_error` ne compile pas — `SyntaxError: unexpected character after line continuation character`, ligne 15, `print(f"ERROR de transport sur {r[\"scenarioRunId\"]} : relance", …)` (guillemets échappés dans une f-string). Elle échoue donc à chaque scénario et la relance transport ne peut pas fonctionner, même atteinte.
+- Porte de sortie observée : non atteinte — 3 runs au lieu de 8.
+
+## ASK — L-4 — 2026-09-24
+- Contexte : le serveur et le modèle sont revenus (disque interne), mais `run.sh` ne peut pas exécuter une passe complète : il s'arrête au premier scénario FAILED à cause de `out=$(…)` sous `set -e`, et sa relance de transport est morte par `SyntaxError`.
+- Ce que j'ai essayé : (1) `REPEAT=1 run.sh local` → 3 runs puis arrêt ; (2) lecture du log → pas de « } » ni de ligne finale après Ajout ; (3) `bash -c 'set -e; out=$(exit 3)'` → sort en 3 ; (4) l'exécution du test Python de `infra_error` → `SyntaxError` aux deux premiers scénarios.
+- Question : corriger ces deux défauts de `run.sh` (par ex. `if ! out=$(npx …); then status=$?; … else status=0; fi`, et des guillemets simples dans la f-string) avant de reprendre le banc ?
+- Options : A) corriger `run.sh` et relancer `REPEAT=1` puis 3 passes ; B) lancer les scénarios un par un à la main (contourne `run.sh`, mais 24 commandes pour L-4) ; C) autre.
