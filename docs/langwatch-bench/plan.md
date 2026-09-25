@@ -196,6 +196,16 @@ fait par Claude, pas par pi qui exécute ce plan).
    ```
    Attendre `"model_loaded":true` (≈ 57 Go résidents, chargement plus long que
    Bonsai 2).
+   **Prérequis : le SSD Lexar doit être monté.** Ce dossier interne est un
+   hybride : 7 shards et les n-gram sont en local (33 Go), mais **15 des 22
+   `model-*.safetensors` sont des liens symboliques vers
+   `/Volumes/Lexar/models/local/…`** (84 Go au total). Vérifier avant de lancer :
+   ```bash
+   ls /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP/model-00009-of-00022.safetensors
+   ```
+   Si le fichier manque, s'arrêter et demander (ne pas chercher à copier : il
+   faudrait ≈ 51 Go de plus, le disque interne n'en a que 46). Ne pas
+   débrancher le SSD pendant la campagne.
 2. Relancer l'agent sous un **autre environnement**, pour que la cible soit
    distincte sur LangWatch (`qwen38-bench · bench-m3max-flashnext`) ; l'agent
    relit `/v1/models` au premier appel :
@@ -591,3 +601,13 @@ Les trois ambiguïtés étaient fondées ; la fiche L-5 est réécrite ci-dessus
 - la porte L-5 se limite à deux lignes, Bonsai 2 et Flash-Next ; la cible du
   marché attend une clé.
 Le redémarrage du serveur est fait par pi (L-5, étape 1).
+
+### Complément — L-5 — 2026-09-25 (vérification des chemins Lexar)
+
+Relecture de tout le plan à la demande de Vincent : plus aucune commande ne
+pointe `/Volumes/Lexar` (les mentions restantes sont dans le journal, à titre
+historique). Bonsai 2 est entièrement en interne (8 Go). En revanche le
+Flash-Next « interne » garde 15 shards sur 22 en liens symboliques vers le
+Lexar : la fiche L-5 le dit maintenant et demande le SSD monté pendant toute
+la campagne. `agent.py` relit `/v1/models` à chaque tour, donc il suit le
+modèle servi sans autre réglage que l'environnement.
