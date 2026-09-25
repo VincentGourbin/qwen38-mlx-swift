@@ -611,3 +611,18 @@ Flash-Next « interne » garde 15 shards sur 22 en liens symboliques vers le
 Lexar : la fiche L-5 le dit maintenant et demande le SSD monté pendant toute
 la campagne. `agent.py` relit `/v1/models` à chaque tour, donc il suit le
 modèle servi sans autre réglage que l'environnement.
+
+## L-5 (prérequis) — 2026-09-25 — bloquée : SSD Lexar absent, 15 shards Flash-Next manquants
+- Fait : exécution de la commande de vérification de la fiche L-5 :
+  `ls /Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP/model-00009-of-00022.safetensors`
+  → `No such file or directory` ; `/Volumes` ne contient toujours pas `Lexar`.
+- Constat : le dossier « interne » de Flash-Next est bien l'hybride décrit — **7 shards réels (33 Go) + 15 `model-*.safetensors` en liens symboliques cassés** vers `/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`. 15 des 22 shards manquent.
+- Conformément à la fiche (« si le fichier manque, s'arrêter et demander ; ne pas chercher à copier »), je **n'ai pas arrêté le serveur Bonsai 2** (pid 67669) et n'ai pas tenté de lancer Flash-Next, qui ne pourrait pas charger ses poids.
+- Vérifié pour la reprise : `run.sh` accepte bien `TARGET_ENV` (environnement visé) et `LABEL` (suffixe de plan), et `agent.py` relit `/v1/models` à chaque tour.
+- Porte de sortie observée : **non atteinte** (Flash-Next non lancé).
+
+## ASK — L-5 — 2026-09-25
+- Contexte : Flash-Next ne peut pas démarrer sans le SSD Lexar : 15 de ses 22 shards sont des liens symboliques vers `/Volumes/Lexar/...`, or le volume n'est pas monté. La fiche demande de s'arrêter dans ce cas.
+- Ce que j'ai essayé : (1) `ls /Volumes/` → pas de Lexar ; (2) la commande de vérification de la fiche → fichier absent ; (3) inventaire du dossier interne → 7 shards réels, 15 liens cassés ; (4) `df` → 54 Go libres (les 15 shards pèsent ≈ 51 Go, marge très faible, et la fiche exclut la copie).
+- Question : rebrancher le SSD Lexar (même point de montage, pour résoudre les 15 liens) puis-je reprendre L-5 ?
+- Options : A) rebrancher Lexar et garder les liens symboliques (recommandé par la fiche) ; B) copier les 15 shards sur le disque interne malgré la marge (≈ 51 Go pour 54 Go libres, risque de saturation) ; C) autre.
