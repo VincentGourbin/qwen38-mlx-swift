@@ -626,3 +626,19 @@ modèle servi sans autre réglage que l'environnement.
 - Ce que j'ai essayé : (1) `ls /Volumes/` → pas de Lexar ; (2) la commande de vérification de la fiche → fichier absent ; (3) inventaire du dossier interne → 7 shards réels, 15 liens cassés ; (4) `df` → 54 Go libres (les 15 shards pèsent ≈ 51 Go, marge très faible, et la fiche exclut la copie).
 - Question : rebrancher le SSD Lexar (même point de montage, pour résoudre les 15 liens) puis-je reprendre L-5 ?
 - Options : A) rebrancher Lexar et garder les liens symboliques (recommandé par la fiche) ; B) copier les 15 shards sur le disque interne malgré la marge (≈ 51 Go pour 54 Go libres, risque de saturation) ; C) autre.
+
+## L-5 (reprise, Lexar monté) — 2026-09-25 — bloquée : le serveur Flash-Next plante (MLX broadcast)
+- Fait : prérequis vérifié (`ls /Volumes/Lexar/.../model-00009-of-00022.safetensors` → présent ; les 15 liens symboliques se résolvent, `ok 08…22`). Serveur Bonsai 2 (pid 67669) arrêté, Flash-Next relancé sur `$HOME/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` → `/healthz` `"model_loaded":true`, `routed_expert_count:10`, `/v1/models` → `Qwen3.8-Flash-Next-MLX-e3bit-MTP`. Agent relancé sous `bench-m3max-flashnext` (assignation **après** `. ./.env`) ; `agent list` → **deux lignes** `qwen38-bench`, les deux `online` (`bench-m3max`, `bench-m3max-flashnext`).
+- Fumée : `TARGET_ENV=bench-m3max-flashnext LABEL=flashnext REPEAT=1 bench/langwatch/run.sh local` → plan « Agent de code : local (flashnext) ».
+- Résultat : **1 SUCCESS** — Lecture 79,8 s ; puis, après 7 appels modèle, **le serveur meurt** :
+  `MLX/ErrorHandler.swift:345: Fatal error: [broadcast_shapes] Shapes (1,1,809,812) and (1,24,809,813) cannot be broadcast. at …/mlx/c/fast.cpp:629`.
+  Les 6 scénarios suivants (Correction 265,2 s, puis Ajout 2,0 s, Prudence 4,1 s, Multi-tours 1,1 s, Recherche 2,6 s, Hors dépôt 1,0 s, Ambigu 2,0 s) sont **ERROR** `ConnectedAgentCallError: (agent_call_failed): APIConnectionError: Connection error.` — le serveur n'écoute plus (`/healthz` et `/v1/models` vides).
+- `run.sh` : `=== 8 runs, 7 avec au moins un échec …, 0 relancés pour coupure de transport` (ces ERROR sont `agent_call_failed`, pas marqués transport, donc non relancés).
+- **Cache de préfixe (mesure demandée)** : sur Flash-Next, `dont N en cache` est **non nul** sur les tours outillés — 800, 994, 780, 1476 jetons en cache — contre **toujours 0** sur le chemin Bonsai 2 ; débit 5,8-17,3 tok/s. À consigner en L-6 pour les deux modèles.
+- Porte de sortie observée : **non atteinte** (serveur mort après 2 tours).
+
+## ASK — L-5 — 2026-09-25
+- Contexte : avec le Lexar monté, Flash-Next charge et répond (Lecture SUCCESS), mais le serveur **plante** sur un broadcast MLX de formes incompatibles, après ~7 appels modèle ; tous les runs suivants échouent en `APIConnectionError`. La campagne 24 runs est impossible tant que le serveur meurt.
+- Ce que j'ai essayé : (1) vérification des 15 shards → OK ; (2) serveur Flash-Next → `model_loaded:true` ; (3) deux agents en ligne (`bench-m3max`, `bench-m3max-flashnext`) ; (4) fumée `REPEAT=1` → 1 SUCCESS + 7 ERROR après le crash ; (5) lecture du journal serveur → l'erreur `[broadcast_shapes] Shapes (1,1,809,812) and (1,24,809,813)` est la dernière ligne, le processus a disparu.
+- Question : corriger le plantage du chemin Flash-Next dans `Sources/` (pi ne peut pas y toucher) avant de reprendre L-5 ?
+- Options : A) corriger la forme fautive (812 vs 813 / 1 vs 24) puis reconstruire le Release et relancer L-5 ; B) chercher un réglage serveur qui évite la forme (p. ex. borner le prompt/batch, `--routed-experts`) ; C) se contenter de Bonsai 2 et retirer Flash-Next de la porte ; D) autre.
