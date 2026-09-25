@@ -11,7 +11,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 set -a; [ -f .env ] && . ./.env; set +a
 : "${LANGWATCH_API_KEY:?LANGWATCH_API_KEY manquante (bench/langwatch/.env)}"
-ENV_NAME="${LANGWATCH_AGENT_ENVIRONMENT:-development}"
+# TARGET_ENV : environnement de l'agent visé (défaut : celui de .env). `. ./.env`
+# réassigne LANGWATCH_AGENT_ENVIRONMENT, donc un export fait avant ne suffit pas :
+# pour viser un second serveur (Flash-Next), passer TARGET_ENV=bench-m3max-flashnext.
+ENV_NAME="${TARGET_ENV:-${LANGWATCH_AGENT_ENVIRONMENT:-development}}"
+# LABEL : suffixe du nom de plan, pour séparer les campagnes d'un même paramètre
+# `model=local` servi par des modèles différents (ex. LABEL=flashnext).
+LABEL="${LABEL:-}"
 REPEAT="${REPEAT:-3}"
 # Juge et simulateur : le fournisseur « custom » (Ollama Cloud, https://ollama.com/v1)
 # enregistré sur le projet le 2026-09-19. deepseek-v4.1-flash et glm-5.3-flash rendent des
@@ -23,7 +29,7 @@ export LANGWATCH_NO_DAEMON=1   # le démon du CLI abandonne après 25 s
 targets=("$@"); [ ${#targets[@]} -eq 0 ] && targets=(local)
 args=()
 for t in "${targets[@]}"; do args+=(--target "connected:qwen38-bench@${ENV_NAME}?model=${t}"); done
-name="Agent de code : $(IFS=' vs '; echo "${targets[*]}")"
+name="Agent de code : $(IFS=' vs '; echo "${targets[*]}")${LABEL:+ ($LABEL)}"
 note="$(git -C ../.. log -1 --pretty=%s | cut -c1-200)"
 ids=$(.venv/bin/python scenarios.py --ids)
 [ -n "$ids" ] || { echo "aucun scénario : lancer scenarios.sh d'abord"; exit 1; }

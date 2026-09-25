@@ -181,17 +181,46 @@ chiffre pas.
 avec ses 24 runs (8 scénarios × 3 passes), aucun en ERROR ; taux de
 réussite, latence moyenne et scénarios ratés recopiés dans le journal.
 
-### L-5 — Flash-Next, même banc
+### L-5 — Flash-Next, même banc — **révisée le 2026-09-25**
 
-Arrêter le serveur, le relancer sur Flash-Next 3 bits
-(`/Volumes/Lexar/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP`), relancer
-`agent.py` (il relit `/v1/models`), puis `bench/langwatch/run.sh local` avec
-`--name` distinct : éditer `run.sh` n'est pas nécessaire, la variable
-`LANGWATCH_AGENT_ENVIRONMENT=bench-m3max-flashnext` dans l'environnement du
-shell suffit pour créer une cible distincte (`qwen38-bench · bench-m3max-flashnext`).
+Même agent, même suite, même juge ; seul le serveur change. Le serveur est
+relancé par pi (Vincent a demandé qu'on le consulte avant tout redémarrage
+fait par Claude, pas par pi qui exécute ce plan).
 
-**Porte de sortie** : sur la page Results, groupée par cible, trois lignes
-comparables : Bonsai 2, Flash-Next, et le modèle du marché.
+1. Arrêter le serveur Bonsai 2, relancer sur Flash-Next 3 bits, qui est sur le
+   disque interne :
+   ```bash
+   caffeinate -i .xcodebuild/Build/Products/Release/qwen38 serve \
+     --model-path $HOME/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP \
+     --port 8848 --enable-thinking
+   ```
+   Attendre `"model_loaded":true` (≈ 57 Go résidents, chargement plus long que
+   Bonsai 2).
+2. Relancer l'agent sous un **autre environnement**, pour que la cible soit
+   distincte sur LangWatch (`qwen38-bench · bench-m3max-flashnext`) ; l'agent
+   relit `/v1/models` au premier appel :
+   ```bash
+   cd bench/langwatch && set -a && . ./.env && set +a && \
+     LANGWATCH_AGENT_ENVIRONMENT=bench-m3max-flashnext .venv/bin/python agent.py
+   ```
+   (l'assignation vient **après** le `. ./.env`, qui remet `bench-m3max` sinon).
+3. Vérifier `langwatch agent list` : deux lignes `qwen38-bench`, la nouvelle en
+   ligne.
+4. Passe de fumée puis campagne, en visant cet environnement et en nommant le
+   plan à part :
+   ```bash
+   TARGET_ENV=bench-m3max-flashnext LABEL=flashnext REPEAT=1 bench/langwatch/run.sh local
+   TARGET_ENV=bench-m3max-flashnext LABEL=flashnext bench/langwatch/run.sh local
+   ```
+   Les runs vont dans le plan « Agent de code : local (flashnext) ». Noter les
+   lignes `usage` du serveur comme en L-4 ; sur Flash-Next, regarder si
+   `dont N en cache` devient non nul sur les tours outillés (le chemin
+   Flash-Next a son propre cache de conversation).
+
+**Porte de sortie** : sur la page Results, groupée par cible, **deux** lignes
+comparables (Bonsai 2 = « Agent de code : local », Flash-Next = « … (flashnext) »)
+avec 24 runs chacune et aucun ERROR. La ligne « modèle du marché » attendra une
+clé OpenAI/Anthropic dans `.env` : elle ne fait pas partie de cette porte.
 
 ### L-6 — Bilan
 
@@ -550,3 +579,15 @@ scénarios rejoueront, c'est voulu : une passe se lit entière) ; si aucun ERROR
 - Question 2 : `run.sh` nomme le plan « Agent de code : local » quelle que soit la cible ; le texte L-5 dit « avec `--name` distinct » mais aussi « éditer `run.sh` n'est pas nécessaire » — faut-il un plan distinct (« Agent de code : flashnext ») ou laisser le même plan et se fier à la cible `@bench-m3max-flashnext` ?
 - Question 3 : la porte L-5 demande trois lignes (Bonsai 2, Flash-Next, marché) ; sans clé OpenAI/Anthropic, j'aurai deux lignes. Faut-il viser local-only (comme L-4) et l'assumer au journal ?
 - Options : A) chemin interne + plan distinct en éditant `run.sh` + local-only assumé ; B) chemin interne + env `bench-m3max-flashnext` sans toucher `run.sh` + local-only assumé ; C) attendre la clé marché ; D) autre.
+
+### Réponse — L-5 — 2026-09-25 (Vincent, via l'auteur du plan)
+
+Les trois ambiguïtés étaient fondées ; la fiche L-5 est réécrite ci-dessus :
+- chemin Flash-Next = `$HOME/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP` ;
+- `run.sh` accepte `TARGET_ENV` (environnement de l'agent visé, car `. ./.env`
+  réassigne la variable) et `LABEL` (suffixe du nom de plan) ; la campagne
+  Flash-Next va dans « Agent de code : local (flashnext) », celle de Bonsai 2
+  reste « Agent de code : local » ;
+- la porte L-5 se limite à deux lignes, Bonsai 2 et Flash-Next ; la cible du
+  marché attend une clé.
+Le redémarrage du serveur est fait par pi (L-5, étape 1).
