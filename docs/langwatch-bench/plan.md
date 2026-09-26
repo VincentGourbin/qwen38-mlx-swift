@@ -239,6 +239,12 @@ le tableau taux de réussite / latence / coût par cible, les scénarios que le
 modèle local rate systématiquement (3/3) et pourquoi (raison du juge), et
 une ligne de conclusion. Pas de recommandation d'optimisation avant cette
 ligne.
+**Révisée le 2026-09-26** : le bilan porte sur **Bonsai 2 seul** (L-5 est
+reportée, voir la réponse du 2026-09-26). Ajouter au bilan les mesures que
+LangWatch ne chiffre pas : jetons prompt/sortie, part en cache (0 sur le
+chemin Bonsai 2 ; 780-1476 jetons par tour outillé sur Flash-Next lors de la
+fumée L-5), débit médian, et le plantage Flash-Next comme fait brut renvoyé
+vers `PLAN.md` §P15, sans analyse ici.
 
 ## 4. Ordre et dépendances
 
@@ -642,3 +648,19 @@ modèle servi sans autre réglage que l'environnement.
 - Ce que j'ai essayé : (1) vérification des 15 shards → OK ; (2) serveur Flash-Next → `model_loaded:true` ; (3) deux agents en ligne (`bench-m3max`, `bench-m3max-flashnext`) ; (4) fumée `REPEAT=1` → 1 SUCCESS + 7 ERROR après le crash ; (5) lecture du journal serveur → l'erreur `[broadcast_shapes] Shapes (1,1,809,812) and (1,24,809,813)` est la dernière ligne, le processus a disparu.
 - Question : corriger le plantage du chemin Flash-Next dans `Sources/` (pi ne peut pas y toucher) avant de reprendre L-5 ?
 - Options : A) corriger la forme fautive (812 vs 813 / 1 vs 24) puis reconstruire le Release et relancer L-5 ; B) chercher un réglage serveur qui évite la forme (p. ex. borner le prompt/batch, `--routed-experts`) ; C) se contenter de Bonsai 2 et retirer Flash-Next de la porte ; D) autre.
+
+### Réponse — L-5 — 2026-09-26 (Vincent, via l'auteur du plan) — **option C**
+
+Décision de Vincent : l'objet du banc est **Bonsai 2**, déjà mesuré en L-4.
+Flash-Next n'était dans le plan qu'en seconde ligne locale, faute de clé pour
+un modèle du marché ; ce n'est pas le sujet, et son plantage est un bug du
+framework (`Sources/`), pas du banc.
+- **L-5 : reportée**, hors porte. Ne pas la reprendre. Laisser les 8 runs
+  « Agent de code : local (flashnext) » tels quels sur LangWatch (1 SUCCESS,
+  7 ERROR) ; ils ne comptent pas.
+- Le plantage est consigné dans `PLAN.md` §P15 avec la trace et les pointeurs
+  de code ; pi n'y touche pas.
+- **Passer à L-6** avec Bonsai 2 seul (porte révisée ci-dessus). L-6 ne
+  demande aucun serveur : ne pas relancer `qwen38 serve`. Arrêter les deux
+  agents (`bench-m3max`, `bench-m3max-flashnext`), ils ne servent plus.
+- Commit L-6 puis fin du plan.

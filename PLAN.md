@@ -4719,3 +4719,50 @@ rejouée : Go** (`docs/knowledge/log.md`, 2026-09-19, section « Correctif »)
 les tailles de contexte testées. P14.7 (optionnel) sans objet : le débit
 mesuré (5,3-16,7 tok/s décodage selon le contexte) n'appelait pas
 d'optimisation supplémentaire dans le périmètre retenu pour cette session.
+
+
+### P15 — Flash-Next : le serveur meurt sur un masque causal décalé d'un jeton — ouvert le 2026-09-26
+
+**Fait** (banc LangWatch, fumée L-5 du 2026-09-25, `/tmp/qwen38-flashnext.log`) :
+serveur Release `qwen38 serve --model-path ~/models/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP
+--enable-thinking`, agent de code outillé (`bench/langwatch/agent.py`, flux,
+fermeture du flux à l'échéance de tour). Sept appels réussis, dont quatre
+avec cache de préfixe non nul (800, 994, 780, 1476 jetons), puis au huitième :
+
+```
+MLX/ErrorHandler.swift:345: Fatal error: [broadcast_shapes]
+Shapes (1,1,809,812) and (1,24,809,813) cannot be broadcast. …/mlx/c/fast.cpp:629
+```
+
+Le processus meurt (Fatal error MLX, pas une erreur Swift rattrapable) ; tous
+les clients suivants échouent en `APIConnectionError`.
+
+**Lecture** : préremplissage de 809 jetons sur une conversation existante.
+Le masque est construit avec `keyLength = cache.offset + 809 = 812`, donc
+`cache.offset = 3`, alors que les scores SDPA ont **813** clés : le cache KV
+contient un jeton de plus que ne le croit son `offset`
+(`Qwen4ExpStreamingDecoder.swift:313`, masque tranché ensuite à
+`0..<keyLength` dans `Qwen4ExpQSAAttention.swift:203`, d'où 812 contre 813).
+Le chemin en cause est la continuation à cache persistant du serveur
+(`continueConversationTurn`, P13.3, `Qwen38FlashNextEngine.swift:531`) ou la
+restauration LRU (`restoreConversationState`, P5.2). Un préfixe commun de
+3 jetons est en soi suspect (à peine `<|im_start|>system\n`) : le LRU a
+peut-être apparié une conversation qui n'avait presque rien en commun.
+
+**Hypothèses à départager** (aucune vérifiée) :
+1. le client ferme le flux à l'échéance (l'agent le fait) et l'annulation
+   tombe entre l'écriture des clés dans le cache et l'incrément d'`offset` ;
+   la conversation reste dans le LRU avec un cache incohérent ;
+2. rognage du cache à un préfixe commun très court (3 jetons) avec un écart
+   d'un jeton entre l'`offset` retenu et les clés conservées ;
+3. drafter MTP (`mtpDraftState`) laissant une clé spéculative dans le cache
+   principal.
+
+**Pistes** : reproduire hors banc avec deux conversations qui ne partagent
+que le préambule système, l'une interrompue en cours de génération ; puis
+`precondition(cache.offset == clés stockées)` à l'entrée de `layer(...)` pour
+localiser, et, quoi qu'il en soit, transformer ce cas en 500 côté serveur
+plutôt qu'en mort du processus (le chemin 27B n'a pas ce défaut : 0 ERROR sur
+24 runs). Le chemin Bonsai 2 n'obtient jamais de hit de cache sur les
+requêtes outillées (`dont 0 en cache` sur 175 appels) : à traiter dans le même
+chantier, c'est l'autre face du même mécanisme.
