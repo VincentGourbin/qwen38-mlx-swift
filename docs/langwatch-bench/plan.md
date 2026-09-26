@@ -28,7 +28,8 @@ un utilisateur simulé, des critères pour un juge) contre une **cible**. Une
 cible est ici toujours le **même agent** (`bench/langwatch/agent.py`, une
 boucle outils → modèle → outils minimale), dont le paramètre de run `model`
 choisit le modèle : `local` (ce que `qwen38 serve` a chargé, Bonsai 2 ou
-Flash-Next), `gpt-5-mini`, `gpt-5`, `claude-sonnet-5`. Une **comparaison** est
+Flash-Next), `ollama/<nom>` (Ollama Cloud via le démon local, sans clé,
+ajouté le 2026-09-26), `gpt-5-mini`, `gpt-5`, `claude-sonnet-5` (clé requise). Une **comparaison** est
 un run avec plusieurs cibles : mêmes scénarios, mêmes outils, même prompt
 système, seule la case modèle change. LangWatch affiche par cible le taux de
 réussite, la latence et le coût.
@@ -246,9 +247,67 @@ chemin Bonsai 2 ; 780-1476 jetons par tour outillé sur Flash-Next lors de la
 fumée L-5), débit médian, et le plantage Flash-Next comme fait brut renvoyé
 vers `PLAN.md` §P15, sans analyse ici.
 
+### L-7 — Campagne v2 : Bonsai 2 contre des modèles du marché ouvert (Ollama Cloud) — ajoutée le 2026-09-26
+
+Demande de Vincent : **repartir de zéro sur Bonsai 2** et le **comparer à
+d'autres modèles**. Sans clé OpenAI/Anthropic, les modèles accessibles sont
+ceux d'**Ollama Cloud**, appelés par le **démon Ollama local** (compte
+`ollama signin`, pas de clé) sur son endpoint compatible OpenAI. `agent.py`
+les connaît sous `ollama/<nom>` (liste `OLLAMA_CLOUD_MODELS`) ; même harnais,
+mêmes outils, même prompt, seule la case modèle change. Vérifié le
+2026-09-26 : un tour complet `run_turn` sur `ollama/glm-5.3-flash` lance les
+tests et nomme l'échec en 18 s.
+
+Cibles retenues (le juge `deepseek-v4.1-flash` **n'est pas** une cible, il
+se noterait lui-même) : `local` (Bonsai 2), `ollama/glm-5.3-flash`,
+`ollama/gpt-oss:120b`, `ollama/kimi-k2.7-code`. Vincent peut en ajouter parmi
+`OLLAMA_CLOUD_MODELS` ; chaque cible ajoute 24 runs cloud (rapides).
+
+1. Préflight Ollama : `curl -s http://127.0.0.1:11434/api/version` répond,
+   `ollama signin` dit « already signed in ». Sinon s'arrêter (ASK).
+2. Serveur Bonsai 2 : relancer comme en L-0 (Release courant, piège 9),
+   attendre `"model_loaded":true`.
+3. `rm -rf bench/langwatch/workspaces` (piège 5), puis agent relancé
+   (piège 8 : `agent.py` a changé, la plateforme relit ses options) :
+   ```bash
+   cd bench/langwatch && set -a && . ./.env && set +a && .venv/bin/python agent.py
+   ```
+   `agent list` → `qwen38-bench` en ligne sous `bench-m3max` seulement.
+4. Fumée, un scénario par cible :
+   ```bash
+   LABEL=v2 REPEAT=1 bench/langwatch/run.sh local ollama/glm-5.3-flash ollama/gpt-oss:120b ollama/kimi-k2.7-code
+   ```
+   Attendu : 8 scénarios × 4 cibles = 32 runs, 0 ERROR, plan
+   « Agent de code : local vs ollama/glm-5.3-flash vs … (v2) ». Une ligne
+   `usage` par appel local sur le serveur ; les cibles cloud n'y apparaissent
+   pas (mesurer leur latence sur la page Results).
+5. Campagne : même commande sans `REPEAT=1` (3 passes). Les quatre cibles
+   jouent chaque scénario en parallèle ; la durée est celle de Bonsai 2
+   (≈ 2 h 15 pour 24 runs en L-4). Ne pas débrancher, ne pas mettre en veille.
+6. Journal : par cible, réussite, latence moyenne/médiane, ERROR ; par
+   scénario, la grille cible × passe ; mesures serveur pour `local`
+   (jetons, cache, débit).
+
+**Porte de sortie** : sur Results, le plan « … (v2) » montre **quatre lignes,
+24 runs chacune, 0 ERROR**. Un ERROR `agent_call_failed` sur une cible cloud
+avec `429`/`rate limit` dans le journal de l'agent = quota Ollama Cloud
+(piège 11) : relancer le scénario concerné pour cette seule cible après une
+pause, et le noter.
+
+### L-8 — Bilan comparé
+
+Nouvelle entrée dans `docs/knowledge/log.md` (« 2026-09-xx — Banc LangWatch
+v2 : Bonsai 2 face à Ollama Cloud ») : tableau cible × (réussite, latence),
+grille scénario × cible (réussites sur 3), les scénarios où Bonsai 2 est
+seul à échouer et ceux où tous échouent (défaut du scénario ou du juge,
+pas du modèle), mesures serveur de `local`, une ligne de conclusion. Pas de
+recommandation d'optimisation avant cette ligne.
+
 ## 4. Ordre et dépendances
 
-L-0 → L-1 → L-2 → L-3 (bloquante sans la clé) → L-4 → L-5 → L-6.
+L-0 → L-1 → L-2 → L-3 (bloquante sans la clé) → L-4 → L-5 → L-6 : **fait**
+(L-5 reportée). Campagne v2 : **L-7 → L-8**, L-7 réutilise L-0 (serveur,
+agent) et suppose L-2/L-3 en place (suite, juge).
 L-2 peut se faire avant L-0 (elle ne touche pas au serveur).
 
 ## 5. Pièges connus
@@ -287,6 +346,19 @@ L-2 peut se faire avant L-0 (elle ne touche pas au serveur).
    l'historique (700 à 4 000 jetons à ~100 jetons/s), d'où 20 à 60 s par
    appel et des tours proches du budget. C'est une mesure du serveur, à
    consigner en L-6 ; pas à corriger dans le banc.
+11. **Ollama Cloud** (cibles `ollama/*`) : le démon local relaie avec le
+   compte connecté ; pas de clé, mais un **quota** gratuit (heure/semaine).
+   Un `429` remonte en `agent_call_failed` (pas un ERROR de transport,
+   `run.sh` ne relance pas) : attendre, relancer le scénario pour cette cible.
+   L'endpoint `/v1` du démon **ignore `reasoning_effort` et `think`** (testé
+   le 26/09 sur deepseek) : le paramètre `thinking` est sans effet sur ces
+   cibles, et la conclusion leur laisse 1 500 jetons au lieu de 400 pour que
+   la réflexion ne mange pas la réponse. Modèles retirés régulièrement
+   (kimi-k2.5, qwen3.5, minimax-m2.5 en 2026) : si `model not found`,
+   retirer la cible, ne pas la remplacer en cours de campagne.
+12. **Le juge ne doit pas être une cible** : `deepseek-v4.1-flash` juge ; le
+   comparer à lui-même n'a pas de sens. Changer de juge (`JUDGE_MODEL`) pour
+   toute la campagne si on veut le mesurer.
 
 ## 6. Commandes de référence
 

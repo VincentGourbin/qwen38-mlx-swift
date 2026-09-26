@@ -4,6 +4,7 @@
 # suite d'un bloc fait échouer les runs en `agent_busy`).
 #   bench/langwatch/run.sh                       # cible local, 3 passes
 #   bench/langwatch/run.sh local gpt-5-mini      # cibles au choix (valeurs du paramètre model)
+#   bench/langwatch/run.sh local ollama/glm-5.3-flash ollama/gpt-oss:120b   # Ollama Cloud via le démon local
 #   REPEAT=1 bench/langwatch/run.sh local        # une seule passe
 # Tous les runs d'une même cible rejoignent le plan « Agent de code : <cibles> »
 # (onglet Results). Prérequis : agent.py connecté, fournisseur de modèle actif.

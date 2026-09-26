@@ -20,6 +20,9 @@ Variables d'environnement :
     LANGWATCH_API_KEY   clé projet LangWatch (obligatoire, sinon rien ne se connecte)
     QWEN38_BASE_URL     serveur local (défaut http://127.0.0.1:8848/v1)
     QWEN38_MODEL        id du modèle local ; défaut : le premier de /v1/models
+    OLLAMA_BASE_URL     démon Ollama local (défaut http://127.0.0.1:11434/v1) : les
+                        cibles `ollama/<modèle>` passent par lui vers Ollama Cloud
+                        (compte `ollama signin`, pas de clé)
     OPENAI_API_KEY      pour les cibles gpt-*
     ANTHROPIC_API_KEY   pour les cibles claude-* (endpoint compatible OpenAI d'Anthropic)
     LANGWATCH_AGENT_ENVIRONMENT  ex. bench-m3max (défaut development = agent personnel)
@@ -46,7 +49,14 @@ WORKSPACES = HERE / "workspaces"
 MAX_READ_LINES = 200
 MAX_TOOL_OUTPUT = 6000  # caractères renvoyés au modèle par appel d'outil
 
-MODEL_OPTIONS = ["local", "gpt-5-mini", "gpt-5", "claude-sonnet-5"]
+# Modèles Ollama Cloud, appelés via le démon Ollama local (`ollama signin`,
+# pas de clé) sur son endpoint compatible OpenAI. Vérifiés le 2026-09-26 :
+# chacun renvoie un tool_call structuré sur une première demande outillée.
+# `deepseek-v4.1-flash` est aussi le juge du banc : ne pas le mettre en cible
+# sans changer de juge (JUDGE_MODEL dans run.sh).
+OLLAMA_CLOUD_MODELS = ["glm-5.3-flash", "glm-5.3", "gpt-oss:120b", "kimi-k2.7-code", "kimi-k3",
+                       "deepseek-v4.1-flash", "deepseek-v4-pro", "minimax-m3", "gemma4", "nemotron-3-super"]
+MODEL_OPTIONS = ["local", *[f"ollama/{m}" for m in OLLAMA_CLOUD_MODELS], "gpt-5-mini", "gpt-5", "claude-sonnet-5"]
 THINKING_OPTIONS = ["off", "low", "medium", "xhigh"]
 
 # La plateforme plafonne un tour d'agent à 300 s. Le tour est chronométré dès
@@ -57,8 +67,12 @@ THINKING_OPTIONS = ["off", "low", "medium", "xhigh"]
 # du banc (ASK L-4, 2026-09-19 : une génération de 3 739 jetons ≈ 250 s).
 TURN_BUDGET_S = 150.0      # 4 tours × 150 s + simulateur + juge < plafond du scénario (~900 s)
 TOKENS_PER_S = 12.0        # débit local prudent (Bonsai 2 ≈ 15-20, Flash-Next ≈ 13)
+CLOUD_TOKENS_PER_S = 40.0  # cibles distantes (Ollama Cloud, marché) : borne basse observée
 CONCLUDE_RESERVE_S = 50.0  # réservé à la conclusion : les outils s'arrêtent avant
 MAX_CALL_TOKENS = 3072
+CONCLUDE_MAX_TOKENS = 400        # conclusion locale, réflexion coupée
+CLOUD_CONCLUDE_MAX_TOKENS = 1500 # Ollama /v1 ignore reasoning_effort et think (testé
+                                 # 2026-09-26) : la réflexion garde sa place
 BLANK_REPLY = "Je n'ai pas pu formuler de réponse dans le temps imparti ; reformule ou précise la demande."
 UNFINISHED_REPLY = "Je n'ai pas terminé : il me reste des vérifications à faire. Dis-moi si je continue."
 TOOL_CALL_XML = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
@@ -232,6 +246,15 @@ def make_client(model: str) -> tuple[OpenAI, str, dict]:
         client = OpenAI(base_url=os.environ.get("QWEN38_BASE_URL", "http://127.0.0.1:8848/v1"),
                         api_key="local", max_retries=0)
         return client, local_model_id(client), {}
+    if model.startswith("ollama/"):
+        # Le démon local relaie vers Ollama Cloud avec le compte connecté ;
+        # le tag cloud s'écrit `:cloud`, ou `-cloud` si le nom porte déjà une
+        # taille (`gpt-oss:120b-cloud`).
+        name = model.removeprefix("ollama/")
+        tag = "-cloud" if ":" in name else ":cloud"
+        client = OpenAI(base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
+                        api_key="ollama", max_retries=0)
+        return client, name + tag, {}
     if model.startswith("gpt-"):
         return OpenAI(max_retries=0), model, {}
     if model.startswith("claude-"):
@@ -250,11 +273,21 @@ def reasoning_kwargs(model: str, thinking: str) -> dict:
         return {"extra_body": {"reasoning_effort": thinking}}
     if model.startswith("gpt-"):
         return {"reasoning_effort": {"off": "low", "low": "low", "medium": "medium", "xhigh": "high"}[thinking]}
+    # ollama/* : l'endpoint /v1 du démon ignore reasoning_effort et think ;
+    # chaque modèle réfléchit comme il l'entend, `thinking` est sans effet.
     return {}
 
 
 def clamp(value: float, low: int, high: int) -> int:
     return max(low, min(high, int(value)))
+
+
+def tokens_per_s(model: str) -> float:
+    return TOKENS_PER_S if model == "local" else CLOUD_TOKENS_PER_S
+
+
+def conclude_max_tokens(model: str) -> int:
+    return CONCLUDE_MAX_TOKENS if model == "local" else CLOUD_CONCLUDE_MAX_TOKENS
 
 
 def no_thinking(model: str, extra: dict) -> dict:
@@ -387,6 +420,7 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
     root = workspace_for(thread_id)
     client, model_id, extra = make_client(model)
     extra = {**extra, **reasoning_kwargs(model, thinking)}
+    tps = tokens_per_s(model)
 
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     history += [{"role": m["role"], "content": m.get("content", "")} for m in messages if m.get("role") in ("user", "assistant")]
@@ -416,7 +450,7 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
         try:
             turn = chat_turn(
                 client, model_id, history, extra,
-                max_tokens=clamp((tools_deadline - time.monotonic()) * TOKENS_PER_S - 100, 256, MAX_CALL_TOKENS),
+                max_tokens=clamp((tools_deadline - time.monotonic()) * tps - 100, 256, MAX_CALL_TOKENS),
                 deadline=tools_deadline)
         except Exception as error:   # délai réseau, serveur : on conclut avec ce qu'on a
             partial = partial or f"(appel interrompu : {type(error).__name__})"
@@ -456,7 +490,7 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
     try:
         turn = chat_turn(
             client, model_id, history, no_thinking(model, extra),
-            max_tokens=clamp(remaining() * TOKENS_PER_S - 100, 128, 400),
+            max_tokens=clamp(remaining() * tps - 100, 128, conclude_max_tokens(model)),
             deadline=deadline - 3)
         if turn.content.strip():
             return spoken(turn.content)
