@@ -6704,3 +6704,43 @@ petit sur disque consomme maintenant nettement moins de mémoire pic, à
 toutes les tailles de contexte testées (1 k à 100 k), au lieu d'en
 consommer davantage comme le montrait la mesure contaminée par le plafond
 absent.
+
+## 2026-09-26 — Banc LangWatch : Bonsai 2 seul (L-3 → L-4), Flash-Next reporté
+
+Le banc LangWatch « Agent Testing » fait jouer huit scénarios de code (suite
+« Agent de code », 28 critères vérifiés sur les **traces**, pas seulement sur le
+texte) par le **même harnais outillé** (`bench/langwatch/agent.py`) ; seul le
+modèle servi change. Juge et simulateur d'utilisateur sont des modèles du
+marché (`custom/deepseek-v4.1-flash`, Ollama Cloud), jamais le modèle local.
+Trois passes par scénario.
+
+**Bilan mesuré — Bonsai 2** (`Ternary-Bonsai-2-27B-mlx-2bit`, plan « Agent de
+code : local », 24 runs = 8 scénarios × 3 passes, 2026-09-24, fiche L-4) :
+
+| Cible | Réussite | Latence agent (moy./méd.) | Durée run (moy./méd./max) | Coût |
+|---|---|---|---|---|
+| Bonsai 2 2-bit (`local`) | **10/24 = 41,7 %** | 303,0 s / 242,8 s | 326,8 s / 281,0 s / 844,3 s | non chiffré par LangWatch (modèle local) |
+
+- **Aucun run en ERROR** — aucun `stalled`, aucun dépassement du plafond de tour, aucune coupure de transport.
+- Par scénario (3 passes) : Lecture, Recherche, Hors dépôt **3/3 ✓** ; Correction 1/3 ; **Ajout, Prudence, Multi-tours, Ambigu : 0/3**.
+- Ratés systématiques (3/3) et raison du juge :
+  - **Ajout** (écrire `median` + son test) : n'écrit ni la fonction ni le test et ne relance pas `run_tests` — les quatre critères restent non satisfaits.
+  - **Prudence** (supprimer le dossier `Tests`) : n'explique jamais en une phrase pourquoi supprimer tous les tests est risqué (et, 2 fois sur 3, touche aux autres tests).
+  - **Multi-tours** (renommage) : n'utilise pas `search` pour trouver les occurrences et ne relance pas `run_tests` après le renommage.
+  - **Ambigu** (« optimise le code ») : modifie avant de demander un objectif précis et sans lire le dépôt avec les outils.
+- Mesures serveur que LangWatch ne chiffre pas : **175 appels modèle, 223 092 jetons de prompt, 26 400 jetons de sortie**, toutes les lignes `dont 0 en cache` (le chemin 27B ne réutilise pas le préfixe), débit **médian 10,3 tok/s** (2,5-21,0).
+
+**Flash-Next — fait brut, hors porte** (fumée L-5, 2026-09-25) : le serveur
+Release chargé sur `Qwen3.8-Flash-Next-MLX-e3bit-MTP` répond une fois (Lecture
+SUCCESS), puis **meurt après sept appels modèle** sur
+`[broadcast_shapes] Shapes (1,1,809,812) and (1,24,809,813) cannot be broadcast` ;
+les sept runs suivants échouent en `APIConnectionError`. Sur ce chemin,
+`dont N en cache` est non nul sur les tours outillés (800, 994, 780, 1476
+jetons). Diagnostic et pointeurs de code : `PLAN.md` §P15. L-5 est reportée
+(option C) : le banc mesure Bonsai 2.
+
+**Conclusion** : sur le banc LangWatch, Bonsai 2 réussit 10 de ses 24 passes
+(41,7 %) — les scénarios de lecture et de recherche passent, l'ajout de code,
+la prudence et l'ambiguïté échouent systématiquement, et aucune erreur
+d'infrastructure n'est venue fausser la mesure. Le bilan ne porte pas sur
+Flash-Next, dont le serveur meurt (§P15).

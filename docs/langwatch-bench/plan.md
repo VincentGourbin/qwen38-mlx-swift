@@ -664,3 +664,8 @@ framework (`Sources/`), pas du banc.
   demande aucun serveur : ne pas relancer `qwen38 serve`. Arrêter les deux
   agents (`bench-m3max`, `bench-m3max-flashnext`), ils ne servent plus.
 - Commit L-6 puis fin du plan.
+
+## L-6 — Bilan — 2026-09-26 — validée
+- Fait : entrée « 2026-09-26 — Banc LangWatch : Bonsai 2 seul (L-3 → L-4), Flash-Next reporté » dans `docs/knowledge/log.md` : tableau taux de réussite (10/24 = 41,7 %), latence agent (303,0 s / 242,8 s), durée de run (326,8 s / 281,0 s / 844,3 s), coût non chiffré par LangWatch ; scénarios ratés 3/3 (Ajout, Prudence, Multi-tours, Ambigu) avec la raison du juge ; jetons prompt/sortie (223 092 / 26 400), `dont 0 en cache`, débit médian 10,3 tok/s ; plantage Flash-Next comme fait brut renvoyant à `PLAN.md` §P15 ; ligne de conclusion.
+- Porte de sortie observée : l'entrée existe dans `docs/knowledge/log.md` avec le tableau, les ratés 3/3 et leur raison, et la ligne de conclusion.
+- Écart au plan : L-5 reportée (option C, réponse du 2026-09-26) ; le bilan porte sur Bonsai 2 seul. Les deux agents (`bench-m3max`, `bench-m3max-flashnext`) sont arrêtés, le serveur n'est pas relancé. Fin du plan.
