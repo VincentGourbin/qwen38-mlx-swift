@@ -1,3 +1,15 @@
+# Vendor/mlx-swift-lm — historique, plus utilisé depuis le 2026-09-27
+
+Le paquet dépend désormais de `ml-explore/mlx-swift-lm` upstream, branche
+`main` (`Package.swift`). Le fork local décrit ci-dessous n'est plus résolu ;
+le dossier `Vendor/mlx-swift-lm` peut être supprimé. Voir `PLAN.md` §P16.
+
+Attention : le patch versionné ici n'a jamais contenu le filtrage des clés
+`.signs` (Bonsai 2) ajouté plus tard dans `Load.swift` ; il ne suffit pas à
+reconstruire le fork tel qu'il a servi entre le 18 et le 26 septembre.
+
+---
+
 # Vendor/mlx-swift-lm — checkout local
 
 - Base : `ml-explore/mlx-swift-lm`, branche `pr-545`, commit épinglé `1a562aa00bb66d611a086174e14951f41c43e100` (« Require explicit MTP target compatibility »).

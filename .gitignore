@@ -34,8 +34,3 @@ bench/langwatch/.venv/
 bench/langwatch/.env
 bench/langwatch/workspaces/
 bench/langwatch/fixture/.build/
-
-# Sonde Bonsai 2 upstream : fichiers copiés et produits de construction
-Scripts/bonsai2-upstream-probe/.dd/
-Scripts/bonsai2-upstream-probe/Package.resolved
-Scripts/bonsai2-upstream-probe/Sources/Bonsai2Probe/Qwen38*.swift

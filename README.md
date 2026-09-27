@@ -65,19 +65,13 @@ assertions, and refuses the run rather than letting it die halfway.
 git clone https://github.com/VincentGourbin/qwen38-mlx-swift
 cd qwen38-mlx-swift
 
-# One-time: fetch the pinned upstream checkout this package depends on.
-# `Package.swift` resolves `Vendor/mlx-swift-lm` as a local path, and that
-# checkout is not vendored here — only the patch that adapts it.
-git clone https://github.com/ml-explore/mlx-swift-lm.git Vendor/mlx-swift-lm
-git -C Vendor/mlx-swift-lm checkout 1a562aa00bb66d611a086174e14951f41c43e100
-git -C Vendor/mlx-swift-lm apply ../mlx-swift-lm-local.patch
-
 Scripts/build-release.sh
 ```
 
-The pinned commit and the seven patched files are documented in
-[`Vendor/README.md`](Vendor/README.md), including how to check that the
-committed patch still matches a fresh checkout.
+`mlx-swift-lm` is the upstream package (`main` branch, the same one apps using
+LTX or Gemma resolve), so this package can be added to such an app without a
+dependency conflict. The former local fork is described, for history only, in
+[`Vendor/README.md`](Vendor/README.md).
 
 > **Use `Scripts/build-release.sh`, not `swift build`.** MLX inference needs
 > the resource bundle Xcode produces —
@@ -333,9 +327,10 @@ Kept visible on purpose.
 - Vision and conversation caching do not combine with batching: a request
   carrying an image, declaring tools, or hitting a cache always takes the
   single-sequence path.
-- `Vendor/mlx-swift-lm` is a pinned local checkout of an upstream PR carrying
-  Qwen MTP support. `mlx-swift` is pinned to an **exact** version — patch
-  releases have changed APIs before.
+- `mlx-swift-lm` tracks upstream `main` until a tagged release carries the
+  Qwen 3.5 / MTP code; multi-turn MTP continuation on the dense 27B path is
+  not available upstream, each turn re-primes the drafter. `mlx-swift` is
+  pinned to an **exact** version — patch releases have changed APIs before.
 - The bench and probe subcommands are shipped in the binary. That is
   intentional (every published number is reproducible from it), but it makes
   `qwen38 --help` long.
