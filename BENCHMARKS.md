@@ -390,3 +390,42 @@ Réponses identiques au jeton près entre les deux moteurs.
 
 Tests : 237 verts ; parité B-3 greedy 32/32 sur 4/4 invites, logits
 maxAbsErr ≤ 3,9e-5.
+
+### P16 — Banc multi-modèles avec profiler : Bonsai 2, 27B 4/8 bits/bf16, Flash-Next (2026-09-27)
+
+`qwen38 brain bench|replay --trace`, profil `fast`, M3 Max, Release, 128 jetons
+générés, machine au repos (60 s sans calcul lourd avant chaque mesure). Modèles
+standard lus depuis le Lexar : mesures **à chaud** (un passage d'amorçage
+avant, sinon les poids mappés se chargent pendant les premiers jetons).
+« Go/s » = taille des poids × jetons/s, la bande passante que le décodage tire
+effectivement (plafond théorique de la puce : 400 Go/s).
+
+| Modèle | Poids | Préfill 1k · 10k | Décodage 1k · 10k | Go/s tirés (1k) | Pic MLX 10k |
+|---|---:|---:|---:|---:|---:|
+| Bonsai 2, 2 bits + Hadamard | 8,6 Go | 141 · 113 tok/s | 22,0 · 16,3 tok/s | 189 | 12,5 Go |
+| Qwen3.8-27B 4 bits | 16,1 Go | 158 · 139 tok/s | 17,8 · 16,5 tok/s | 286 | 17,4 Go |
+| Qwen3.8-27B 8 bits | 29,5 Go | 144 · 138 tok/s | 9,6 · 9,4 tok/s | 284 | 30,0 Go |
+| Qwen3.8-27B bf16 | 54,7 Go | 146 · 151 tok/s | 5,3 · 5,1 tok/s | 291 | 53,9 Go |
+| Flash-Next 3 bits (MoE) | — | — · 99 tok/s | 18,9 · 7,8 tok/s | — | 69,3 Go |
+
+Profiler, occupation par phase : sur les quatre modèles denses, GPU à 97-100 %
+en préfill comme en décodage, CPU à 5-50 % : tout le temps est dans les noyaux
+GPU. Flash-Next : décodage à GPU 50-77 % et CPU 95-97 %, limité par l'hôte
+(lancements de noyaux) ; sa première requête charge les couches (72 s, GPU 5 %).
+
+Rejeu d'agent (4 tours, 16 024 jetons de prompt cumulés), préfill total :
+
+| Modèle | Réutilisation | Préfill total | Décodage |
+|---|---:|---:|---:|
+| Bonsai 2 | 47 % | 72,7 s | 20-22 tok/s |
+| 27B 4 bits | 47 % | 61,7 s | 17,5-18,2 tok/s |
+| 27B 8 bits | 47 % | 62,8 s | 9-10 tok/s |
+| 27B bf16 | 47 % | 60,0 s | 4,8-5,6 tok/s |
+| Flash-Next (chemin runtime) | 0 % | 206,8 s, dont ≈ 60 s de chargement | 14 tok/s, 2,8 au 4e tour |
+
+Lectures : (1) les formats 4 bits, 8 bits et bf16 tirent tous ≈ 285 Go/s ;
+Bonsai 2 seulement 189 Go/s : son noyau 2 bits + rotation lit mal la mémoire,
+à efficacité égale il décoderait vers 33 tok/s. (2) Le préfill est limité par
+le calcul de déquantification : plus la quantification est forte, plus il est
+lent (bf16 151, 2 bits 113 tok/s à 10k). (3) Flash-Next ne réutilise pas la
+conversation dans `Qwen38Brain` et son décodage est limité par le CPU.

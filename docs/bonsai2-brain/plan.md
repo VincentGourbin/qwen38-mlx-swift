@@ -187,3 +187,18 @@ Gabarits :
 - Trouvé en route : le chemin historique du runtime (`ChatSession`)
   redimensionne toute image en 512×512 par défaut ; le cerveau suit le
   budget du checkpoint et expose `imageResize`.
+
+## K-11 — Banc multi-modèles avec profiler — 2026-09-27 — validée
+- `qwen38 brain … --trace` : phases (chargement, préfill historique, préfill
+  invite, décodage), GPU/CPU/mémoire échantillonnés, trace Chrome, percentiles
+  par jeton, bande passante des poids. Détail : BENCHMARKS.md, section
+  « Banc multi-modèles ».
+- Corrigé en route : `Qwen38Brain.load` lisait les jetons d'arrêt dans le
+  conteneur dense, absent pour Flash-Next (« Aucun modèle Qwen3.8 n'est
+  chargé »).
+- Pistes, par gain attendu : (1) Flash-Next dans le cerveau sans
+  réutilisation de conversation : brancher le cache de conversation Flash du
+  runtime (`generateFlashConversationTurn`) ; (2) décodage Bonsai 2 à 189 Go/s
+  contre 285 pour les autres formats : noyau 2 bits g128 + rotation à étudier
+  (jusqu'à ×1,5) ; (3) Flash-Next limité par l'hôte (CPU 95 %) : compiler le
+  pas de décodage.

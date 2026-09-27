@@ -163,11 +163,15 @@ public actor Qwen38Brain {
         try await runtime.load(
             from: modelDirectory, preloadMTP: false, textOnly: profile.textOnly)
         profile.applyGlobalPolicy()
+        // Stop tokens only matter to the dense engine; Flash-Next's runtime
+        // path has no `ModelContainer` and handles its own stops.
         var stops = Set<Int>()
-        let tokenizerStops = try await runtime.performRaw { _, tokenizer in
-            ["<|im_end|>", "<|endoftext|>"].compactMap { tokenizer.convertTokenToId($0) }
+        if info.family == .qwen35 {
+            let tokenizerStops = try await runtime.performRaw { _, tokenizer in
+                ["<|im_end|>", "<|endoftext|>"].compactMap { tokenizer.convertTokenToId($0) }
+            }
+            stops.formUnion(tokenizerStops)
         }
-        stops.formUnion(tokenizerStops)
         if let data = try? Data(
             contentsOf: modelDirectory.appending(component: "generation_config.json")),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
