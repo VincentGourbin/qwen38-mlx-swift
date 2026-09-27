@@ -429,3 +429,18 @@ Bonsai 2 seulement 189 Go/s : son noyau 2 bits + rotation lit mal la mémoire,
 le calcul de déquantification : plus la quantification est forte, plus il est
 lent (bf16 151, 2 bits 113 tok/s à 10k). (3) Flash-Next ne réutilise pas la
 conversation dans `Qwen38Brain` et son décodage est limité par le CPU.
+
+### P16 — Micro-banc `quantized_matmul` 2/3/4/8 bits aux formes de Bonsai 2 (2026-09-27)
+
+mlx 0.32.0 (Python, `venv-bonsai2`), M3 Max, vecteur `[1, in]` fp16, 300
+appels en lots de 10, après une passe d'échauffement complète (la toute
+première mesure d'un script est faussée par la montée en fréquence du GPU).
+
+| Forme | 2 bits g128 | 2 bits g64 | 2 bits g32 | 4 bits g128 | 8 bits g64 | fp16 |
+|---|---:|---:|---:|---:|---:|---:|
+| 17408×5120 (gate/up) | 110,5 µs | 109,3 µs | 109,3 µs | 161,7 µs | 344,2 µs | 608,8 µs |
+| 5120×17408 (down) | 111,5 µs | 111,4 µs | 111,2 µs | 137,3 µs | 341,2 µs | 633,9 µs |
+| 6144×5120 (qkv) | 53,3 µs | 52,7 µs | 53,0 µs | 51,0 µs | 74,5 µs | 221,0 µs |
+
+Bande passante tirée : 2 bits ≈ 230-250 Go/s, 4 bits ≈ 290-345, fp16 ≈ 285.
+La taille de groupe ne change rien au 2 bits.

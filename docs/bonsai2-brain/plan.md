@@ -202,3 +202,37 @@ Gabarits :
   contre 285 pour les autres formats : noyau 2 bits g128 + rotation à étudier
   (jusqu'à ×1,5) ; (3) Flash-Next limité par l'hôte (CPU 95 %) : compiler le
   pas de décodage.
+
+## K-12 — Les trois pistes d'optimisation évaluées — 2026-09-27 — aucune retenue
+Demande de Vincent : « fais les optimisations une par une en évaluant la
+pertinence à chaque fois ».
+
+1. **Cache de conversation Flash-Next dans le cerveau** (protocole du serveur,
+   frontière de continuation élargie à plusieurs messages ajoutés). Rejeu
+   d'agent A/B/B/A : tour 2 repris (502 jetons, 9,6 s contre 14,2 s) mais
+   **réponse différente (vide)**, tours 3 et 4 ratés. Le cache Flash suppose que
+   les jetons générés égalent le rendu du gabarit du tour assistant ; faux dès
+   que la génération est coupée ou que la réflexion est retirée du rendu. Même
+   famille que §P15. **Défait** (runtime compris : le serveur y aurait été
+   exposé). Correctif propre = instantané d'état à la fin du dernier message,
+   comme le moteur dense : chantier lourd, pour un modèle de 96 Go qui n'est
+   pas candidat pour une app.
+2. **Noyau 2 bits de Bonsai 2.** Micro-banc `quantized_matmul` (mlx 0.32,
+   M3 Max, formes de Bonsai) : 2 bits ≈ 110 µs pour 17408×5120, 4 bits ≈ 160 µs ;
+   le 2 bits tire ≈ 230-250 Go/s contre ≈ 290 pour le 4 bits, soit ≈ 20 % de
+   marge théorique sur les produits matriciels, atteignable seulement avec un
+   noyau Metal écrit à la main. Taille de groupe 128/64/32 : aucun effet
+   (un premier écart 164/111 µs était la montée en fréquence du GPU sur la
+   toute première mesure). Pas de décodage de 46 ms à 1 k : ≈ 32 ms de
+   produits matriciels, ≈ 14 ms d'autre chose (≈ 4 ms sur le 27B 4 bits) ;
+   la rotation Hadamard n'en explique que 1-2 % (K-8). Attribuer ce reste
+   demande une capture GPU ouverte dans Xcode (le profiler ne nomme pas les
+   noyaux MLX). **Non retenu** : gain plafonné vers 15 % du décodage, coût élevé.
+3. **Compiler le pas de décodage de Flash-Next** : déjà mesuré (P7.3,
+   `docs/knowledge/log.md`) : −1,5 à −2,8 % sur GDN en cassant la parité,
+   +14 à +16 % sur QSA, `shapeless` plante. **Non refait.**
+
+Correction d'une affirmation antérieure : « à efficacité égale Bonsai 2
+décoderait vers 33 tok/s » surestimait le gain : l'écart de bande passante
+vient pour ≈ 1/3 des produits matriciels 2 bits et pour ≈ 2/3 d'opérations
+non encore attribuées.
