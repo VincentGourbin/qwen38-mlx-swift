@@ -4766,3 +4766,28 @@ plutôt qu'en mort du processus (le chemin 27B n'a pas ce défaut : 0 ERROR sur
 24 runs). Le chemin Bonsai 2 n'obtient jamais de hit de cache sur les
 requêtes outillées (`dont 0 en cache` sur 175 appels) : à traiter dans le même
 chantier, c'est l'autre face du même mécanisme.
+
+### P16 — Bonsai 2 comme cerveau d'app, sans le fork de mlx-swift-lm — plan du 2026-09-27
+
+**Problème** : chaque tentative d'intégrer ce framework dans une app bute sur
+le fork. Ce paquet dépend de `Vendor/mlx-swift-lm` (PR upstream #545, ouverte,
+plus 194 lignes locales) ; une app qui utilise déjà mlx-swift-lm upstream (LTX,
+Gemma dans Fluxforge Studio) ne peut pas résoudre deux paquets de même
+identité, même pour un seul produit.
+
+**Constat vérifié le 2026-09-27** : Bonsai 2 n'a presque pas besoin du fork.
+Son modèle est le `Qwen35` upstream ; le seul apport du fork est un filtrage de
+6 lignes des clés `.signs`. Une sonde (`Scripts/bonsai2-upstream-probe/`) charge
+et fait répondre Bonsai 2 contre la révision de mlx-swift-lm que résout
+Fluxforge Studio (`604fae710a`) et contre la tête de `main` : chargement 2,8 s,
+réponse correcte, pic 8,85 Go.
+
+**Décision** : un dépôt séparé `bonsai2-swift-mlx` (bibliothèque
+`Bonsai2Brain` + CLI `bonsai2`), aux dépendances alignées sur l'app, avec des
+profils `fast`/`lean` sur le modèle de YuE2, et trois leviers de performance
+mesurés un par un : réutilisation de la conversation (0 jeton réutilisé
+aujourd'hui sur 175 appels d'agent), préfill, décodage. Ce dépôt-ci garde le
+fork pour Flash-Next ; sa propre sortie du fork est notée hors plan.
+
+Plan exécutable : `docs/bonsai2-brain/plan.md` (fiches K-0 à K-9, portes
+mesurées, preuve finale = Fluxforge Studio résout et compile avec le paquet).
