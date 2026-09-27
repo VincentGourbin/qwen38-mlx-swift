@@ -171,3 +171,19 @@ Gabarits :
 ## K-9 — Intégration Fluxforge Studio — 2026-09-27 — validée
 - Porte observée : une seule entrée `mlx-swift-lm` (`ee673d6`) ;
   `** BUILD SUCCEEDED **` de l'app entière ; 776 symboles Qwen38Brain liés.
+
+## K-10 — Images dans le moteur réutilisable — 2026-09-27 — validée
+- Demande de Vincent : lever la limite « une conversation avec image repaie
+  tout le préfill ». Le préfill du moteur dense passe par le `prepare`
+  officiel (tour de vision sur les seules images nouvelles, positions M-RoPE
+  ancrées à l'offset du cache) ; l'état positionnel est gardé avec
+  l'instantané.
+- Porte observée : à redimensionnement égal (512), réponses identiques au
+  runtime sur une image seule, un dialogue de 3 tours, et un dialogue où une
+  2e image arrive au tour 2 ; tour 3 : 32 jetons préremplis au lieu de 463.
+  Budget complet du checkpoint : tour 3 en 0,63 s, 2 573 jetons réutilisés.
+  Agent texte : réponses identiques, réutilisation inchangée. 237 tests
+  verts, parité B-3 4/4.
+- Trouvé en route : le chemin historique du runtime (`ChatSession`)
+  redimensionne toute image en 512×512 par défaut ; le cerveau suit le
+  budget du checkpoint et expose `imageResize`.

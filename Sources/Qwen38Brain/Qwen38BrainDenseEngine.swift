@@ -17,6 +17,9 @@ import Qwen38Core
 final class Qwen38BrainConversationCache: @unchecked Sendable {
     fileprivate var cache: [KVCache]?
     fileprivate var state: LMOutput.State?
+    /// Positional state at the snapshot point: carries the M-RoPE delta that
+    /// earlier images introduced, which every later token is anchored on.
+    fileprivate var snapshotState: LMOutput.State?
     fileprivate var prefixTokens: [Int] = []
     fileprivate var recurrentSnapshot: [(index: Int, arrays: [MLXArray], offset: Int)] = []
     fileprivate var kvBits: Int?
@@ -24,13 +27,20 @@ final class Qwen38BrainConversationCache: @unchecked Sendable {
     func reset() {
         cache = nil
         state = nil
+        snapshotState = nil
         prefixTokens = []
         recurrentSnapshot = []
     }
 }
 
-struct Qwen38BrainDenseRequest: Sendable {
+struct Qwen38BrainDenseRequest {
     let tokens: [Int]
+    /// Pixels of every image in the conversation, in order, as the model's
+    /// processor produced them; `nil` for a text-only conversation.
+    let image: LMInput.ProcessedImage?
+    /// `<|vision_start|>`: one per image, used to find which images a token
+    /// range contains.
+    let visionStartTokenID: Int?
     let maxTokens: Int
     let temperature: Float
     let topP: Float
@@ -82,6 +92,7 @@ enum Qwen38BrainDenseEngine {
             tokens.lastIndex(of: id)
         }
         let snapshotLength = min(lastStart ?? (tokens.count - 1), tokens.count - 1)
+        // (the generation prompt, from the last `<|im_start|>`, is never empty)
 
         var start = 0
         if let cache = conversation.cache, conversation.kvBits == request.kvBits,
@@ -103,6 +114,7 @@ enum Qwen38BrainDenseEngine {
                         layer: index, offset: layer.offset, expected: start)
                 }
             }
+            conversation.state = conversation.snapshotState
         } else {
             conversation.reset()
             var cache = try model.newCache(parameters: nil)
@@ -121,28 +133,59 @@ enum Qwen38BrainDenseEngine {
             conversation.state = output.state ?? conversation.state
             return output
         }
-        func forward(_ slice: ArraySlice<Int>) -> LMOutput {
-            forward(MLXArray(slice.map(Int32.init)).reshaped(1, slice.count))
+
+        // Images whose `<|vision_start|>` falls inside `range`, sliced out of
+        // the conversation's pixels (rows are t·h·w patches per image). Range
+        // bounds are message boundaries, so an image is never split.
+        func images(in range: Range<Int>) -> LMInput.ProcessedImage? {
+            guard let image = request.image, let frames = image.frames,
+                let visionStart = request.visionStartTokenID
+            else { return nil }
+            let before = tokens[..<range.lowerBound].filter { $0 == visionStart }.count
+            let inside = tokens[range].filter { $0 == visionStart }.count
+            guard inside > 0 else { return nil }
+            let rows = frames.map { $0.t * $0.h * $0.w }
+            let firstRow = rows[..<before].reduce(0, +)
+            let rowCount = rows[before ..< before + inside].reduce(0, +)
+            return LMInput.ProcessedImage(
+                pixels: image.pixels[firstRow ..< firstRow + rowCount],
+                frames: Array(frames[before ..< before + inside]))
         }
-        func prefill(_ range: Range<Int>) {
-            var position = range.lowerBound
-            while position < range.upperBound {
-                let end = min(position + request.prefillStepSize, range.upperBound)
-                _ = forward(tokens[position ..< end])
+
+        // The model's own prepare: vision tower on the new images only, M-RoPE
+        // positions anchored at the cache offset, chunked prefill. Returns the
+        // logits of the range's last position.
+        func prefill(_ range: Range<Int>) throws -> MLXArray? {
+            guard !range.isEmpty else { return nil }
+            let text = LMInput.Text(
+                tokens: MLXArray(tokens[range].map(Int32.init)).reshaped(1, range.count))
+            let input = LMInput(text: text, image: images(in: range))
+            switch try model.prepare(
+                input, cache: cache, state: conversation.state,
+                prefill: PrefillParameters(stepSize: request.prefillStepSize))
+            {
+            case .logits(let output):
+                conversation.state = output.state ?? conversation.state
                 eval(cache.flatMap { $0.innerState() })
-                position = end
+                return output.logits
+            case .tokens(let remaining):
+                // Text-only remainder left to the caller (not the Qwen 3.5 path).
+                return forward(remaining.tokens.ndim == 1
+                    ? remaining.tokens.reshaped(1, -1) : remaining.tokens).logits
             }
         }
 
         // 1. history up to the resume point, then snapshot it;
-        // 2. the generation prompt except its last token;
-        // 3. decode from the last prompt token.
-        prefill(start ..< snapshotLength)
+        // 2. the generation prompt, whose last logits give the first token.
+        _ = try prefill(start ..< snapshotLength)
         conversation.prefixTokens = Array(tokens[..<snapshotLength])
+        conversation.snapshotState = conversation.state
         conversation.recurrentSnapshot = cache.enumerated().compactMap { index, layer in
             layer is ArraysCache ? (index, layer.state, layer.offset) : nil
         }
-        prefill(snapshotLength ..< tokens.count - 1)
+        guard let promptLogits = try prefill(snapshotLength ..< tokens.count) else {
+            throw Qwen38BrainDenseEngineError.emptyPrompt
+        }
         let prefillSeconds = Date().timeIntervalSince(started)
 
         let parameters = GenerateParameters(
@@ -160,7 +203,7 @@ enum Qwen38BrainDenseEngine {
         var timeToFirstToken: TimeInterval?
         var hitLength = true
         let decodeStarted = Date()
-        var current = step(MLXArray([Int32(tokens[tokens.count - 1])]))
+        var current = sampler.sample(logits: promptLogits[0..., -1, 0...])
         asyncEval(current)
         while generated < request.maxTokens {
             let next = generated + 1 < request.maxTokens ? step(current) : nil

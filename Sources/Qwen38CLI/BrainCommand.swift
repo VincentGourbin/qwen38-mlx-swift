@@ -1,4 +1,5 @@
 import ArgumentParser
+import CoreGraphics
 import Darwin
 import Foundation
 import Qwen38Brain
@@ -102,6 +103,9 @@ struct BrainAsk: AsyncParsableCommand {
     @Option(name: .long, help: "Image locale à joindre à la question")
     var image: String?
 
+    @Option(name: .long, help: "Redimensionner l'image en N×N (défaut : budget du checkpoint)")
+    var imageResize: Int?
+
     @Option(name: .long, help: "Température, 0 = greedy")
     var temperature: Float = 0
 
@@ -114,7 +118,9 @@ struct BrainAsk: AsyncParsableCommand {
             to: [.init(
                 role: .user, content: prompt,
                 imageURLs: image.map { [URL(fileURLWithPath: $0)] } ?? [])],
-            options: .init(maxTokens: maxTokens, temperature: temperature, enableThinking: thinking))
+            options: .init(
+                maxTokens: maxTokens, temperature: temperature, enableThinking: thinking,
+                imageResize: imageResize.map { CGSize(width: $0, height: $0) }))
         for try await event in stream {
             switch event {
             case .reasoning(let text): FileHandle.standardError.write(Data(text.utf8))
@@ -225,6 +231,8 @@ struct BrainTranscript: Codable {
         var role: String
         var content: String
         var toolCalls: [ToolCall]?
+        /// Local image paths attached to this message.
+        var images: [String]?
     }
     var tools: [String]
     var messages: [Message]
@@ -234,6 +242,7 @@ struct BrainTranscript: Codable {
             Qwen38ChatMessage(
                 role: Qwen38ChatMessage.Role(rawValue: message.role) ?? .user,
                 content: message.content,
+                imageURLs: (message.images ?? []).map { URL(fileURLWithPath: $0) },
                 toolCalls: (message.toolCalls ?? []).map {
                     Qwen38ToolCall(id: $0.id, name: $0.name, argumentsJSON: $0.arguments)
                 })
@@ -328,6 +337,9 @@ struct BrainReplay: AsyncParsableCommand {
     @Option(name: .long, help: "Jetons générés par tour (la suite vient de l'enregistrement)")
     var maxTokens: Int = 16
 
+    @Option(name: .long, help: "Redimensionner les images en N×N (défaut : budget du checkpoint)")
+    var imageResize: Int?
+
     func run() async throws {
         let recorded = try JSONDecoder().decode(
             BrainTranscript.self, from: Data(contentsOf: URL(fileURLWithPath: transcript)))
@@ -341,7 +353,9 @@ struct BrainReplay: AsyncParsableCommand {
         for (index, end) in turns.enumerated() {
             let stream = await brain.respond(
                 to: recorded.chatMessages(upTo: end), tools: tools,
-                options: .init(maxTokens: maxTokens, temperature: 0))
+                options: .init(
+                    maxTokens: maxTokens, temperature: 0,
+                    imageResize: imageResize.map { CGSize(width: $0, height: $0) }))
             var answer = ""
             for try await event in stream {
                 switch event {

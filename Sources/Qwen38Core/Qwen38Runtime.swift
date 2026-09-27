@@ -502,6 +502,19 @@ public actor Qwen38Runtime {
     /// capture raw logits — there is no other way to reach them through the
     /// generation API. Throws `.modelNotLoaded` outside the `.qwen35`
     /// family (`container == nil`, e.g. Flash-Next resident).
+    /// P16 : accès au `ModelContext` complet (processeur multimodal compris),
+    /// pour le moteur de `Qwen38Brain` sur la famille dense.
+    public func performContext<R: Sendable>(
+        _ action: @Sendable (ModelContext) async throws -> sending R
+    ) async throws -> sending R {
+        guard let container else {
+            throw Qwen38RuntimeError.modelNotLoaded
+        }
+        return try await container.perform { context in
+            try await action(context)
+        }
+    }
+
     public func performRaw<R: Sendable>(
         _ action: @Sendable (any LanguageModel, Tokenizer) throws -> sending R
     ) async throws -> sending R {

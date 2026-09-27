@@ -103,6 +103,21 @@ if !calls.isEmpty {
 `argumentsJSON` est typé d'après le schéma (un nombre reste un nombre). Le
 texte d'une réponse outillée ne contient jamais le XML `<tool_call>`.
 
+### Images
+
+Joindre les images au message : `.init(role: .user, content: "Décris.",
+imageURLs: [url])`. Une image déjà vue dans la conversation n'est jamais
+recalculée : seules les images nouvelles passent dans la tour de vision.
+
+Par défaut, chaque image suit le budget du checkpoint, environ 1 270 jetons de
+vision pour une photo : le plus de détail, environ 12 s de préfill sur un M3
+Max. `Qwen38BrainOptions(imageResize: CGSize(width: 512, height: 512))`
+descend à environ 200 jetons, environ 2 s.
+
+Mesure, dialogue de 3 tours avec 2 photos, budget du checkpoint : le 3e tour
+ne préremplit que 32 jetons nouveaux et reprend 2 573 jetons du cache, soit
+0,6 s au lieu d'environ 25 s.
+
 ### Mémoire et cohabitation avec les autres modèles de l'app
 
 - `await brain.memoryReport()` : mémoire active, cache, pic.
@@ -147,10 +162,9 @@ réutilise tout l'historique d'un tour à l'autre ; temps de préfill total
 - Un seul modèle résident par `Qwen38Brain` ; les requêtes sont servies une à
   la fois.
 - `textOnlyVariant()` charge le modèle sans vision : une image est alors refusée.
-- Une requête avec image passe par le chemin historique du runtime, sans
-  réutilisation de conversation.
 - La réutilisation de conversation vaut pour Bonsai 2 et la famille Qwen 3.5
-  dense ; Flash-Next passe par le chemin historique du runtime.
+  dense, images comprises ; Flash-Next passe par le chemin historique du
+  runtime.
 - mlx-swift-lm est suivi sur `main` tant qu'aucune version publiée ne contient
   Qwen 3.5 : noter la révision résolue.
 

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import MLX
 import MLXLMCommon
@@ -43,11 +44,17 @@ public struct Qwen38BrainOptions: Sendable, Equatable {
     public var enableThinking: Bool
     /// `low`, `medium` or `xhigh` — the Qwen template has no `high`.
     public var reasoningEffort: String
+    /// Resize every image to this size before the vision tower. `nil` keeps
+    /// the checkpoint's own pixel budget (≈ 1,280 vision tokens per image for
+    /// Bonsai 2): most detail, longest prefill. 512×512 ≈ 170 tokens.
+    public var imageResize: CGSize?
 
     public init(
         maxTokens: Int = 2048, temperature: Float = 0.7, topP: Float = 0.95, topK: Int = 20,
-        enableThinking: Bool = false, reasoningEffort: String = "low"
+        enableThinking: Bool = false, reasoningEffort: String = "low",
+        imageResize: CGSize? = nil
     ) {
+        self.imageResize = imageResize
         self.maxTokens = maxTokens
         self.temperature = temperature
         self.topP = topP
@@ -115,6 +122,20 @@ public actor Qwen38Brain {
         self.isDense = isDense
         self.stopTokenIDs = stopTokenIDs
         self.prefillStepSize = profile.prefillStepSize
+    }
+
+    /// A chat-template message: the checkpoint's own shape (ordered tool-call
+    /// arguments), with images as `{"type": "image"}` content parts before the
+    /// text, as Qwen's vision template expects.
+    static func templateMessage(_ message: Qwen38ChatMessage) -> [String: any Sendable] {
+        var rendered = Qwen4ExpPromptBuilder.hfMessage(from: message)
+        if !message.imageURLs.isEmpty {
+            let parts: [[String: any Sendable]] =
+                message.imageURLs.map { _ in ["type": "image"] }
+                + [["type": "text", "text": message.content]]
+            rendered["content"] = parts
+        }
+        return rendered
     }
 
     public func setPrefillStepSize(_ value: Int) {
@@ -207,8 +228,9 @@ public actor Qwen38Brain {
                         return finish
                     }
 
-                    if isDense, messages.allSatisfy({ $0.imageURLs.isEmpty }) {
-                        let hfMessages = messages.map(Qwen4ExpPromptBuilder.hfMessage(from:))
+                    if isDense {
+                        let hfMessages = messages.map(Qwen38Brain.templateMessage)
+                        let imageURLs = messages.flatMap(\.imageURLs)
                         let context = Qwen4ExpPromptBuilder.templateContext(
                             thinking: options.enableThinking,
                             reasoningEffort: options.reasoningEffort,
@@ -216,18 +238,38 @@ public actor Qwen38Brain {
                         let toolDictionaries = tools.isEmpty ? nil : tools.map(\.toolSpecDictionary)
                         Memory.peakMemory = 0
                         let chunks = Qwen38BrainChunkBuffer()
-                        let result = try await runtime.performRaw { model, tokenizer in
-                            let tokens = try tokenizer.applyChatTemplate(
-                                messages: hfMessages, tools: toolDictionaries,
-                                additionalContext: context)
+                        let result = try await runtime.performContext { modelContext in
+                            let tokenizer = modelContext.tokenizer
+                            // Same rendering with or without images: our own
+                            // messages (ordered tool arguments); the processor
+                            // only adds image pixels and expands the padding.
+                            let tokens: [Int]
+                            let image: LMInput.ProcessedImage?
+                            if imageURLs.isEmpty {
+                                tokens = try tokenizer.applyChatTemplate(
+                                    messages: hfMessages, tools: toolDictionaries,
+                                    additionalContext: context)
+                                image = nil
+                            } else {
+                                let input = try await modelContext.processor.prepare(
+                                    input: UserInput(
+                                        prompt: .messages(hfMessages),
+                                        images: imageURLs.map(UserInput.Image.url),
+                                        processing: .init(resize: options.imageResize),
+                                        tools: toolDictionaries, additionalContext: context))
+                                tokens = input.text.tokens.asArray(Int.self)
+                                image = input.image
+                            }
                             let request = Qwen38BrainDenseRequest(
-                                tokens: tokens, maxTokens: options.maxTokens,
+                                tokens: tokens, image: image,
+                                visionStartTokenID: tokenizer.convertTokenToId("<|vision_start|>"),
+                                maxTokens: options.maxTokens,
                                 temperature: options.temperature, topP: options.topP,
                                 topK: options.topK, kvBits: profile.kvBits,
                                 prefillStepSize: prefillStepSize, stopTokenIDs: stopTokenIDs,
                                 conversationStartTokenID: tokenizer.convertTokenToId("<|im_start|>"))
                             return try Qwen38BrainDenseEngine.run(
-                                request, model: model, tokenizer: tokenizer,
+                                request, model: modelContext.model, tokenizer: tokenizer,
                                 conversation: conversation
                             ) { piece in
                                 chunks.append(piece)
