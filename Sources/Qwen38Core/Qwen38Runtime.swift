@@ -1,3 +1,5 @@
+import CoreGraphics
+import CoreImage
 import Foundation
 import MLX
 import MLXLMCommon
@@ -65,6 +67,9 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
     /// `Qwen38Runtime`'s prefix/LRU comparisons en pratique, mais reste
     /// comparé ci-dessous par défense en profondeur.
     public var tools: [Qwen38ToolSpec]
+    /// Tokens kept in full precision before the KV cache is quantized to
+    /// `kvBits` (0 = quantized from the first token).
+    public var quantizedKVStart: Int = 5000
 
     public init(
         maxTokens: Int = 256,
@@ -103,7 +108,7 @@ public struct Qwen38GenerationOptions: Sendable, Equatable {
             maxTokens: maxTokens,
             kvBits: kvBits,
             kvGroupSize: 64,
-            quantizedKVStart: 5000,
+            quantizedKVStart: quantizedKVStart,
             temperature: temperature,
             topP: topP,
             topK: topK,
@@ -152,6 +157,8 @@ public struct Qwen38RunMetrics: Sendable {
     /// laisser croire à tort qu'une mesure a été prise avec (ou sans)
     /// ablation.
     public let ablation: String
+    /// P16 : temps entre jetons décodés (moteur dense seulement), en secondes.
+    public let decodeStepDurations: [Double]
 
     public init(
         metrics: LLMMetrics,
@@ -169,8 +176,10 @@ public struct Qwen38RunMetrics: Sendable {
         inputDescription: String = "Texte",
         mtpStatus: Qwen38MTPRunStatus = .init(availability: .unavailable),
         routedExpertCount: Int? = nil,
-        ablation: String = "none"
+        ablation: String = "none",
+        decodeStepDurations: [Double] = []
     ) {
+        self.decodeStepDurations = decodeStepDurations
         self.metrics = metrics
         self.stopReason = stopReason
         self.report = report
@@ -188,6 +197,13 @@ public struct Qwen38RunMetrics: Sendable {
         self.routedExpertCount = routedExpertCount
         self.ablation = ablation
     }
+}
+
+/// Images read before a dense generation starts, carried into the model's
+/// context (read-only; `UserInput.Image` is not `Sendable`).
+final class Qwen38DenseImages: @unchecked Sendable {
+    let images: [UserInput.Image]
+    init(_ images: [UserInput.Image]) { self.images = images }
 }
 
 /// Token-level comparison between the local M2 loop and the upstream M1
@@ -422,6 +438,13 @@ public actor Qwen38Runtime {
     /// (or is lazily seeded with), so a later request can be recognized as a
     /// strict extension and reuse the cache instead of a full replay.
     private var statelessSession: ChatSession?
+    /// P16 : cache du moteur dense à conversation réutilisée
+    /// (`generateDenseConversation`).
+    private let denseConversation = Qwen38DenseConversationCache()
+    /// Tranche de préfill du moteur dense, en jetons (512 mesuré le meilleur
+    /// compromis vitesse/pic mémoire sur Bonsai 2, voir BENCHMARKS.md P16).
+    public var densePrefillStepSize = 512
+    public func setDensePrefillStepSize(_ value: Int) { densePrefillStepSize = max(64, value) }
     private var statelessLedger: [Qwen38ConversationTurn] = []
     private var statelessLedgerKey: Qwen38StatelessCacheKey?
     /// M1's standalone upstream MTP path rebuilds the prompt through
@@ -502,6 +525,126 @@ public actor Qwen38Runtime {
     /// capture raw logits — there is no other way to reach them through the
     /// generation API. Throws `.modelNotLoaded` outside the `.qwen35`
     /// family (`container == nil`, e.g. Flash-Next resident).
+    /// P16 : famille dense (Qwen 3.5, Bonsai 2) — la conversation OpenAI
+    /// complète en entrée, comme `generateStateless`, mais le cache est
+    /// réutilisé d'une requête à l'autre quand la nouvelle conversation
+    /// prolonge la précédente (instantané de l'état GatedDeltaNet à la fin du
+    /// dernier message, rognage du KV des couches d'attention, préfill du seul
+    /// suffixe ; seules les images nouvelles passent la tour de vision). Mêmes
+    /// événements que les autres chemins : `.chunk` au fil de l'eau, puis
+    /// `.metrics`. `imageResize` : `nil` = budget de pixels du checkpoint.
+    public var isDenseConversationAvailable: Bool { container != nil && flashEngine == nil }
+
+    public func generateDenseConversation(
+        messages: [Qwen38ChatMessage], options: Qwen38GenerationOptions,
+        imageResize: CGSize? = nil
+    ) async throws -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+        guard let container, flashEngine == nil else { throw Qwen38RuntimeError.modelNotLoaded }
+        guard !messages.isEmpty else { throw Qwen38RuntimeError.missingUserMessage }
+        let hfMessages = messages.map(Self.denseTemplateMessage)
+        let imageURLs = messages.flatMap(\.imageURLs)
+        // Read the images now: callers such as the server delete their
+        // temporary image files as soon as this method returns.
+        let images: [UserInput.Image] = try imageURLs.map { url in
+            guard let image = CIImage(contentsOf: url) else {
+                throw Qwen38RuntimeError.unreadableImage(url.lastPathComponent)
+            }
+            return .ciImage(image)
+        }
+        let imageBox = Qwen38DenseImages(images)
+        let context = Qwen4ExpPromptBuilder.templateContext(
+            thinking: options.enableThinking, reasoningEffort: options.reasoningEffort,
+            tools: options.tools.isEmpty ? nil : options.tools)
+        let toolDictionaries = options.tools.isEmpty ? nil : options.tools.map(\.toolSpecDictionary)
+        let conversation = denseConversation
+        let prefillStepSize = densePrefillStepSize
+        let parameters = options.parameters
+        let inputDescription = images.isEmpty ? "Texte" : "Texte + image"
+        let hasImages = !images.isEmpty
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    Memory.peakMemory = 0
+                    let started = Date()
+                    let result = try await container.perform { modelContext in
+                        let tokenizer = modelContext.tokenizer
+                        let tokens: [Int]
+                        let image: LMInput.ProcessedImage?
+                        if !hasImages {
+                            tokens = try tokenizer.applyChatTemplate(
+                                messages: hfMessages, tools: toolDictionaries,
+                                additionalContext: context)
+                            image = nil
+                        } else {
+                            let input = try await modelContext.processor.prepare(
+                                input: UserInput(
+                                    prompt: .messages(hfMessages),
+                                    images: imageBox.images,
+                                    processing: .init(resize: imageResize),
+                                    tools: toolDictionaries, additionalContext: context))
+                            tokens = input.text.tokens.asArray(Int.self)
+                            image = input.image
+                        }
+                        var stops = Set(modelContext.configuration.eosTokenIds)
+                        for token in ["<|im_end|>", "<|endoftext|>"] {
+                            if let id = tokenizer.convertTokenToId(token) { stops.insert(id) }
+                        }
+                        let request = Qwen38DenseRequest(
+                            tokens: tokens, image: image,
+                            visionStartTokenID: tokenizer.convertTokenToId("<|vision_start|>"),
+                            maxTokens: parameters.maxTokens ?? 2048,
+                            temperature: parameters.temperature, topP: parameters.topP,
+                            topK: parameters.topK, kvBits: parameters.kvBits,
+                            quantizedKVStart: parameters.quantizedKVStart,
+                            prefillStepSize: prefillStepSize, stopTokenIDs: stops,
+                            conversationStartTokenID: tokenizer.convertTokenToId("<|im_start|>"))
+                        return try Qwen38DenseEngine.run(
+                            request, model: modelContext.model, tokenizer: tokenizer,
+                            conversation: conversation
+                        ) { piece in
+                            continuation.yield(.chunk(piece))
+                            return !Task.isCancelled
+                        }
+                    }
+                    let metrics = LLMMetrics(
+                        prefillTime: result.prefillSeconds,
+                        generationTime: result.decodeSeconds,
+                        promptTokens: result.promptTokens,
+                        generatedTokens: result.completionTokens)
+                    continuation.yield(.metrics(Qwen38RunMetrics(
+                        metrics: metrics,
+                        stopReason: result.hitLength ? .length : .stop,
+                        report: "", chromeTrace: Data(),
+                        activeMemoryBytes: Memory.activeMemory,
+                        peakMemoryBytes: Memory.peakMemory,
+                        timeToFirstToken: result.timeToFirstToken,
+                        cacheReused: result.cachedPromptTokens > 0,
+                        cachedPromptTokens: result.cachedPromptTokens,
+                        inputDescription: inputDescription,
+                        decodeStepDurations: result.stepDurations)))
+                    _ = started
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// A chat-template message: the checkpoint's own shape (ordered tool-call
+    /// arguments), images as `{"type": "image"}` parts before the text.
+    static func denseTemplateMessage(_ message: Qwen38ChatMessage) -> [String: any Sendable] {
+        var rendered = Qwen4ExpPromptBuilder.hfMessage(from: message)
+        if !message.imageURLs.isEmpty {
+            let parts: [[String: any Sendable]] =
+                message.imageURLs.map { _ in ["type": "image"] }
+                + [["type": "text", "text": message.content]]
+            rendered["content"] = parts
+        }
+        return rendered
+    }
+
     /// P16 : accès au `ModelContext` complet (processeur multimodal compris),
     /// pour le moteur de `Qwen38Brain` sur la famille dense.
     public func performContext<R: Sendable>(
@@ -621,6 +764,7 @@ public actor Qwen38Runtime {
     }
 
     public func unload() async {
+        denseConversation.reset()
         chatSession = nil
         container = nil
         mtpDrafter = nil
@@ -640,6 +784,7 @@ public actor Qwen38Runtime {
     /// Clears the conversation history and KV cache while keeping the model
     /// weights resident for clean repeated benchmarks.
     public func resetConversation() {
+        denseConversation.reset()
         if let flashEngine {
             flashEngine.resetConversation()
             conversationTurnCount = 0
@@ -2278,9 +2423,11 @@ public enum Qwen38RuntimeError: LocalizedError, Equatable {
     case missingUserMessage
     case incompatibleMTPDrafter
     case localMTPStreamUnavailable
+    case unreadableImage(String)
 
     public var errorDescription: String? {
         switch self {
+        case .unreadableImage(let name): return "Image illisible : \(name)"
         case .modelNotLoaded: return "Aucun modèle Qwen3.8 n'est chargé."
         case .missingCompletionInfo: return "Le runtime n'a pas reçu les métriques de fin de génération."
         case .missingUserMessage: return "La conversation doit se terminer par un message utilisateur."

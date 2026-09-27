@@ -1,7 +1,6 @@
 import CoreGraphics
 import Foundation
 import MLX
-import MLXLMCommon
 import Qwen38Core
 
 /// What an answer is made of, in stream order: reasoning (when thinking is
@@ -104,42 +103,22 @@ public actor Qwen38Brain {
     public let modelDirectory: URL
     public let profile: Qwen38BrainProfile
     private let runtime: Qwen38Runtime
-    /// Dense hybrid family (Qwen 3.5 / Bonsai 2): answered by
-    /// `Qwen38BrainDenseEngine`, which reuses the conversation cache across
-    /// requests. Flash-Next keeps the runtime's own path.
+    /// Dense hybrid family (Qwen 3.5 / Bonsai 2): answered by the runtime's
+    /// reusable-conversation engine. Flash-Next keeps the runtime's own path.
     private let isDense: Bool
-    private let conversation = Qwen38BrainConversationCache()
-    private let stopTokenIDs: Set<Int>
-    /// Prefill chunk, in tokens; starts at the profile's value. On Bonsai 2 at
-    /// 10k tokens, 512 measured 100 tok/s / 16 GB peak against 88 tok/s /
-    /// 32 GB at 2048 and 94 tok/s / 52 GB at 4096; lean uses 256 (32k:
-    /// 11.3 GB peak, 73 tok/s) — `docs/bonsai2-brain/plan.md`, K-7.
-    public var prefillStepSize: Int
 
     private init(
-        modelDirectory: URL, profile: Qwen38BrainProfile, runtime: Qwen38Runtime,
-        isDense: Bool, stopTokenIDs: Set<Int>
+        modelDirectory: URL, profile: Qwen38BrainProfile, runtime: Qwen38Runtime, isDense: Bool
     ) {
         self.modelDirectory = modelDirectory
         self.profile = profile
         self.runtime = runtime
         self.isDense = isDense
-        self.stopTokenIDs = stopTokenIDs
-        self.prefillStepSize = profile.prefillStepSize
     }
 
-    /// A chat-template message: the checkpoint's own shape (ordered tool-call
-    /// arguments), with images as `{"type": "image"}` content parts before the
-    /// text, as Qwen's vision template expects.
-    static func templateMessage(_ message: Qwen38ChatMessage) -> [String: any Sendable] {
-        var rendered = Qwen4ExpPromptBuilder.hfMessage(from: message)
-        if !message.imageURLs.isEmpty {
-            let parts: [[String: any Sendable]] =
-                message.imageURLs.map { _ in ["type": "image"] }
-                + [["type": "text", "text": message.content]]
-            rendered["content"] = parts
-        }
-        return rendered
+    /// Prefill chunk of the dense engine, in tokens (starts at the profile's).
+    public var prefillStepSize: Int {
+        get async { await runtime.densePrefillStepSize }
     }
 
     static func percentile(_ values: [Double], _ q: Double) -> Double? {
@@ -149,8 +128,8 @@ public actor Qwen38Brain {
         return sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * q))]
     }
 
-    public func setPrefillStepSize(_ value: Int) {
-        prefillStepSize = max(64, value)
+    public func setPrefillStepSize(_ value: Int) async {
+        await runtime.setDensePrefillStepSize(value)
     }
 
     /// Loads the model (Bonsai 2 or any checkpoint `Qwen38ModelValidator`
@@ -163,29 +142,13 @@ public actor Qwen38Brain {
         try await runtime.load(
             from: modelDirectory, preloadMTP: false, textOnly: profile.textOnly)
         profile.applyGlobalPolicy()
-        // Stop tokens only matter to the dense engine; Flash-Next's runtime
-        // path has no `ModelContainer` and handles its own stops.
-        var stops = Set<Int>()
-        if info.family == .qwen35 {
-            let tokenizerStops = try await runtime.performRaw { _, tokenizer in
-                ["<|im_end|>", "<|endoftext|>"].compactMap { tokenizer.convertTokenToId($0) }
-            }
-            stops.formUnion(tokenizerStops)
-        }
-        if let data = try? Data(
-            contentsOf: modelDirectory.appending(component: "generation_config.json")),
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        {
-            if let one = object["eos_token_id"] as? Int { stops.insert(one) }
-            if let many = object["eos_token_id"] as? [Int] { stops.formUnion(many) }
-        }
+        await runtime.setDensePrefillStepSize(profile.prefillStepSize)
         return Qwen38Brain(
             modelDirectory: modelDirectory, profile: profile, runtime: runtime,
-            // `QWEN38_BRAIN_ENGINE=runtime` forces the runtime's own path on
-            // the dense family too — to check the dense engine against it.
+            // `QWEN38_BRAIN_ENGINE=runtime` forces the runtime's historical
+            // path on the dense family too — to check the engine against it.
             isDense: info.family == .qwen35
-                && ProcessInfo.processInfo.environment["QWEN38_BRAIN_ENGINE"] != "runtime",
-            stopTokenIDs: stops)
+                && ProcessInfo.processInfo.environment["QWEN38_BRAIN_ENGINE"] != "runtime")
     }
 
     public func respond(
@@ -195,9 +158,6 @@ public actor Qwen38Brain {
         let runtime = runtime
         let profile = profile
         let isDense = isDense
-        let conversation = conversation
-        let stopTokenIDs = stopTokenIDs
-        let prefillStepSize = prefillStepSize
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -208,135 +168,64 @@ public actor Qwen38Brain {
                     guard !profile.textOnly || messages.allSatisfy({ $0.imageURLs.isEmpty }) else {
                         throw Qwen38BrainError.imagesNeedVision
                     }
-                    // Shared by both engines: reasoning / text / tool calls.
+                    var generation = Qwen38GenerationOptions(
+                        maxTokens: options.maxTokens, temperature: options.temperature,
+                        topP: options.topP, topK: options.topK,
+                        enableThinking: options.enableThinking,
+                        reasoningEffort: options.reasoningEffort, kvBits: profile.kvBits,
+                        tools: tools)
+                    generation.quantizedKVStart = profile.quantizedKVStart
+                    let stream = isDense
+                        ? try await runtime.generateDenseConversation(
+                            messages: messages, options: generation, imageResize: options.imageResize)
+                        : try await runtime.generateStateless(messages: messages, options: generation)
+
                     var parser = Qwen38ThinkingStreamParser(primedInside: options.enableThinking)
                     var splitter = Qwen38ToolCallTextSplitter(enabled: !tools.isEmpty)
                     var fullContent = ""
-                    func absorb(_ chunk: String) {
-                        let output = parser.append(chunk)
-                        if !output.reasoning.isEmpty { continuation.yield(.reasoning(output.reasoning)) }
-                        fullContent += output.content
-                        let visible = splitter.append(output.content)
-                        if !visible.isEmpty { continuation.yield(.text(visible)) }
-                    }
-                    func finish(stoppedByLength: Bool) -> Qwen38BrainUsage.FinishReason {
-                        let tail = parser.finish()
-                        if !tail.reasoning.isEmpty { continuation.yield(.reasoning(tail.reasoning)) }
-                        fullContent += tail.content
-                        let visibleTail = splitter.append(tail.content) + splitter.finish()
-                        if !visibleTail.isEmpty { continuation.yield(.text(visibleTail)) }
-                        var finish: Qwen38BrainUsage.FinishReason = stoppedByLength ? .length : .stop
-                        if !tools.isEmpty {
-                            let parsed = Qwen38ToolCallParser.parse(fullContent)
-                            for call in parsed.calls {
-                                let schema = tools.first(where: { $0.name == call.name })?.parameters
-                                let arguments = Qwen38ToolArgumentTyper.typedArguments(
-                                    call.parameters, schema: schema
-                                ).toJSONString()
-                                let id = "call_" + UUID().uuidString
-                                    .replacingOccurrences(of: "-", with: "").prefix(24)
-                                continuation.yield(.toolCall(
-                                    Qwen38ToolCall(id: id, name: call.name, argumentsJSON: arguments)))
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        switch event {
+                        case .chunk(let chunk):
+                            let output = parser.append(chunk)
+                            if !output.reasoning.isEmpty { continuation.yield(.reasoning(output.reasoning)) }
+                            fullContent += output.content
+                            let visible = splitter.append(output.content)
+                            if !visible.isEmpty { continuation.yield(.text(visible)) }
+                        case .metrics(let metrics):
+                            let tail = parser.finish()
+                            if !tail.reasoning.isEmpty { continuation.yield(.reasoning(tail.reasoning)) }
+                            fullContent += tail.content
+                            let visibleTail = splitter.append(tail.content) + splitter.finish()
+                            if !visibleTail.isEmpty { continuation.yield(.text(visibleTail)) }
+                            var finish: Qwen38BrainUsage.FinishReason =
+                                metrics.stopReason == .length ? .length : .stop
+                            if !tools.isEmpty {
+                                let parsed = Qwen38ToolCallParser.parse(fullContent)
+                                for call in parsed.calls {
+                                    let schema = tools.first(where: { $0.name == call.name })?.parameters
+                                    let arguments = Qwen38ToolArgumentTyper.typedArguments(
+                                        call.parameters, schema: schema
+                                    ).toJSONString()
+                                    let id = "call_" + UUID().uuidString
+                                        .replacingOccurrences(of: "-", with: "").prefix(24)
+                                    continuation.yield(.toolCall(
+                                        Qwen38ToolCall(id: id, name: call.name, argumentsJSON: arguments)))
+                                }
+                                if !parsed.calls.isEmpty, finish != .length { finish = .toolCalls }
                             }
-                            if !parsed.calls.isEmpty, finish != .length { finish = .toolCalls }
-                        }
-                        return finish
-                    }
-
-                    if isDense {
-                        let hfMessages = messages.map(Qwen38Brain.templateMessage)
-                        let imageURLs = messages.flatMap(\.imageURLs)
-                        let context = Qwen4ExpPromptBuilder.templateContext(
-                            thinking: options.enableThinking,
-                            reasoningEffort: options.reasoningEffort,
-                            tools: tools.isEmpty ? nil : tools)
-                        let toolDictionaries = tools.isEmpty ? nil : tools.map(\.toolSpecDictionary)
-                        Memory.peakMemory = 0
-                        let chunks = Qwen38BrainChunkBuffer()
-                        let result = try await runtime.performContext { modelContext in
-                            let tokenizer = modelContext.tokenizer
-                            // Same rendering with or without images: our own
-                            // messages (ordered tool arguments); the processor
-                            // only adds image pixels and expands the padding.
-                            let tokens: [Int]
-                            let image: LMInput.ProcessedImage?
-                            if imageURLs.isEmpty {
-                                tokens = try tokenizer.applyChatTemplate(
-                                    messages: hfMessages, tools: toolDictionaries,
-                                    additionalContext: context)
-                                image = nil
-                            } else {
-                                let input = try await modelContext.processor.prepare(
-                                    input: UserInput(
-                                        prompt: .messages(hfMessages),
-                                        images: imageURLs.map(UserInput.Image.url),
-                                        processing: .init(resize: options.imageResize),
-                                        tools: toolDictionaries, additionalContext: context))
-                                tokens = input.text.tokens.asArray(Int.self)
-                                image = input.image
-                            }
-                            let request = Qwen38BrainDenseRequest(
-                                tokens: tokens, image: image,
-                                visionStartTokenID: tokenizer.convertTokenToId("<|vision_start|>"),
-                                maxTokens: options.maxTokens,
-                                temperature: options.temperature, topP: options.topP,
-                                topK: options.topK, kvBits: profile.kvBits,
-                                prefillStepSize: prefillStepSize, stopTokenIDs: stopTokenIDs,
-                                conversationStartTokenID: tokenizer.convertTokenToId("<|im_start|>"))
-                            return try Qwen38BrainDenseEngine.run(
-                                request, model: modelContext.model, tokenizer: tokenizer,
-                                conversation: conversation
-                            ) { piece in
-                                chunks.append(piece)
-                                return !Task.isCancelled
-                            }
-                        }
-                        // `perform` runs synchronously; replay its text in order.
-                        for piece in chunks.drain() { absorb(piece) }
-                        let finishReason = finish(stoppedByLength: result.hitLength)
-                        continuation.yield(.done(Qwen38BrainUsage(
-                            promptTokens: result.promptTokens,
-                            cachedPromptTokens: result.cachedPromptTokens,
-                            completionTokens: result.completionTokens,
-                            promptTokensPerSecond: result.prefillSeconds > 0
-                                ? Double(result.promptTokens) / result.prefillSeconds : 0,
-                            prefillSeconds: result.prefillSeconds,
-                            tokensPerSecond: result.decodeSeconds > 0
-                                ? Double(result.completionTokens) / result.decodeSeconds : 0,
-                            timeToFirstToken: result.timeToFirstToken,
-                            peakMemoryBytes: Memory.peakMemory,
-                            stepMedian: Qwen38Brain.percentile(result.stepDurations, 0.5),
-                            stepP90: Qwen38Brain.percentile(result.stepDurations, 0.9),
-                            finishReason: finishReason)))
-                    } else {
-                        let generation = Qwen38GenerationOptions(
-                            maxTokens: options.maxTokens, temperature: options.temperature,
-                            topP: options.topP, topK: options.topK,
-                            enableThinking: options.enableThinking,
-                            reasoningEffort: options.reasoningEffort, kvBits: profile.kvBits,
-                            tools: tools)
-                        let stream = try await runtime.generateStateless(
-                            messages: messages, options: generation)
-                        for try await event in stream {
-                            try Task.checkCancellation()
-                            switch event {
-                            case .chunk(let chunk):
-                                absorb(chunk)
-                            case .metrics(let metrics):
-                                let finishReason = finish(
-                                    stoppedByLength: metrics.stopReason == .length)
-                                continuation.yield(.done(Qwen38BrainUsage(
-                                    promptTokens: metrics.metrics.promptTokens,
-                                    cachedPromptTokens: metrics.cachedPromptTokens,
-                                    completionTokens: metrics.metrics.generatedTokens,
-                                    promptTokensPerSecond: metrics.metrics.prefillTokensPerSecond,
-                                    prefillSeconds: metrics.metrics.prefillTime,
-                                    tokensPerSecond: metrics.metrics.generationTokensPerSecond,
-                                    timeToFirstToken: metrics.timeToFirstToken,
-                                    peakMemoryBytes: metrics.peakMemoryBytes,
-                                    stepMedian: nil, stepP90: nil,
-                                    finishReason: finishReason)))
-                            }
+                            continuation.yield(.done(Qwen38BrainUsage(
+                                promptTokens: metrics.metrics.promptTokens,
+                                cachedPromptTokens: metrics.cachedPromptTokens,
+                                completionTokens: metrics.metrics.generatedTokens,
+                                promptTokensPerSecond: metrics.metrics.prefillTokensPerSecond,
+                                prefillSeconds: metrics.metrics.prefillTime,
+                                tokensPerSecond: metrics.metrics.generationTokensPerSecond,
+                                timeToFirstToken: metrics.timeToFirstToken,
+                                peakMemoryBytes: metrics.peakMemoryBytes,
+                                stepMedian: Qwen38Brain.percentile(metrics.decodeStepDurations, 0.5),
+                                stepP90: Qwen38Brain.percentile(metrics.decodeStepDurations, 0.9),
+                                finishReason: finish)))
                         }
                     }
                     if profile.clearCacheAfterAnswer { Memory.clearCache() }
@@ -352,7 +241,6 @@ public actor Qwen38Brain {
 
     /// Forgets the cached conversation; the next answer prefills from scratch.
     public func resetConversation() async {
-        conversation.reset()
         await runtime.resetConversation()
     }
 
@@ -365,27 +253,6 @@ public actor Qwen38Brain {
 
     public func unload() async {
         await runtime.unload()
-    }
-}
-
-/// Text pieces produced inside `ModelContainer.perform` (synchronous), handed
-/// back to the async side in order.
-final class Qwen38BrainChunkBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pieces: [String] = []
-
-    func append(_ piece: String) {
-        lock.lock()
-        pieces.append(piece)
-        lock.unlock()
-    }
-
-    func drain() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        let result = pieces
-        pieces = []
-        return result
     }
 }
 

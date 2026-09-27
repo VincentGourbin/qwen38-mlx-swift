@@ -2,7 +2,6 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXProfiler
-import Qwen38Core
 
 /// Conversation cache for the dense hybrid family (Qwen 3.5 / Bonsai 2):
 /// 16 full-attention layers whose KV can be trimmed, and 48 GatedDeltaNet
@@ -15,7 +14,7 @@ import Qwen38Core
 /// (reasoning dropped, tool calls re-serialised), so what the model generated
 /// is not a reliable prefix of the next request; the history up to the last
 /// `<|im_end|>` is.
-final class Qwen38BrainConversationCache: @unchecked Sendable {
+final class Qwen38DenseConversationCache: @unchecked Sendable {
     fileprivate var cache: [KVCache]?
     fileprivate var state: LMOutput.State?
     /// Positional state at the snapshot point: carries the M-RoPE delta that
@@ -34,7 +33,7 @@ final class Qwen38BrainConversationCache: @unchecked Sendable {
     }
 }
 
-struct Qwen38BrainDenseRequest {
+struct Qwen38DenseRequest {
     let tokens: [Int]
     /// Pixels of every image in the conversation, in order, as the model's
     /// processor produced them; `nil` for a text-only conversation.
@@ -47,12 +46,15 @@ struct Qwen38BrainDenseRequest {
     let topP: Float
     let topK: Int
     let kvBits: Int?
+    /// Tokens kept in full precision before the KV cache is quantized to
+    /// `kvBits` (the runtime's `GenerateParameters.quantizedKVStart`).
+    let quantizedKVStart: Int
     let prefillStepSize: Int
     let stopTokenIDs: Set<Int>
     let conversationStartTokenID: Int?
 }
 
-struct Qwen38BrainDenseResult: Sendable {
+struct Qwen38DenseResult: Sendable {
     let promptTokens: Int
     let cachedPromptTokens: Int
     let completionTokens: Int
@@ -64,7 +66,7 @@ struct Qwen38BrainDenseResult: Sendable {
     let stepDurations: [Double]
 }
 
-enum Qwen38BrainDenseEngineError: LocalizedError {
+enum Qwen38DenseEngineError: LocalizedError {
     case emptyPrompt
     case cacheOffsetMismatch(layer: Int, offset: Int, expected: Int)
 
@@ -77,16 +79,16 @@ enum Qwen38BrainDenseEngineError: LocalizedError {
     }
 }
 
-enum Qwen38BrainDenseEngine {
+enum Qwen38DenseEngine {
     /// Runs one answer synchronously (inside `ModelContainer.perform`),
     /// reusing `conversation` when possible. `emit` receives decoded text
     /// pieces; returning `false` stops generation (cancellation).
     static func run(
-        _ request: Qwen38BrainDenseRequest, model: any LanguageModel, tokenizer: any Tokenizer,
-        conversation: Qwen38BrainConversationCache, emit: (String) -> Bool
-    ) throws -> Qwen38BrainDenseResult {
+        _ request: Qwen38DenseRequest, model: any LanguageModel, tokenizer: any Tokenizer,
+        conversation: Qwen38DenseConversationCache, emit: (String) -> Bool
+    ) throws -> Qwen38DenseResult {
         let tokens = request.tokens
-        guard !tokens.isEmpty else { throw Qwen38BrainDenseEngineError.emptyPrompt }
+        guard !tokens.isEmpty else { throw Qwen38DenseEngineError.emptyPrompt }
         let started = Date()
         // Phases land in the active profiling session, if any (`qwen38 brain
         // … --trace`); a disabled profiler makes these calls no-ops.
@@ -116,23 +118,27 @@ enum Qwen38BrainDenseEngine {
                 if layer.offset > start { layer.trim(layer.offset - start) }
                 guard layer.offset == start else {
                     conversation.reset()
-                    throw Qwen38BrainDenseEngineError.cacheOffsetMismatch(
+                    throw Qwen38DenseEngineError.cacheOffsetMismatch(
                         layer: index, offset: layer.offset, expected: start)
                 }
             }
             conversation.state = conversation.snapshotState
         } else {
             conversation.reset()
-            var cache = try model.newCache(parameters: nil)
-            if let bits = request.kvBits {
-                cache = cache.map { layer in
-                    layer is ArraysCache ? layer : QuantizedKVCache(groupSize: 64, bits: bits)
-                }
-            }
-            conversation.cache = cache
+            conversation.cache = try model.newCache(parameters: nil)
             conversation.kvBits = request.kvBits
         }
-        let cache = conversation.cache!
+        // Same rule as the runtime's iterator: full precision until
+        // `quantizedKVStart` tokens, then `kvBits` (the quantized layers
+        // replace the plain ones in place, trimming still works).
+        func quantizeIfDue() {
+            guard request.kvBits != nil, var layers = conversation.cache else { return }
+            maybeQuantizeKVCache(
+                cache: &layers, kvBits: request.kvBits, kvGroupSize: 64,
+                quantizedKVStart: request.quantizedKVStart)
+            conversation.cache = layers
+        }
+        var cache: [KVCache] { conversation.cache! }
 
         func forward(_ input: MLXArray) -> LMOutput {
             let output = model(LMInput.Text(tokens: input), cache: cache, state: conversation.state)
@@ -173,6 +179,7 @@ enum Qwen38BrainDenseEngine {
             case .logits(let output):
                 conversation.state = output.state ?? conversation.state
                 eval(cache.flatMap { $0.innerState() })
+                quantizeIfDue()
                 return output.logits
             case .tokens(let remaining):
                 // Text-only remainder left to the caller (not the Qwen 3.5 path).
@@ -195,7 +202,7 @@ enum Qwen38BrainDenseEngine {
         let promptLogitsOrNil = try prefill(snapshotLength ..< tokens.count)
         session?.endPhase("Préfill invite", category: .prefill)
         guard let promptLogits = promptLogitsOrNil else {
-            throw Qwen38BrainDenseEngineError.emptyPrompt
+            throw Qwen38DenseEngineError.emptyPrompt
         }
         let prefillSeconds = Date().timeIntervalSince(started)
 
@@ -206,6 +213,7 @@ enum Qwen38BrainDenseEngine {
         // current token is read back, so the GPU never waits on the host.
         func step(_ token: MLXArray) -> MLXArray {
             let output = forward(token.reshaped(1, 1))
+            quantizeIfDue()
             return sampler.sample(logits: output.logits[0..., -1, 0...])
         }
 
@@ -242,7 +250,7 @@ enum Qwen38BrainDenseEngine {
                 }
             }
         }
-        return Qwen38BrainDenseResult(
+        return Qwen38DenseResult(
             promptTokens: tokens.count - start, cachedPromptTokens: start,
             completionTokens: generated, prefillSeconds: prefillSeconds,
             decodeSeconds: Date().timeIntervalSince(decodeStarted),

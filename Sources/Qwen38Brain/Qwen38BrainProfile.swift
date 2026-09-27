@@ -15,6 +15,8 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
     public let kind: Kind
     /// KV-cache quantization for the full-attention layers (`nil` = fp16).
     public let kvBits: Int?
+    /// Tokens kept in full precision before `kvBits` applies.
+    public var quantizedKVStart: Int { kvBits == nil ? 5000 : 0 }
     /// `Memory.cacheLimit` in MB, or `nil` to size it from available memory.
     public let cacheLimitMB: Int?
     /// `Memory.memoryLimit` in MB (mlx's cache-GC threshold, not a hard cap),

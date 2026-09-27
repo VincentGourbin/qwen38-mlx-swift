@@ -999,6 +999,14 @@ public actor Qwen38InferenceServer {
     ) async throws -> (
         stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, usedPersistentCache: Bool
     ) {
+        // P16 : famille dense (Bonsai 2, Qwen 3.5) — le moteur à conversation
+        // réutilisée de `Qwen38Brain`, le même que l'app embarque : la
+        // conversation complète à chaque requête, le cache repris quand elle
+        // prolonge la précédente (y compris un tour qui finit par des
+        // résultats d'outils). Le MTP explicite garde son chemin historique.
+        if !options.mtp.enabled, await runtime.isDenseConversationAvailable {
+            return (try await runtime.generateDenseConversation(messages: messages, options: options), true)
+        }
         guard usePersistentCache, let last = messages.last else {
             return (try await runtime.generateStateless(messages: messages, options: options), false)
         }
