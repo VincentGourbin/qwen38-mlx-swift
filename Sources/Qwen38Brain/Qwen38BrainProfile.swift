@@ -23,13 +23,18 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
     /// Free cached (not active) buffers after every answer.
     public let clearCacheAfterAnswer: Bool
     /// Skip the vision tower (Bonsai 2: −0.92 GB); images are then refused.
+    /// Off in both named profiles; set it only for an app that never sends
+    /// images.
     public let textOnly: Bool
+    /// Prefill chunk in tokens: smaller chunks lower the transient peak
+    /// (attention scores are materialised per chunk with a quantized KV).
+    public let prefillStepSize: Int
 
     public var id: String { kind.rawValue }
 
     public init(
         kind: Kind, kvBits: Int?, cacheLimitMB: Int?, memoryLimitMB: Int?,
-        clearCacheAfterAnswer: Bool, textOnly: Bool
+        clearCacheAfterAnswer: Bool, textOnly: Bool = false, prefillStepSize: Int = 512
     ) {
         self.kind = kind
         self.kvBits = kvBits
@@ -37,14 +42,15 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
         self.memoryLimitMB = memoryLimitMB
         self.clearCacheAfterAnswer = clearCacheAfterAnswer
         self.textOnly = textOnly
+        self.prefillStepSize = prefillStepSize
     }
 
     /// Everything resident, fp16 KV, a Mac-sized buffer cache.
     public static let fast = Qwen38BrainProfile(
         kind: .fast, kvBits: nil, cacheLimitMB: 4096, memoryLimitMB: nil,
-        clearCacheAfterAnswer: false, textOnly: false)
+        clearCacheAfterAnswer: false, textOnly: false, prefillStepSize: 512)
 
-    /// Text only, 8-bit KV, a small buffer cache and a GC threshold sized from what the
+    /// 8-bit KV, 256-token prefill chunks, a small buffer cache and a GC threshold sized from what the
     /// machine actually has, cache cleared between answers.
     public static var lean: Qwen38BrainProfile {
         let available = availableMemoryMB()
@@ -52,7 +58,7 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
             kind: .lean, kvBits: 8,
             cacheLimitMB: min(1024, max(256, available / 6)),
             memoryLimitMB: max(4096, available - 2048),
-            clearCacheAfterAnswer: true, textOnly: true)
+            clearCacheAfterAnswer: true, textOnly: false, prefillStepSize: 256)
     }
 
     public static func named(_ id: String) -> Qwen38BrainProfile? {
@@ -61,6 +67,14 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
         case "lean": return .lean
         default: return nil
         }
+    }
+
+    /// The same profile without the vision tower.
+    public func textOnlyVariant() -> Qwen38BrainProfile {
+        Qwen38BrainProfile(
+            kind: kind, kvBits: kvBits, cacheLimitMB: cacheLimitMB, memoryLimitMB: memoryLimitMB,
+            clearCacheAfterAnswer: clearCacheAfterAnswer, textOnly: true,
+            prefillStepSize: prefillStepSize)
     }
 
     /// Process-wide knobs. Call after the model is loaded: the runtime sets

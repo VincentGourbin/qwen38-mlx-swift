@@ -12,8 +12,8 @@
 - La bibliothèque à importer est **`Qwen38Brain`** : un acteur qui charge le
   modèle, prend une conversation au format OpenAI et rend un flux
   d'événements typés (réflexion, texte, appels d'outils, usage).
-- Deux profils, `fast` et `lean`, à la manière de YuE2 ; `lean` vise un Mac
-  16 Go.
+- Deux profils, `fast` et `lean`, à la manière de YuE2 ; `lean` tient dans
+  environ 12 Go jusqu'à 32 000 jetons de contexte, vision comprise.
 - Le modèle conseillé est **Bonsai 2** (`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`,
   8,6 Go sur disque) : un Qwen3.8-27B ternaire, 2 bits, contexte 262 k.
 
@@ -116,13 +116,39 @@ texte d'une réponse outillée ne contient jamais le XML `<tool_call>`.
 
 ## Profils mesurés
 
-(Remplis par K-5 ; voir `BENCHMARKS.md` pour les lignes brutes.)
+M3 Max, Release, 2026-09-27 ; lignes brutes et conditions dans `BENCHMARKS.md`
+(section P16). Le Mac 16 Go est simulé par `QWEN38_BRAIN_AVAILABLE_MB=16384`.
+
+| Profil | Contexte | Préfill | Décodage | Pic mémoire MLX |
+|---|---:|---:|---:|---:|
+| `lean` | 1 k | 119 tok/s | 17,8 tok/s | 10,0 Go |
+| `lean` | 10 k | 119 tok/s | 17,6 tok/s | 10,4 Go |
+| `lean` | 32 k | 70 tok/s | 8,3 tok/s | 12,2 Go |
+| `fast` | 1 k | 97 tok/s | 13,8 tok/s | 10,8 Go |
+| `fast` | 10 k | 108 tok/s | 14,5 tok/s | 12,6 Go |
+| `fast` | 32 k | 71 tok/s | 9,2 tok/s | 16,1 Go |
+
+Les débits entre les deux profils ne sont pas directement comparables (la
+machine dérive d'une passe à l'autre) ; les pics mémoire le sont.
+
+- **`lean`** : cache KV 8 bits, tranches de préfill de 256, limites mémoire
+  calculées depuis la mémoire disponible, cache MLX vidé après chaque
+  réponse. Vision chargée. Pour une app qui n'envoie jamais d'image,
+  `Qwen38BrainProfile.lean.textOnlyVariant()` retire la tour de vision
+  (−0,9 Go) et refuse alors les images.
+- **`fast`** : cache KV fp16, tranches de 512, cache MLX de 4 Go.
+
+**Boucle d'agent** (4 tours, 16 000 jetons de prompt cumulés) : le cerveau
+réutilise tout l'historique d'un tour à l'autre ; temps de préfill total
+78-83 s contre 138-148 s sans réutilisation, 4e tour 30-33 s contre 76 s.
 
 ## Limites connues
 
 - Un seul modèle résident par `Qwen38Brain` ; les requêtes sont servies une à
   la fois.
-- `lean` charge le modèle sans vision : une image est refusée.
+- `textOnlyVariant()` charge le modèle sans vision : une image est alors refusée.
+- Une requête avec image passe par le chemin historique du runtime, sans
+  réutilisation de conversation.
 - La réutilisation de conversation vaut pour Bonsai 2 et la famille Qwen 3.5
   dense ; Flash-Next passe par le chemin historique du runtime.
 - mlx-swift-lm est suivi sur `main` tant qu'aucune version publiée ne contient

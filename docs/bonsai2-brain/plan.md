@@ -151,14 +151,22 @@ Gabarits :
   84 et 96 s contre 145 et 253 s (A/B/B/A). Conditions de machine
   dégradées (voir K-7), les ratios restent valables.
 
-## K-7/K-8 — Mesures de débit — 2026-09-27 — en attente
-- Constat : la machine ralentit d'une passe à l'autre indépendamment du code
-  (fork : 102 puis 61 tok/s de préfill à 10 k en A/B/B/A). Un processus
-  WebKit (≈ 110 % CPU depuis 2,5 jours) garde le GPU vers 60 %. Mesures
-  reprises quand il sera fermé ; `campaign.sh` attend désormais 60 s de GPU
-  < 75 % sans calcul lourd.
-- Rotations Hadamard partagées : 402 → 257 par passe, greedy inchangé ;
-  gain de débit non mesuré proprement à ce jour.
+## K-4/K-5/K-7/K-8 — Mesures — 2026-09-27 — validées (détail : BENCHMARKS.md, P16)
+- Conditions : la machine dérive d'une passe à l'autre (fork 102 puis 61
+  tok/s) ; campagne gardée par 60 s sans calcul lourd, comparaisons en
+  A/B/B/A uniquement.
+- A : fork contre upstream, aucun écart attribuable à la dépendance.
+- K-7 : tranche 512 = 100 tok/s / 16 Go contre 88 tok/s / 32 Go (2048) et
+  94 tok/s / 52 Go (4096) ; lean à 256 (32 k : 11,3 Go au lieu de 13,7 Go).
+- K-8 : rotation Hadamard 1-2 % du décodage sur machine saine ; partage des
+  rotations sans gain mesurable et +7,5 Go de pic : retiré.
+- K-5 : Vincent veut la vision dans lean (« il faudra quand même charger les
+  couches images ») ; sans vision devient `textOnlyVariant()`. Porte : lean
+  pic 10,0 / 10,4 / 12,2 Go à 1 k / 10 k / 32 k (objectif 12 Go tenu à
+  0,2 Go près à 32 k) ; image décrite correctement en lean ; parité B-3
+  4/4 ; 237 tests verts.
+- F : rejeu d'agent, préfill total 78-83 s (dense) contre 138-148 s
+  (runtime), réponses identiques.
 
 ## K-9 — Intégration Fluxforge Studio — 2026-09-27 — validée
 - Porte observée : une seule entrée `mlx-swift-lm` (`ee673d6`) ;

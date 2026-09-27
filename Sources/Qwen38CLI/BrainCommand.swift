@@ -24,10 +24,14 @@ struct BrainCommonOptions: ParsableArguments {
     @Option(name: .long, help: "Tranche de préfill en jetons (moteur dense)")
     var prefillStep: Int?
 
+    @Flag(name: .long, help: "Charger le modèle sans tour de vision")
+    var textOnly = false
+
     func loadBrain() async throws -> Qwen38Brain {
-        guard let profile = Qwen38BrainProfile.named(profile) else {
+        guard var profile = Qwen38BrainProfile.named(profile) else {
             throw ValidationError("profil inconnu : \(self.profile) (fast ou lean)")
         }
+        if textOnly { profile = profile.textOnlyVariant() }
         let started = Date()
         let brain = try await Qwen38Brain.load(
             modelDirectory: URL(fileURLWithPath: modelPath, isDirectory: true), profile: profile)
@@ -95,6 +99,9 @@ struct BrainAsk: AsyncParsableCommand {
     @Flag(name: .long, help: "Activer la réflexion")
     var thinking = false
 
+    @Option(name: .long, help: "Image locale à joindre à la question")
+    var image: String?
+
     @Option(name: .long, help: "Température, 0 = greedy")
     var temperature: Float = 0
 
@@ -104,7 +111,9 @@ struct BrainAsk: AsyncParsableCommand {
     func run() async throws {
         let brain = try await common.loadBrain()
         let stream = await brain.respond(
-            to: [.init(role: .user, content: prompt)],
+            to: [.init(
+                role: .user, content: prompt,
+                imageURLs: image.map { [URL(fileURLWithPath: $0)] } ?? [])],
             options: .init(maxTokens: maxTokens, temperature: temperature, enableThinking: thinking))
         for try await event in stream {
             switch event {

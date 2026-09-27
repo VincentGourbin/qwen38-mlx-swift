@@ -323,3 +323,70 @@ chemin. Parité bit-exacte confirmée avant/après (`flash-ngram-parity`).
 | `QWEN38_DTYPE_AUDIT` texte/image | 0 ligne signalée dans les deux cas |
 | H6 (texte) | PASS (H6.1, H6.2a-d, H6.4-t1/t2) |
 | `Scripts/run-tests.sh` | 89 tests verts |
+
+### P16 — Bonsai 2 sur mlx-swift-lm upstream, cerveau `Qwen38Brain` (2026-09-27)
+
+M3 Max 96 Go, Release, `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`, mlx-swift-lm
+`main` @`ee673d6`, greedy. Mesures par `qwen38 brain bench|replay` et
+`qwen38 generate`, prompts `docs/bonsai2-brain/prompts/` (calibrés au
+tokenizer du pack). Chaque série est en A/B/B/A avec au moins 60 s de pause.
+**La machine dérive d'une passe à l'autre** (le même binaire du fork a donné
+102 puis 61 tok/s de préfill) : seules les comparaisons dans une même série
+sont fiables, pas les valeurs absolues entre séries.
+
+**Fork contre upstream**, `qwen38 generate`, 10 k jetons :
+
+| Passe | Binaire | Préfill | Décodage |
+|---|---|---:|---:|
+| 1 | fork (PR #545) | 102 tok/s | 14,0 tok/s |
+| 2 | upstream `main` | 57 tok/s | 10,5 tok/s |
+| 3 | upstream `main` | 63 tok/s | 8,4 tok/s |
+| 4 | fork (PR #545) | 61 tok/s | 5,1 tok/s |
+
+Pas d'écart attribuable à la dépendance : le fork chute autant que upstream.
+
+**Tranche de préfill**, moteur dense, 10 k jetons (512/2048/4096/4096/2048/512) :
+
+| Tranche | Préfill (2 passes) | Pic MLX |
+|---:|---:|---:|
+| 512 | 104,2 · 96,7 tok/s | 16,1 Go |
+| 2048 | 89,0 · 86,6 tok/s | 31,6 Go |
+| 4096 | 92,2 · 95,3 tok/s | 52,5 Go |
+
+Retenu : 512 (profil fast), 256 pour lean (32 k : 11,3 Go, 73 tok/s, contre
+13,7 Go, 64 tok/s à 512).
+
+**Rotation Hadamard**, décodage 256 jetons sur 1 k (memo0/memo1/skip/skip/memo1/memo0) :
+
+| Variante | 1re moitié | 2e moitié |
+|---|---:|---:|
+| sans partage | 15,0 tok/s | 21,5 tok/s |
+| partage des rotations (402 → 257) | 17,1 tok/s | 21,3 tok/s |
+| sans rotation (sorties fausses, plafond) | 20,4 tok/s | 21,8 tok/s |
+
+Sur machine saine la rotation coûte 1 à 2 % ; le partage n'apporte rien et
+retenait 7,5 Go : retiré.
+
+**Rejeu d'agent**, `transcripts/agent-scripts.json`, 4 tours, 16 024 jetons de
+prompt au total (runtime/dense/dense/runtime) :
+
+| Moteur | Réutilisés | Préfill total | Tour 4 |
+|---|---:|---:|---:|
+| runtime | 0 % | 147,7 s · 138,1 s | 76,4 s · 75,7 s |
+| dense (conversation réutilisée) | 47 % | 82,7 s · 78,0 s | 32,6 s · 30,4 s |
+
+Réponses identiques au jeton près entre les deux moteurs.
+
+**Profils** après corrections (tranche par profil, sans partage), 128 jetons générés :
+
+| Profil | Contexte | Préfill | Décodage | Pic MLX | Empreinte |
+|---|---:|---:|---:|---:|---:|
+| lean (vision chargée, KV 8 bits, 16 Go simulés) | 1 k | 119 tok/s | 17,8 tok/s | 10,0 Go | 9,9 Go |
+| lean | 10 k | 119 tok/s | 17,6 tok/s | 10,4 Go | 10,3 Go |
+| lean | 32 k | 70 tok/s | 8,3 tok/s | 12,2 Go | 11,0 Go |
+| fast (KV fp16) | 1 k | 97 tok/s | 13,8 tok/s | 10,8 Go | 13,1 Go |
+| fast | 10 k | 108 tok/s | 14,5 tok/s | 12,6 Go | 14,2 Go |
+| fast | 32 k | 71 tok/s | 9,2 tok/s | 16,1 Go | 16,9 Go |
+
+Tests : 237 verts ; parité B-3 greedy 32/32 sur 4/4 invites, logits
+maxAbsErr ≤ 3,9e-5.
