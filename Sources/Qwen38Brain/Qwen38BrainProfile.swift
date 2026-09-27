@@ -22,26 +22,29 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
     public let memoryLimitMB: Int?
     /// Free cached (not active) buffers after every answer.
     public let clearCacheAfterAnswer: Bool
+    /// Skip the vision tower (Bonsai 2: −0.92 GB); images are then refused.
+    public let textOnly: Bool
 
     public var id: String { kind.rawValue }
 
     public init(
         kind: Kind, kvBits: Int?, cacheLimitMB: Int?, memoryLimitMB: Int?,
-        clearCacheAfterAnswer: Bool
+        clearCacheAfterAnswer: Bool, textOnly: Bool
     ) {
         self.kind = kind
         self.kvBits = kvBits
         self.cacheLimitMB = cacheLimitMB
         self.memoryLimitMB = memoryLimitMB
         self.clearCacheAfterAnswer = clearCacheAfterAnswer
+        self.textOnly = textOnly
     }
 
     /// Everything resident, fp16 KV, a Mac-sized buffer cache.
     public static let fast = Qwen38BrainProfile(
         kind: .fast, kvBits: nil, cacheLimitMB: 4096, memoryLimitMB: nil,
-        clearCacheAfterAnswer: false)
+        clearCacheAfterAnswer: false, textOnly: false)
 
-    /// 8-bit KV, a small buffer cache and a GC threshold sized from what the
+    /// Text only, 8-bit KV, a small buffer cache and a GC threshold sized from what the
     /// machine actually has, cache cleared between answers.
     public static var lean: Qwen38BrainProfile {
         let available = availableMemoryMB()
@@ -49,7 +52,7 @@ public struct Qwen38BrainProfile: Sendable, Equatable, Identifiable {
             kind: .lean, kvBits: 8,
             cacheLimitMB: min(1024, max(256, available / 6)),
             memoryLimitMB: max(4096, available - 2048),
-            clearCacheAfterAnswer: true)
+            clearCacheAfterAnswer: true, textOnly: true)
     }
 
     public static func named(_ id: String) -> Qwen38BrainProfile? {

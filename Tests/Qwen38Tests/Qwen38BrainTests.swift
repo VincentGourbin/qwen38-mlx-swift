@@ -35,5 +35,6 @@ func brainProfiles() throws {
     #expect(lean.kvBits == 8)
     #expect((lean.cacheLimitMB ?? .max) < (fast.cacheLimitMB ?? .max))
     #expect(lean.clearCacheAfterAnswer)
+    #expect(lean.textOnly && !fast.textOnly)
     #expect(Qwen38BrainProfile.named("max") == nil)
 }

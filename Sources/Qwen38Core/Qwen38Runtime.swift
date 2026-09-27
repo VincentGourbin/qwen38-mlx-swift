@@ -526,7 +526,10 @@ public actor Qwen38Runtime {
         /// court-circuiter dans tout l'engin Flash-Next résident. `.none`
         /// (le défaut) laisse le comportement inchangé. Sans effet sur la
         /// famille 27B.
-        ablation: Qwen4ExpLayerBenchAblation = .none
+        ablation: Qwen4ExpLayerBenchAblation = .none,
+        /// P16 : Bonsai 2 sans tour de vision (−0,92 Go) ; les images sont
+        /// alors refusées. Sans effet sur les autres modèles.
+        textOnly: Bool = false
     ) async throws {
         let info = try Qwen38ModelValidator.validate(directory)
         guard let family = info.family else {
@@ -579,7 +582,8 @@ public actor Qwen38Runtime {
             await Qwen38MTPRegistration.register()
             if info.isBonsai2 {
                 container = try await Qwen38Bonsai2.loadContainer(
-                    directory: directory, tokenizerLoader: Qwen38TokenizerLoader())
+                    directory: directory, tokenizerLoader: Qwen38TokenizerLoader(),
+                    textOnly: textOnly)
             } else {
                 // The generic helper tries registered factories in order. The LLM
                 // factory also accepts qwen3_5 and would silently load the text-only

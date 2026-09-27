@@ -21,6 +21,9 @@ struct BrainCommonOptions: ParsableArguments {
     @Option(name: .long, help: "Profil : fast ou lean")
     var profile: String = "fast"
 
+    @Option(name: .long, help: "Tranche de préfill en jetons (moteur dense)")
+    var prefillStep: Int?
+
     func loadBrain() async throws -> Qwen38Brain {
         guard let profile = Qwen38BrainProfile.named(profile) else {
             throw ValidationError("profil inconnu : \(self.profile) (fast ou lean)")
@@ -28,6 +31,7 @@ struct BrainCommonOptions: ParsableArguments {
         let started = Date()
         let brain = try await Qwen38Brain.load(
             modelDirectory: URL(fileURLWithPath: modelPath, isDirectory: true), profile: profile)
+        if let prefillStep { await brain.setPrefillStepSize(prefillStep) }
         let report = await brain.memoryReport()
         FileHandle.standardError.write(Data(String(
             format: "brain · profil %@ · chargé en %.1f s · actif %d Mo · footprint %d Mo\n",
@@ -68,6 +72,7 @@ enum BrainMeasure {
             "cached_prompt_tokens": usage.cachedPromptTokens,
             "completion_tokens": usage.completionTokens,
             "prefill_tok_s": decimal(usage.promptTokensPerSecond),
+            "prefill_s": decimal(usage.prefillSeconds, 2),
             "decode_tok_s": decimal(usage.tokensPerSecond),
             "ttft_s": usage.timeToFirstToken.map { decimal($0, 2) } ?? NSNull(),
             "peak_mb": usage.peakMemoryBytes / 1_048_576,
@@ -384,6 +389,7 @@ struct BrainBench: AsyncParsableCommand {
                     var fields = BrainMeasure.usageFields(usage)
                     fields["prompt_file"] = (path as NSString).lastPathComponent
                     fields["profile"] = common.profile
+                    fields["prefill_step"] = await brain.prefillStepSize
                     fields["footprint_mb"] = BrainMeasure.physFootprintMB()
                     fields["date"] = ISO8601DateFormatter().string(from: Date())
                     print(BrainMeasure.jsonLine(fields))

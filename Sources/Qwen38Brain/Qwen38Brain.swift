@@ -23,6 +23,8 @@ public struct Qwen38BrainUsage: Sendable, Equatable {
     public let cachedPromptTokens: Int
     public let completionTokens: Int
     public let promptTokensPerSecond: Double
+    /// Wall time spent prefilling this answer's new prompt tokens.
+    public let prefillSeconds: Double
     public let tokensPerSecond: Double
     public let timeToFirstToken: TimeInterval?
     public let peakMemoryBytes: Int
@@ -64,6 +66,7 @@ public struct Qwen38BrainMemoryReport: Sendable, Equatable {
 public enum Qwen38BrainError: LocalizedError {
     case invalidReasoningEffort(String)
     case emptyConversation
+    case imagesNeedVision
 
     public var errorDescription: String? {
         switch self {
@@ -71,6 +74,8 @@ public enum Qwen38BrainError: LocalizedError {
             return "reasoningEffort \(value) inconnu : low, medium ou xhigh"
         case .emptyConversation:
             return "conversation vide : au moins un message utilisateur ou outil"
+        case .imagesNeedVision:
+            return "ce profil charge le modèle sans vision : pas d'image possible"
         }
     }
 }
@@ -119,7 +124,8 @@ public actor Qwen38Brain {
     ) async throws -> Qwen38Brain {
         let info = try Qwen38ModelValidator.validate(modelDirectory)
         let runtime = Qwen38Runtime()
-        try await runtime.load(from: modelDirectory, preloadMTP: false)
+        try await runtime.load(
+            from: modelDirectory, preloadMTP: false, textOnly: profile.textOnly)
         profile.applyGlobalPolicy()
         var stops = Set<Int>()
         let tokenizerStops = try await runtime.performRaw { _, tokenizer in
@@ -159,6 +165,9 @@ public actor Qwen38Brain {
                         throw Qwen38BrainError.invalidReasoningEffort(options.reasoningEffort)
                     }
                     guard !messages.isEmpty else { throw Qwen38BrainError.emptyConversation }
+                    guard !profile.textOnly || messages.allSatisfy({ $0.imageURLs.isEmpty }) else {
+                        throw Qwen38BrainError.imagesNeedVision
+                    }
                     // Shared by both engines: reasoning / text / tool calls.
                     var parser = Qwen38ThinkingStreamParser(primedInside: options.enableThinking)
                     var splitter = Qwen38ToolCallTextSplitter(enabled: !tools.isEmpty)
@@ -230,6 +239,7 @@ public actor Qwen38Brain {
                             completionTokens: result.completionTokens,
                             promptTokensPerSecond: result.prefillSeconds > 0
                                 ? Double(result.promptTokens) / result.prefillSeconds : 0,
+                            prefillSeconds: result.prefillSeconds,
                             tokensPerSecond: result.decodeSeconds > 0
                                 ? Double(result.completionTokens) / result.decodeSeconds : 0,
                             timeToFirstToken: result.timeToFirstToken,
@@ -257,6 +267,7 @@ public actor Qwen38Brain {
                                     cachedPromptTokens: metrics.cachedPromptTokens,
                                     completionTokens: metrics.metrics.generatedTokens,
                                     promptTokensPerSecond: metrics.metrics.prefillTokensPerSecond,
+                                    prefillSeconds: metrics.metrics.prefillTime,
                                     tokensPerSecond: metrics.metrics.generationTokensPerSecond,
                                     timeToFirstToken: metrics.timeToFirstToken,
                                     peakMemoryBytes: metrics.peakMemoryBytes,

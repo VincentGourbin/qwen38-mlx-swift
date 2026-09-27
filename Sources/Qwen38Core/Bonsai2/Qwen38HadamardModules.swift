@@ -21,13 +21,47 @@ func hadamardRotate(_ x: MLXArray, signs: MLXArray, block: Int, inverse: Bool) -
 /// A `QuantizedLinear` whose input is first Hadamard-rotated (Bonsai 2 /
 /// Prism Hadamard packs). Signs are applied before the transform, matching
 /// the projection path of `runtime/runtime.py`.
+/// P16 K-8 : projections that read the same activation with the same signs
+/// (q/k/v, gate/up, GDN in_proj_qkv/in_proj_z in Bonsai 2) share one of these,
+/// so the rotation runs once per input instead of once per projection. The
+/// match is on the input's identity: the model passes the very same
+/// `MLXArray` to each sibling projection.
+final class Qwen38HadamardRotationMemo: @unchecked Sendable {
+    private weak var lastInput: MLXArray?
+    private var lastOutput: MLXArray?
+
+    func rotated(_ x: MLXArray, compute: (MLXArray) -> MLXArray) -> MLXArray {
+        if let lastInput, lastInput === x, let lastOutput { return lastOutput }
+        let output = compute(x)
+        lastInput = x
+        lastOutput = output
+        return output
+    }
+}
+
+/// `QWEN38_HADAMARD_SKIP=1` drops the rotation entirely: **wrong outputs**,
+/// only there to measure what the rotation costs (K-8).
+let qwen38HadamardSkip = ProcessInfo.processInfo.environment["QWEN38_HADAMARD_SKIP"] == "1"
+
 public final class Qwen38HadamardQuantizedLinear: QuantizedLinear {
     let signs: MLXArray
     let block: Int
+    let memo: Qwen38HadamardRotationMemo?
 
     public init(_ source: QuantizedLinear, signs: MLXArray, block: Int) {
         self.signs = signs
         self.block = block
+        self.memo = nil
+        super.init(
+            weight: source.weight, bias: source.bias, scales: source.scales,
+            biases: source.biases, groupSize: source.groupSize,
+            bits: source.bits, mode: source.mode)
+    }
+
+    init(_ source: QuantizedLinear, signs: MLXArray, block: Int, memo: Qwen38HadamardRotationMemo?) {
+        self.signs = signs
+        self.block = block
+        self.memo = memo
         super.init(
             weight: source.weight, bias: source.bias, scales: source.scales,
             biases: source.biases, groupSize: source.groupSize,
@@ -35,7 +69,11 @@ public final class Qwen38HadamardQuantizedLinear: QuantizedLinear {
     }
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        super.callAsFunction(hadamardRotate(x, signs: signs, block: block, inverse: false))
+        if qwen38HadamardSkip { return super.callAsFunction(x) }
+        let rotate = { [signs, block] (input: MLXArray) in
+            hadamardRotate(input, signs: signs, block: block, inverse: false)
+        }
+        return super.callAsFunction(memo?.rotated(x, compute: rotate) ?? rotate(x))
     }
 }
 
