@@ -29,8 +29,14 @@ export LANGWATCH_NO_DAEMON=1   # le démon du CLI abandonne après 25 s
 
 targets=("$@"); [ ${#targets[@]} -eq 0 ] && targets=(local)
 args=()
-for t in "${targets[@]}"; do args+=(--target "connected:qwen38-bench@${ENV_NAME}?model=${t}"); done
-name="Agent de code : $(IFS=' vs '; echo "${targets[*]}")${LABEL:+ ($LABEL)}"
+# TOOLSET : jeu d'outils de l'agent (toolsets/<nom>.json ; défaut « code », le
+# dépôt Swift réel). SUITE_FILE : suite de scénarios à jouer (suites/<nom>.json ;
+# défaut « Agent de code »), lue par scenarios.py. Voir
+# docs/integration/evaluation-fluxforge.md.
+TOOLSET="${TOOLSET:-}"
+for t in "${targets[@]}"; do args+=(--target "connected:qwen38-bench@${ENV_NAME}?model=${t}${TOOLSET:+&toolset=$TOOLSET}"); done
+suite_name="$(.venv/bin/python scenarios.py --suite-name)"
+name="${suite_name} : $(IFS=' vs '; echo "${targets[*]}")${LABEL:+ ($LABEL)}"
 note="$(git -C ../.. log -1 --pretty=%s | cut -c1-200)"
 ids=$(.venv/bin/python scenarios.py --ids)
 [ -n "$ids" ] || { echo "aucun scénario : lancer scenarios.sh d'abord"; exit 1; }

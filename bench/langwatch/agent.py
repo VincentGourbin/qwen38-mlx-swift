@@ -125,6 +125,48 @@ TOOLS = [
 
 # --- espace de travail par conversation ------------------------------------
 
+# --- jeux d'outils -----------------------------------------------------------
+# « code » : les outils réels ci-dessus, sur une copie de la fixture Swift.
+# Tout autre nom : `toolsets/<nom>.json`, des outils simulés pour évaluer un
+# autre usage (celui d'une app) avec le même harnais, le même juge et les mêmes
+# cibles :
+#   {"system_prompt": "...",
+#    "tools": [<specs OpenAI>],
+#    "responses": {"<outil>": "réponse, {argument} remplacé par sa valeur"}}
+TOOLSETS_DIR = HERE / "toolsets"
+
+
+def toolset_names() -> list[str]:
+    return ["code"] + sorted(p.stem for p in TOOLSETS_DIR.glob("*.json"))
+
+
+def load_toolset(name: str) -> dict:
+    if name == "code":
+        return {"system_prompt": SYSTEM_PROMPT, "tools": TOOLS, "responses": None}
+    data = json.loads((TOOLSETS_DIR / f"{name}.json").read_text(encoding="utf-8"))
+    return {"system_prompt": data["system_prompt"], "tools": data["tools"],
+            "responses": data.get("responses", {})}
+
+
+class _KeepMissing(dict):
+    """Un argument facultatif absent s'affiche « défaut » dans la réponse."""
+    def __missing__(self, key):
+        return "défaut"
+
+
+def run_simulated_tool(responses: dict, name: str, arguments: dict) -> str:
+    with langwatch.span(type="tool", name=name, input=arguments) as span:
+        template = responses.get(name)
+        if template is None:
+            result = f"erreur : outil inconnu {name}"
+        else:
+            values = _KeepMissing({k: (json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v)
+                                   for k, v in arguments.items()})
+            result = template.format_map(values)
+        span.update(output=result)
+        return result
+
+
 def workspace_for(thread_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", thread_id or "adhoc")
     path = WORKSPACES / safe
@@ -319,13 +361,14 @@ class Turn:
 # --- la boucle d'agent ------------------------------------------------------
 
 def chat_turn(client: OpenAI, model_id: str, messages: list[dict], extra: dict,
-              *, max_tokens: int, deadline: float, with_tools: bool = True) -> Turn:
+              *, max_tokens: int, deadline: float, with_tools: bool = True,
+              tools: list[dict] | None = None) -> Turn:
     """Un appel modèle en flux. À l'échéance, le flux est fermé : le serveur
     local annule alors la génération (chemin diffusé), au lieu de la finir
     dans le vide et de bloquer la file pour le tour suivant."""
     with langwatch.span(type="llm", name="chat.completions", model=model_id, input=messages) as span:
         started = time.monotonic()
-        tool_kwargs = {"tools": TOOLS, "tool_choice": "auto"} if with_tools else {}
+        tool_kwargs = {"tools": tools or TOOLS, "tool_choice": "auto"} if with_tools else {}
         turn = Turn()
         stream = client.chat.completions.create(
             model=model_id, messages=messages, temperature=0.7, max_tokens=max_tokens,
@@ -394,6 +437,8 @@ def qwen38_bench(
     model: Annotated[str, langwatch.Param(description="Modèle sous test", options=MODEL_OPTIONS)] = "local",
     thinking: Annotated[str, langwatch.Param(description="Effort de réflexion", options=THINKING_OPTIONS)] = "low",
     max_steps: Annotated[int, langwatch.Param(description="Appels d'outils au plus par tour")] = 12,
+    toolset: Annotated[str, langwatch.Param(description="Jeu d'outils (code = dépôt Swift réel)",
+                                            options=toolset_names())] = "code",
 ) -> str:
     # Un seul trace LangWatch par tour, sous le contexte adopté par le relais :
     # sans cet enveloppement, chaque span (llm, tool) partait comme un trace
@@ -404,25 +449,35 @@ def qwen38_bench(
         span = trace.root_span if hasattr(trace, "root_span") else None
         if model == "local":
             with LOCAL_TURN:
-                reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline)
+                reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline, toolset)
         else:
-            reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline)
+            reply = run_turn(messages, thread_id, model, thinking, max_steps, deadline, toolset)
         if span is not None:
             try:
                 span.update(output=reply)
             except Exception:
                 pass
+        # Journal local : LangWatch ne rattache pas un run à sa cible dans son
+        # API ; le bilan relie chaque run à son modèle par la réponse.
+        try:
+            with open(HERE / "runs.jsonl", "a", encoding="utf-8") as log:
+                log.write(json.dumps({"time": time.time(), "thread_id": thread_id, "model": model,
+                                      "turn": sum(1 for m in messages if m.get("role") == "user"),
+                                      "reply": reply}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         return reply
 
 
 def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, max_steps: int,
-             deadline: float) -> str:
-    root = workspace_for(thread_id)
+             deadline: float, toolset: str = "code") -> str:
+    kit = load_toolset(toolset)
+    root = workspace_for(thread_id) if kit["responses"] is None else None
     client, model_id, extra = make_client(model)
     extra = {**extra, **reasoning_kwargs(model, thinking)}
     tps = tokens_per_s(model)
 
-    history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history: list[dict] = [{"role": "system", "content": kit["system_prompt"]}]
     history += [{"role": m["role"], "content": m.get("content", "")} for m in messages if m.get("role") in ("user", "assistant")]
     partial = ""   # dernier texte visible, rendu si le budget s'épuise
 
@@ -451,7 +506,7 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
             turn = chat_turn(
                 client, model_id, history, extra,
                 max_tokens=clamp((tools_deadline - time.monotonic()) * tps - 100, 256, MAX_CALL_TOKENS),
-                deadline=tools_deadline)
+                deadline=tools_deadline, tools=kit["tools"])
         except Exception as error:   # délai réseau, serveur : on conclut avec ce qu'on a
             partial = partial or f"(appel interrompu : {type(error).__name__})"
             break
@@ -477,7 +532,8 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
                 arguments = json.loads(call["arguments"] or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            result = run_tool(root, call["name"], arguments)
+            result = (run_tool(root, call["name"], arguments) if kit["responses"] is None
+                      else run_simulated_tool(kit["responses"], call["name"], arguments))
             history.append({"role": "tool", "tool_call_id": call["id"] or f"call_{i}", "content": result})
 
     # Budget d'outils épuisé, tour vide ou appel coupé : une conclusion courte,
@@ -491,7 +547,7 @@ def run_turn(messages: list[dict], thread_id: str, model: str, thinking: str, ma
         turn = chat_turn(
             client, model_id, history, no_thinking(model, extra),
             max_tokens=clamp(remaining() * tps - 100, 128, conclude_max_tokens(model)),
-            deadline=deadline - 3)
+            deadline=deadline - 3, tools=kit["tools"])
         if turn.content.strip():
             return spoken(turn.content)
         return spoken(partial, wanted_tools=bool(turn.calls))

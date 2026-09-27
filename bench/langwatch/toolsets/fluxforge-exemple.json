@@ -1,0 +1,38 @@
+{
+  "system_prompt": "Tu es l'assistant créatif de Fluxforge Studio, une app macOS de génération d'images (Flux 2) et de vidéos (LTX). Tu disposes d'outils pour lister les ressources du projet, générer une image, générer une vidéo et détourer une image. Règles :\n- Avant de générer, reformule la demande en un prompt précis en anglais (sujet, cadrage, lumière, style).\n- Ne génère qu'une fois la demande assez claire ; sinon pose une question courte.\n- Après une génération, dis ce qui a été produit (identifiant, réglages) en une ou deux phrases.\n- Réponds en français, brièvement.",
+  "tools": [
+    {"type": "function", "function": {
+      "name": "list_assets",
+      "description": "Liste les images et vidéos du projet ouvert (identifiant, type, légende).",
+      "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+      "name": "generate_image",
+      "description": "Génère une image avec Flux 2 à partir d'un prompt en anglais.",
+      "parameters": {"type": "object", "properties": {
+        "prompt": {"type": "string", "description": "Prompt en anglais"},
+        "width": {"type": "integer", "description": "Largeur en pixels (512 à 2048)"},
+        "height": {"type": "integer", "description": "Hauteur en pixels (512 à 2048)"},
+        "steps": {"type": "integer", "description": "Nombre d'étapes (4 à 50)"}},
+        "required": ["prompt"]}}},
+    {"type": "function", "function": {
+      "name": "generate_video",
+      "description": "Génère une vidéo avec LTX à partir d'un prompt en anglais, éventuellement animée depuis une image du projet.",
+      "parameters": {"type": "object", "properties": {
+        "prompt": {"type": "string", "description": "Prompt en anglais"},
+        "duration_s": {"type": "number", "description": "Durée en secondes (2 à 10)"},
+        "source_image_id": {"type": "string", "description": "Identifiant d'une image du projet à animer (facultatif)"}},
+        "required": ["prompt"]}}},
+    {"type": "function", "function": {
+      "name": "remove_background",
+      "description": "Détoure une image du projet (RMBG 2) et renvoie l'identifiant de l'image détourée.",
+      "parameters": {"type": "object", "properties": {
+        "image_id": {"type": "string", "description": "Identifiant de l'image"}},
+        "required": ["image_id"]}}}
+  ],
+  "responses": {
+    "list_assets": "img_001 · image · « portrait studio d'une femme, fond gris »\nimg_002 · image · « bouteille de parfum sur marbre »\nvid_001 · vidéo · « vagues au coucher du soleil, 5 s »",
+    "generate_image": "Image générée : img_010 ({width}×{height}, {steps} étapes). Prompt utilisé : {prompt}",
+    "generate_video": "Vidéo générée : vid_010 ({duration_s} s, source {source_image_id}). Prompt utilisé : {prompt}",
+    "remove_background": "Image détourée : {image_id}_cutout (PNG avec transparence)."
+  }
+}

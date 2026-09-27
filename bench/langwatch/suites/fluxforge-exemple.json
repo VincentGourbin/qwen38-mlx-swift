@@ -1,0 +1,36 @@
+{
+  "suite": "Fluxforge Studio (exemple)",
+  "scenarios": [
+    {
+      "name": "Image : visuel produit à partir d'une idée floue",
+      "labels": ["fluxforge", "image"],
+      "situation": "Tu prépares une campagne pour une marque de café artisanal. Tu demandes à l'assistant une image pour Instagram, au format carré, qui donne envie, sans être très précis au départ. Si l'assistant pose une question, réponds que tu veux une ambiance chaleureuse du matin.",
+      "criteria": [
+        "L'agent appelle generate_image avec un prompt en anglais qui décrit un café, une ambiance chaleureuse et un cadrage (visible dans la trace)",
+        "L'agent demande une image carrée (width égal à height) conformément au format Instagram",
+        "L'agent dit en une ou deux phrases ce qui a été produit (identifiant ou réglages)"
+      ]
+    },
+    {
+      "name": "Vidéo : animer une image existante",
+      "labels": ["fluxforge", "vidéo", "outils"],
+      "situation": "Tu as déjà une image de bouteille de parfum dans ton projet. Tu demandes à l'assistant d'en faire une courte vidéo de quelques secondes avec un léger mouvement de caméra. Tu ne donnes pas l'identifiant de l'image.",
+      "criteria": [
+        "L'agent appelle list_assets pour retrouver l'image de la bouteille avant de générer (visible dans la trace)",
+        "L'agent appelle generate_video avec source_image_id égal à img_002",
+        "La durée demandée est comprise entre 2 et 10 secondes",
+        "L'agent n'invente pas une ressource absente du projet"
+      ]
+    },
+    {
+      "name": "Enchaînement : détourer puis réutiliser",
+      "labels": ["fluxforge", "multi-outils"],
+      "situation": "Tu veux le portrait studio de ton projet sans son fond, puis une nouvelle image où cette personne apparaît dans une rue de Tokyo la nuit. Tu formules les deux demandes dans le même message.",
+      "criteria": [
+        "L'agent appelle remove_background sur img_001 (visible dans la trace)",
+        "L'agent appelle generate_image avec un prompt en anglais qui mentionne Tokyo et la nuit",
+        "L'agent résume les deux résultats sans inventer d'identifiant absent des réponses des outils"
+      ]
+    }
+  ]
+}

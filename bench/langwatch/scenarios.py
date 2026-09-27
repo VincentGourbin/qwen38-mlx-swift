@@ -8,6 +8,11 @@ la suite et mis à jour (PATCH), sinon créé (POST).
 
     set -a; . bench/langwatch/.env; set +a
     bench/langwatch/.venv/bin/python bench/langwatch/scenarios.py
+
+Autre suite (les usages d'une app, par exemple) : `SUITE_FILE=suites/<nom>.json`
+désigne un fichier `{"suite": "<nom de suite>", "scenarios": [...]}`, même
+forme de scénario que `SCENARIOS` ci-dessous (name, labels, situation,
+criteria). `--suite-name` imprime le nom de la suite choisie.
 """
 import json
 import os
@@ -18,6 +23,7 @@ import urllib.request
 BASE = os.environ.get("LANGWATCH_ENDPOINT", "https://app.langwatch.ai").rstrip("/")
 KEY = os.environ.get("LANGWATCH_API_KEY") or sys.exit("LANGWATCH_API_KEY manquante (bench/langwatch/.env)")
 SUITE_NAME = "Agent de code"
+SUITE_FILE = os.environ.get("SUITE_FILE")
 
 SCENARIOS = [
     {
@@ -107,6 +113,18 @@ SCENARIOS = [
 ]
 
 
+if SUITE_FILE:
+    # Relatif au dossier courant, à ce dossier-ci ou à la racine du dépôt.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [SUITE_FILE, os.path.join(_here, SUITE_FILE),
+                   os.path.join(_here, "..", "..", SUITE_FILE)]
+    SUITE_FILE = next((c for c in _candidates if os.path.exists(c)), SUITE_FILE)
+    with open(SUITE_FILE, encoding="utf-8") as handle:
+        _suite = json.load(handle)
+    SUITE_NAME = _suite["suite"]
+    SCENARIOS = _suite["scenarios"]
+
+
 def call(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
@@ -140,6 +158,9 @@ def ensure_suite():
 
 
 def main():
+    if "--suite-name" in sys.argv:
+        print(SUITE_NAME)
+        return
     suite_id = ensure_suite()
     if "--ids" in sys.argv:
         by_name = {s["name"]: s["id"] for s in items(call("GET", "/api/scenarios")) if s.get("testSuiteId") == suite_id}
