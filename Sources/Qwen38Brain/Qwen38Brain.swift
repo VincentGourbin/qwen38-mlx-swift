@@ -99,8 +99,10 @@ public actor Qwen38Brain {
     private let isDense: Bool
     private let conversation = Qwen38BrainConversationCache()
     private let stopTokenIDs: Set<Int>
-    /// Prefill chunk, in tokens (see `docs/bonsai2-brain/plan.md`, K-7).
-    public var prefillStepSize = 2048
+    /// Prefill chunk, in tokens. 512 measured best on Bonsai 2 at 10k tokens
+    /// (100 tok/s and 16 GB peak, against 88 tok/s / 32 GB at 2048 and
+    /// 94 tok/s / 52 GB at 4096 — `docs/bonsai2-brain/plan.md`, K-7).
+    public var prefillStepSize = 512
 
     private init(
         modelDirectory: URL, profile: Qwen38BrainProfile, runtime: Qwen38Runtime,

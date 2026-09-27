@@ -122,24 +122,6 @@ public struct Qwen38Bonsai2Loader: @unchecked Sendable {
         let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         var updates = [(String, Module)]()
         updates.reserveCapacity(entries.count)
-        // K-8 : one rotation memo per group of sibling projections (same
-        // parent module) whose sign vectors are identical.
-        // `QWEN38_HADAMARD_MEMO=0` turns the sharing off, to measure it.
-        let shareRotations = ProcessInfo.processInfo.environment["QWEN38_HADAMARD_MEMO"] != "0"
-        var memos: [(parent: String, signs: MLXArray, memo: Qwen38HadamardRotationMemo)] = []
-        func memo(for modulePath: String, signs: MLXArray) -> Qwen38HadamardRotationMemo {
-            let parent = modulePath.split(separator: ".").dropLast().joined(separator: ".")
-            if let existing = memos.first(where: {
-                $0.parent == parent && $0.signs.shape == signs.shape
-                    && arrayEqual($0.signs, signs).item(Bool.self)
-            }) {
-                return existing.memo
-            }
-            let created = Qwen38HadamardRotationMemo()
-            memos.append((parent, signs, created))
-            return created
-        }
-
         for entry in entries {
             let modulePath = "language_model." + entry.path
             guard let signsVector = signs[modulePath] else {
@@ -160,17 +142,12 @@ public struct Qwen38Bonsai2Loader: @unchecked Sendable {
                     fatalError("Bonsai 2 : \(modulePath) n'est pas un QuantizedLinear")
                 }
                 replacement = Qwen38HadamardQuantizedLinear(
-                    linear, signs: signsVector, block: entry.block,
-                    memo: shareRotations ? memo(for: modulePath, signs: signsVector) : nil)
+                    linear, signs: signsVector, block: entry.block)
             }
             updates.append((modulePath, replacement))
         }
 
         model.update(modules: ModuleChildren.unflattened(updates))
-        if ProcessInfo.processInfo.environment["QWEN38_HADAMARD_REPORT"] == "1" {
-            FileHandle.standardError.write(Data(
-                "Bonsai 2 : \(updates.count) modules Hadamard, \(memos.count) rotations distinctes\n".utf8))
-        }
         return updates.count
     }
 }
