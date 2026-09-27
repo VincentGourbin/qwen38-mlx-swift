@@ -2897,9 +2897,8 @@ struct OpOverheadProbe: AsyncParsableCommand {
         // experts, 640 intermédiaire, top-10, 4 bits g32 — mêmes
         // dimensions que le bench) chronométré seul, hors
         // `Qwen4ExpSparseMoE`/`Qwen4ExpDecoderLayer`.
-        let switchGLU = SwitchGLU(
-            inputDims: dim, hiddenDims: 640, numExperts: 512,
-            quantization: (groupSize: 32, bits: 4, mode: .affine))
+        let switchGLU = SwitchGLU(inputDims: dim, hiddenDims: 640, numExperts: 512)
+        quantize(model: switchGLU, groupSize: 32, bits: 4, mode: .affine)
         eval(switchGLU.parameters().flattened().map { $0.1 })
         let expertIndices = MLXArray((0 ..< 10).map { UInt32($0) }, [1, 10])
         eval(expertIndices)

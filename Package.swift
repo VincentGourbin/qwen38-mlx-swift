@@ -16,7 +16,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.6"),
         // Local pinned checkout of upstream PR #545 (based on post-#351 MTP support).
         // Switch back to a tagged revision only once the Qwen MTP changes are released.
-        .package(path: "Vendor/mlx-swift-lm"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         // Rendu des gabarits de chat : 2.5 aligne `tojson` sur `json.dumps`
         // de Python (séparateurs, `/` non échappé, `ensure_ascii=False`),

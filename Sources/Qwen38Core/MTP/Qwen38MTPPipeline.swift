@@ -74,9 +74,6 @@ public enum Qwen38MTPPipeline {
     ) throws -> Result {
         guard parameters.temperature == 0 else { throw Error.nonGreedySampling }
         precondition(blockSize >= 2, "blockSize doit être >= 2")
-        guard drafter.isCompatible(with: target) else {
-            throw Error.invalidDrafterOutput
-        }
 
         let maxTokens = parameters.maxTokens ?? Int.max
         guard maxTokens > 0 else { return Result(tokenIDs: [], stats: Stats()) }

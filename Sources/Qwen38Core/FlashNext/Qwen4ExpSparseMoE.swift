@@ -219,14 +219,17 @@ public final class Qwen4ExpSparseMoE: Module, UnaryLayer {
         // the unchanged Vontra checkpoint's behavior.
         let switchMLPQuantization = expertsQuantization ?? quantization
         if let switchMLPQuantization {
-            _switchMLP.wrappedValue = SwitchGLU(
+            // Upstream has no packed-checkpoint SwitchGLU initializer: build
+            // the float module (lazy, never evaluated) and swap in quantized
+            // leaves, which the checkpoint's arrays then replace on update.
+            let packed = SwitchGLU(
                 inputDims: configuration.hiddenSize,
                 hiddenDims: configuration.moeIntermediateSize,
-                numExperts: numExperts,
-                quantization: (
-                    groupSize: switchMLPQuantization.groupSize,
-                    bits: switchMLPQuantization.bits,
-                    mode: switchMLPQuantization.mode))
+                numExperts: numExperts)
+            quantize(
+                model: packed, groupSize: switchMLPQuantization.groupSize,
+                bits: switchMLPQuantization.bits, mode: switchMLPQuantization.mode)
+            _switchMLP.wrappedValue = packed
         } else {
             _switchMLP.wrappedValue = SwitchGLU(
                 inputDims: configuration.hiddenSize,

@@ -578,32 +578,17 @@ public actor Qwen38Runtime {
             Memory.cacheLimit = 8 * 1024 * 1024 * 1024
             await Qwen38MTPRegistration.register()
             if info.isBonsai2 {
-                await Qwen38Bonsai2.register()
-                // Belt and braces: the fused 4-way GDN projection cannot fuse
-                // mixed packed/float projections anyway (FusedQuantizedLinear
-                // returns ineligible), but never let it try on this checkpoint.
-                setenv("MLX_QWEN_FOUR_GDN", "0", 1)
-            }
-            // The generic helper tries registered factories in order. The LLM
-            // factory also accepts qwen3_5 and would silently load the text-only
-            // implementation, dropping vision inputs. Select the VLM factory
-            // explicitly so Qwen35.prepare() receives the processed image.
-            container = try await VLMModelFactory.shared.loadContainer(
-                from: directory,
-                using: Qwen38TokenizerLoader()
-            )
-            if info.isBonsai2 {
-                let installer = try Qwen38Bonsai2Loader(directory: directory)
-                // `context.model` is a class reference: mutating it in place via
-                // `perform` (not `update`) avoids capturing a `var` across the
-                // `@Sendable` closure boundary just to read the count back.
-                let replacedCount = await container!.perform { context in
-                    installer.install(into: context.model)
-                }
-                guard replacedCount == installer.expectedReplacementCount else {
-                    throw Qwen38Bonsai2LoaderError.unexpectedReplacementCount(
-                        expected: installer.expectedReplacementCount, actual: replacedCount)
-                }
+                container = try await Qwen38Bonsai2.loadContainer(
+                    directory: directory, tokenizerLoader: Qwen38TokenizerLoader())
+            } else {
+                // The generic helper tries registered factories in order. The LLM
+                // factory also accepts qwen3_5 and would silently load the text-only
+                // implementation, dropping vision inputs. Select the VLM factory
+                // explicitly so Qwen35.prepare() receives the processed image.
+                container = try await VLMModelFactory.shared.loadContainer(
+                    from: directory,
+                    using: Qwen38TokenizerLoader()
+                )
             }
             // Leave processing overrides empty so the Qwen processor uses the
             // checkpoint's own min/max pixel contract for each image.
@@ -2083,9 +2068,6 @@ public actor Qwen38Runtime {
                     )
                     let preparedInput = try await context.processor.prepare(input: input)
                     if canUseMTP, let activeDrafter {
-                        guard activeDrafter.model.isCompatible(with: context.model) else {
-                            throw Qwen38RuntimeError.incompatibleMTPDrafter
-                        }
                         return try MLXLMCommon.generate(
                             input: preparedInput,
                             parameters: options.parameters,

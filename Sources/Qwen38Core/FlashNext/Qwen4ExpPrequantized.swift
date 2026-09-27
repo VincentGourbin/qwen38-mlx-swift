@@ -176,23 +176,12 @@ public func qwen4ExpSwitchLinear(
             bias: false)
     }
     precondition(inputDimensions % quantization.groupSize == 0)
-    let packed = MLXArray.zeros(
-        [numExperts, outputDimensions,
-         qwen4ExpPackedInput(inputDimensions, bits: quantization.bits)],
-        dtype: .uint32)
-    let scales = MLXArray.zeros(
-        [numExperts, outputDimensions, inputDimensions / quantization.groupSize],
-        dtype: .bfloat16)
-    let biases = quantization.mode == .affine
-        ? MLXArray.zeros(scales.shape, dtype: .bfloat16) : nil
+    // UPSTREAM PROBE: no packed initializer upstream; quantize a lazy float
+    // placeholder (never evaluated, replaced by the checkpoint's arrays).
+    let float = SwitchLinear(
+        inputDims: inputDimensions, outputDims: outputDimensions,
+        numExperts: numExperts, bias: false)
     return QuantizedSwitchLinear(
-        inputDims: inputDimensions,
-        outputDims: outputDimensions,
-        numExperts: numExperts,
-        weight: packed,
-        scales: scales,
-        biases: biases,
-        groupSize: quantization.groupSize,
-        bits: quantization.bits,
+        float, groupSize: quantization.groupSize, bits: quantization.bits,
         mode: quantization.mode)
 }

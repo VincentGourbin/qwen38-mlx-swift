@@ -82,9 +82,6 @@ public final class Qwen38MTPConversation: @unchecked Sendable {
         guard let statefulDrafter = drafter as? any StatefulMTPDrafterModel else {
             throw Error.unsupportedContinuation
         }
-        guard drafter.isCompatible(with: target) else {
-            throw Qwen38MTPPipeline.Error.invalidDrafterOutput
-        }
 
         mainState[mtpEmitFlagKey] = true
         let prefill = PrefillParameters(stepSize: Int.max, chunking: .unchunked)
@@ -226,15 +223,9 @@ public final class Qwen38MTPConversation: @unchecked Sendable {
             bonus.reshaped(1, 1),
         ], axis: 1)
         let drafterHidden = targetHidden[0..., ..<(suffixCount + 1), 0...]
-        var nextDrafterState = previousDrafterState
-        statefulDrafter.appendDrafterState(
-            target: target,
-            suffixTokens: drafterTokens,
-            suffixTargetHidden: drafterHidden,
-            positionDeltas: mainState[mtpPositionDeltasKey],
-            state: &nextDrafterState,
-            sampler: sampler)
-        drafterState = nextDrafterState
+        // UPSTREAM PROBE: `appendDrafterState` is a local patch; unsupported here.
+        _ = (statefulDrafter, drafterTokens, drafterHidden, previousDrafterState)
+        throw Error.unsupportedContinuation
         didStartGeneration?()
 
         let result = try generateFromBoundary(
