@@ -741,3 +741,48 @@ framework (`Sources/`), pas du banc.
 - Fait : entrée « 2026-09-26 — Banc LangWatch : Bonsai 2 seul (L-3 → L-4), Flash-Next reporté » dans `docs/knowledge/log.md` : tableau taux de réussite (10/24 = 41,7 %), latence agent (303,0 s / 242,8 s), durée de run (326,8 s / 281,0 s / 844,3 s), coût non chiffré par LangWatch ; scénarios ratés 3/3 (Ajout, Prudence, Multi-tours, Ambigu) avec la raison du juge ; jetons prompt/sortie (223 092 / 26 400), `dont 0 en cache`, débit médian 10,3 tok/s ; plantage Flash-Next comme fait brut renvoyant à `PLAN.md` §P15 ; ligne de conclusion.
 - Porte de sortie observée : l'entrée existe dans `docs/knowledge/log.md` avec le tableau, les ratés 3/3 et leur raison, et la ligne de conclusion.
 - Écart au plan : L-5 reportée (option C, réponse du 2026-09-26) ; le bilan porte sur Bonsai 2 seul. Les deux agents (`bench-m3max`, `bench-m3max-flashnext`) sont arrêtés, le serveur n'est pas relancé. Fin du plan.
+
+## L-7 — Campagne v2 — 2026-09-27 — validée (exécutée par Claude, pas par pi)
+- Préalable : `qwen38 serve` passe désormais, pour la famille dense, par le
+  moteur de `Qwen38Brain` (conversation réutilisée, y compris après un
+  résultat d'outil : 955/1 242, 1 237/1 877 jetons repris dans les journaux ;
+  0 avant). Commit `aff2c51`.
+- Plan « Agent de code : local ollama/glm-5.3-flash ollama/gpt-oss:120b
+  ollama/kimi-k2.7-code (v2) » (`suite_var_gQLGYCdCkoUJ1oCtm`) : 24 lancements
+  × 4 cibles, 0 coupure de transport, 1 ERROR (Bonsai 2, « Ajout », plafond de
+  temps de la plateforme, compté en échec).
+- Plan « Agent de code : local (v2-27b) » (`suite_nZxJaJfpnTKTgkcMIG7KH`) :
+  même suite, Qwen3.8-27B 4 bits standard derrière le même serveur.
+- Rattachement run → cible : `bench/langwatch/report.py` par le journal local
+  de l'agent (`runs.jsonl`) ; quelques réponses courtes identiques entre
+  modèles (« Hors dépôt ») se rattachent mal, d'où des totaux cloud > 24.
+- Porte observée : 4 lignes comparables + la ligne 27B, 0 erreur de transport.
+
+## L-8 — Bilan comparé — 2026-09-27
+
+| Cible | Réussite | Durée médiane d'un run |
+|---|---:|---:|
+| Qwen3.8-27B 4 bits, local | 16/24 = 67 % | 154 s |
+| Bonsai 2, local | 13/24 = 54 % | 216 s |
+| glm-5.3-flash (Ollama Cloud) | ≈ 77 % | 44 s |
+| kimi-k2.7-code (Ollama Cloud) | ≈ 77 % | 46 s |
+| gpt-oss:120b (Ollama Cloud) | ≈ 62 % | 40 s |
+| *Rappel L-4 : Bonsai 2 via l'ancien chemin* | *10/24 = 42 %* | *281 s* |
+
+| Scénario | 27B 4 bits | Bonsai 2 | glm | kimi | gpt-oss |
+|---|---:|---:|---:|---:|---:|
+| Lecture | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| Recherche | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| Hors dépôt | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+| Ajout | 3/3 | 1/3 | 3/3 | 3/3 | 0/3 |
+| Correction | 2/3 | 1/3 | 3/3 | 3/3 | 3/3 |
+| Ambigu | 2/3 | 3/3 | 1/3 | 3/3 | 0/3 |
+| Multi-tours | 0/3 | 0/3 | ≈ 1-2/3 | 0/3 | 1/3 |
+| Prudence | 0/3 | 0/3 | 0/3 | 0/3 | 1/3 |
+
+Lectures : (1) le nouveau moteur fait passer Bonsai 2 de 42 % à 54 % ; (2) le
+27B 4 bits standard fait mieux (67 %), surtout sur les tâches d'écriture de code
+avec tests, et deux fois plus vite par run ; (3) « Prudence » et « Multi-tours »
+échouent chez presque toutes les cibles : critères à revoir avant d'en tirer
+une conclusion sur les modèles ; (4) le meilleur local reste à ≈ 10 points des
+meilleurs modèles cloud testés.

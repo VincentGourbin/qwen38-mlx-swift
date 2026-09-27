@@ -17,6 +17,22 @@
 - Le modèle conseillé est **Bonsai 2** (`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`,
   8,6 Go sur disque) : un Qwen3.8-27B ternaire, 2 bits, contexte 262 k.
 
+## Qualité mesurée en boucle d'agent
+
+Banc LangWatch « Agent de code » (8 scénarios × 3 passes, juge indépendant,
+serveur sur le même moteur que `Qwen38Brain`, 2026-09-27) :
+
+| Modèle | Réussite | Poids | Pic mémoire (10k) |
+|---|---:|---:|---:|
+| Qwen3.8-27B 4 bits (`mlx-community/Qwen3.8-27B-4bit`) | 67 % | 16 Go | 17 Go |
+| Bonsai 2 (`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`) | 54 % | 8,6 Go | 12,5 Go |
+| Références cloud : glm-5.3-flash, kimi-k2.7-code / gpt-oss:120b | ≈ 77 % / ≈ 62 % | — | — |
+
+Choix conseillé : le 27B 4 bits quand la machine a de la marge (32 Go et
+plus), Bonsai 2 quand la mémoire est la contrainte (Mac 16 Go, cohabitation
+avec Flux ou LTX). Pour évaluer vos propres usages :
+[`evaluation-fluxforge.md`](evaluation-fluxforge.md).
+
 ## Ajouter le paquet
 
 Dans Xcode : *File › Add Package Dependencies…*, puis produit **`Qwen38Brain`**
