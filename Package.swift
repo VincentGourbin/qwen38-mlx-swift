@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "Qwen38Core", targets: ["Qwen38Core"]),
         .library(name: "Qwen38Server", targets: ["Qwen38Server"]),
         .library(name: "Qwen38Agent", targets: ["Qwen38Agent"]),
+        .library(name: "Qwen38Brain", targets: ["Qwen38Brain"]),
         .executable(name: "qwen38", targets: ["Qwen38CLI"]),
         .executable(name: "qwen38-bench-ui", targets: ["Qwen38BenchUI"]),
     ],
@@ -41,6 +42,17 @@ let package = Package(
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
             ]
         ),
+        // Cerveau embarquable (P16) : façade pour une app — profils fast/lean,
+        // conversation OpenAI en entrée, événements typés en sortie. Ne
+        // dépend que de Qwen38Core (pas de serveur HTTP).
+        .target(
+            name: "Qwen38Brain",
+            dependencies: [
+                "Qwen38Core",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ]
+        ),
         .target(
             name: "Qwen38Server",
             dependencies: [
@@ -53,6 +65,7 @@ let package = Package(
             dependencies: [
                 "Qwen38Core",
                 "Qwen38Server",
+                "Qwen38Brain",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
@@ -74,7 +87,7 @@ let package = Package(
         .testTarget(
             name: "Qwen38Tests",
             dependencies: [
-                "Qwen38Core", "Qwen38Server", "Qwen38Agent",
+                "Qwen38Core", "Qwen38Server", "Qwen38Agent", "Qwen38Brain",
                 .product(name: "Jinja", package: "swift-jinja"),
             ]
         ),

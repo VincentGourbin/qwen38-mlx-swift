@@ -1,0 +1,87 @@
+
+// ===== Sources/Qwen38Core/Bonsai2/Qwen38Bonsai2Container.swift =====
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+import MLXVLM
+
+extension Qwen38Bonsai2 {
+    /// Loads a Bonsai 2 pack into a `ModelContainer` with upstream
+    /// mlx-swift-lm only. `VLMModelFactory.loadContainer` cannot be used: its
+    /// `loadWeights` verifies every safetensors key (`verify: [.all]`), and
+    /// the pack's `.signs` vectors belong to no module. This replays the
+    /// public steps of `VLMModelFactory._load` and drops them first; the
+    /// Hadamard installer reads them from the file itself.
+    public static func loadContainer(
+        directory: URL, tokenizerLoader: any TokenizerLoader
+    ) async throws -> ModelContainer {
+        setenv("MLX_QWEN_FOUR_GDN", "0", 1)
+        let configData = try Data(contentsOf: directory.appending(component: "config.json"))
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
+        let configuration = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configData)
+        let model = Qwen35(configuration)
+
+        var weights = try loadArrays(url: directory.appending(component: "model.safetensors"))
+        weights = model.sanitize(weights: weights, metadata: [:])
+        weights = weights.filter { !$0.key.hasSuffix(".signs") }
+        if let perLayer = base.perLayerQuantization {
+            quantize(model: model) { path, _ in
+                weights["\(path).scales"] != nil ? perLayer.quantization(layer: path)?.asTuple : nil
+            }
+        }
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(model)
+
+        let installer = try Qwen38Bonsai2Loader(directory: directory)
+        let replaced = installer.install(into: model)
+        guard replaced == installer.expectedReplacementCount else {
+            throw Qwen38Bonsai2LoaderError.unexpectedReplacementCount(
+                expected: installer.expectedReplacementCount, actual: replaced)
+        }
+
+        let tokenizer = try await tokenizerLoader.load(from: directory)
+        let processorData = try Data(
+            contentsOf: directory.appending(component: "preprocessor_config.json"))
+        let processor = try await VLMProcessorTypeRegistry.shared.createModel(
+            configuration: processorData, processorType: "Qwen3VLProcessor", tokenizer: tokenizer)
+        var eosTokenIds = base.effectiveEOSTokenIds
+        if let data = try? Data(contentsOf: directory.appending(component: "generation_config.json")),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            if let one = object["eos_token_id"] as? Int {
+                eosTokenIds = [one]
+            } else if let many = object["eos_token_id"] as? [Int] {
+                eosTokenIds = Set(many)
+            }
+        }
+        let modelConfiguration = ModelConfiguration(directory: directory, eosTokenIds: eosTokenIds)
+        return ModelContainer(context: ModelContext(
+            configuration: modelConfiguration, model: model, processor: processor,
+            tokenizer: tokenizer))
+    }
+}
+
+// ===== Sources/Qwen38Core/Bonsai2/Qwen38Bonsai2Loader.swift =====
+import Foundation
+import MLX
+import MLXNN
+import MLXLMCommon
+
+public enum Qwen38Bonsai2LoaderError: LocalizedError, Equatable {
+    case unsupportedBlock(Int)
+    case unsupportedDtype(String)
+    case missingSigns(String)
+    case invalidSigns(String)
+    case unexpectedReplacementCount(expected: Int, actual: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedBlock(let block):
+            return "Bonsai 2 : bloc Hadamard non supporté (\(block))"
+        case .unsupportedDtype(let dtype):
+            return "Bonsai 2 : dtype de module non supporté (\(dtype))"
+        case .missingSigns(let path):
+            return "Bonsai 2 : vecteur de signes 
+
+Fin du code. Résume en trois phrases ce que fait ce code et cite un type public.

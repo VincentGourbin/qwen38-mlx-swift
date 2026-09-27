@@ -19,7 +19,7 @@ struct Qwen38CLI: AsyncParsableCommand {
         commandName: "qwen38",
         abstract: "Inférence locale Qwen3.8 sur MLX",
         subcommands: [
-            Info.self, FlashSliceProbe.self, FlashStreamProbe.self, FlashGlobalProbe.self,
+            Info.self, Brain.self, FlashSliceProbe.self, FlashStreamProbe.self, FlashGlobalProbe.self,
             FlashTextProbe.self, FlashVisionProbe.self, FlashMergeProbe.self,
             FlashMultimodalProbe.self, FlashGenerateProbe.self, FlashLayerBench.self,
             FlashQSAParity.self,
