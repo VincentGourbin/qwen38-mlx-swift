@@ -29,6 +29,10 @@ public struct Qwen38BrainUsage: Sendable, Equatable {
     public let tokensPerSecond: Double
     public let timeToFirstToken: TimeInterval?
     public let peakMemoryBytes: Int
+    /// Decode time per token, median and 90th percentile, in seconds (dense
+    /// engine only; `nil` on the runtime path).
+    public let stepMedian: Double?
+    public let stepP90: Double?
     /// `length` when `maxTokens` cut the answer, `stop` otherwise; `toolCalls`
     /// when the answer ended by asking for tools.
     public let finishReason: FinishReason
@@ -136,6 +140,13 @@ public actor Qwen38Brain {
             rendered["content"] = parts
         }
         return rendered
+    }
+
+    static func percentile(_ values: [Double], _ q: Double) -> Double? {
+        // The first interval includes the queueing of the first step: skip it.
+        let sorted = values.dropFirst().sorted()
+        guard !sorted.isEmpty else { return nil }
+        return sorted[min(sorted.count - 1, Int(Double(sorted.count - 1) * q))]
     }
 
     public func setPrefillStepSize(_ value: Int) {
@@ -290,6 +301,8 @@ public actor Qwen38Brain {
                                 ? Double(result.completionTokens) / result.decodeSeconds : 0,
                             timeToFirstToken: result.timeToFirstToken,
                             peakMemoryBytes: Memory.peakMemory,
+                            stepMedian: Qwen38Brain.percentile(result.stepDurations, 0.5),
+                            stepP90: Qwen38Brain.percentile(result.stepDurations, 0.9),
                             finishReason: finishReason)))
                     } else {
                         let generation = Qwen38GenerationOptions(
@@ -317,6 +330,7 @@ public actor Qwen38Brain {
                                     tokensPerSecond: metrics.metrics.generationTokensPerSecond,
                                     timeToFirstToken: metrics.timeToFirstToken,
                                     peakMemoryBytes: metrics.peakMemoryBytes,
+                                    stepMedian: nil, stepP90: nil,
                                     finishReason: finishReason)))
                             }
                         }

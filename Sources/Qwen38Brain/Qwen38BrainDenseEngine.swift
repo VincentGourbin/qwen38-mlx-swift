@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXProfiler
 import Qwen38Core
 
 /// Conversation cache for the dense hybrid family (Qwen 3.5 / Bonsai 2):
@@ -59,6 +60,8 @@ struct Qwen38BrainDenseResult: Sendable {
     let decodeSeconds: Double
     let timeToFirstToken: TimeInterval?
     let hitLength: Bool
+    /// Wall time between consecutive decoded tokens, in seconds.
+    let stepDurations: [Double]
 }
 
 enum Qwen38BrainDenseEngineError: LocalizedError {
@@ -85,6 +88,9 @@ enum Qwen38BrainDenseEngine {
         let tokens = request.tokens
         guard !tokens.isEmpty else { throw Qwen38BrainDenseEngineError.emptyPrompt }
         let started = Date()
+        // Phases land in the active profiling session, if any (`qwen38 brain
+        // … --trace`); a disabled profiler makes these calls no-ops.
+        let session = MLXProfiler.shared.isEnabled ? MLXProfiler.shared.activeSession : nil
 
         // Resume point of this request: just before the last `<|im_start|>`
         // (the generation prompt), or the whole prompt minus its last token.
@@ -177,13 +183,18 @@ enum Qwen38BrainDenseEngine {
 
         // 1. history up to the resume point, then snapshot it;
         // 2. the generation prompt, whose last logits give the first token.
+        session?.beginPhase("Préfill historique", category: .prefill)
         _ = try prefill(start ..< snapshotLength)
+        session?.endPhase("Préfill historique", category: .prefill)
         conversation.prefixTokens = Array(tokens[..<snapshotLength])
         conversation.snapshotState = conversation.state
         conversation.recurrentSnapshot = cache.enumerated().compactMap { index, layer in
             layer is ArraysCache ? (index, layer.state, layer.offset) : nil
         }
-        guard let promptLogits = try prefill(snapshotLength ..< tokens.count) else {
+        session?.beginPhase("Préfill invite", category: .prefill)
+        let promptLogitsOrNil = try prefill(snapshotLength ..< tokens.count)
+        session?.endPhase("Préfill invite", category: .prefill)
+        guard let promptLogits = promptLogitsOrNil else {
             throw Qwen38BrainDenseEngineError.emptyPrompt
         }
         let prefillSeconds = Date().timeIntervalSince(started)
@@ -203,12 +214,19 @@ enum Qwen38BrainDenseEngine {
         var timeToFirstToken: TimeInterval?
         var hitLength = true
         let decodeStarted = Date()
+        var stepDurations: [Double] = []
+        var lastStep = decodeStarted
+        session?.beginPhase("Décodage", category: .generation)
+        defer { session?.endPhase("Décodage", category: .generation) }
         var current = sampler.sample(logits: promptLogits[0..., -1, 0...])
         asyncEval(current)
         while generated < request.maxTokens {
             let next = generated + 1 < request.maxTokens ? step(current) : nil
             if let next { asyncEval(next) }
             let token = current.item(Int.self)
+            let now = Date()
+            stepDurations.append(now.timeIntervalSince(lastStep))
+            lastStep = now
             if request.stopTokenIDs.contains(token) {
                 hitLength = false
                 break
@@ -228,6 +246,7 @@ enum Qwen38BrainDenseEngine {
             promptTokens: tokens.count - start, cachedPromptTokens: start,
             completionTokens: generated, prefillSeconds: prefillSeconds,
             decodeSeconds: Date().timeIntervalSince(decodeStarted),
-            timeToFirstToken: timeToFirstToken, hitLength: hitLength)
+            timeToFirstToken: timeToFirstToken, hitLength: hitLength,
+            stepDurations: stepDurations)
     }
 }

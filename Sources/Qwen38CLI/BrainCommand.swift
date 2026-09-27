@@ -2,6 +2,7 @@ import ArgumentParser
 import CoreGraphics
 import Darwin
 import Foundation
+import MLXProfiler
 import Qwen38Brain
 import Qwen38Core
 
@@ -27,6 +28,63 @@ struct BrainCommonOptions: ParsableArguments {
 
     @Flag(name: .long, help: "Charger le modèle sans tour de vision")
     var textOnly = false
+
+    @Option(name: .long, help: "Dossier où écrire la trace du profiler (trace.json, report.txt, phases.jsonl)")
+    var trace: String?
+
+    /// Opens a profiling session (GPU/CPU/memory sampling) before the model
+    /// loads; `finishTrace` writes it out. The runtime's own request sessions
+    /// (Flash-Next path) join the same session.
+    func startTrace() -> ProfilingSession? {
+        guard trace != nil else { return nil }
+        let session = ProfilingSession(config: .fineGrained, subsystem: "com.qwen38mlx.brain")
+        session.title = "qwen38 brain · \(URL(fileURLWithPath: modelPath).lastPathComponent) · \(profile)"
+        MLXProfiler.shared.activeSession = session
+        MLXProfiler.shared.enable()
+        Qwen38Profiling.sharedSession = session
+        return session
+    }
+
+    func finishTrace(_ session: ProfilingSession?) throws {
+        guard let session, let trace else { return }
+        session.finish()
+        MLXProfiler.shared.disable()
+        let directory = URL(fileURLWithPath: trace, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try ChromeTraceExporter.export(session: session).write(to: directory.appending(path: "trace.json"))
+        try session.generateReport().write(
+            to: directory.appending(path: "report.txt"), atomically: true, encoding: .utf8)
+        var lines: [String] = []
+        for phase in session.phaseSummaries() {
+            var fields: [String: Any] = [
+                "phase": phase.name, "ms": BrainMeasure.decimal(phase.durationMs, 0),
+            ]
+            if let gpu = phase.gpu {
+                fields["gpu_mean"] = BrainMeasure.decimal(gpu.mean, 0)
+                fields["gpu_p90"] = BrainMeasure.decimal(gpu.p90, 0)
+            }
+            if let cpu = phase.cpuPercent { fields["cpu_pct"] = BrainMeasure.decimal(cpu, 0) }
+            if let peak = phase.peakMLXActiveMB { fields["peak_mlx_mb"] = BrainMeasure.decimal(peak, 0) }
+            lines.append(BrainMeasure.jsonLine(fields))
+        }
+        try (lines.joined(separator: "\n") + "\n").write(
+            to: directory.appending(path: "phases.jsonl"), atomically: true, encoding: .utf8)
+        FileHandle.standardError.write(Data("trace : \(directory.path)\n".utf8))
+    }
+
+    /// Size of the weights read per decoded token for a dense model (all
+    /// safetensors of the pack, symlinks followed), in GB.
+    func weightGigabytes() -> Double {
+        let directory = URL(fileURLWithPath: modelPath, isDirectory: true)
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)) ?? []
+        let bytes = files.filter { $0.pathExtension == "safetensors" }.reduce(0) { total, url in
+            let resolved = url.resolvingSymlinksInPath()
+            let size = (try? resolved.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return total + size
+        }
+        return Double(bytes) / 1e9
+    }
 
     func loadBrain() async throws -> Qwen38Brain {
         guard var profile = Qwen38BrainProfile.named(profile) else {
@@ -81,6 +139,8 @@ enum BrainMeasure {
             "decode_tok_s": decimal(usage.tokensPerSecond),
             "ttft_s": usage.timeToFirstToken.map { decimal($0, 2) } ?? NSNull(),
             "peak_mb": usage.peakMemoryBytes / 1_048_576,
+            "step_p50_ms": usage.stepMedian.map { decimal($0 * 1000, 1) } ?? NSNull(),
+            "step_p90_ms": usage.stepP90.map { decimal($0 * 1000, 1) } ?? NSNull(),
             "finish": usage.finishReason.rawValue,
         ]
     }
@@ -344,6 +404,7 @@ struct BrainReplay: AsyncParsableCommand {
         let recorded = try JSONDecoder().decode(
             BrainTranscript.self, from: Data(contentsOf: URL(fileURLWithPath: transcript)))
         let tools = BrainReadOnlyTools.specs.filter { recorded.tools.contains($0.name) }
+        let session = common.startTrace()
         let brain = try await common.loadBrain()
         // Chaque tour assistant enregistré devient une requête : l'historique
         // qui le précède, comme le renverrait un client d'API.
@@ -377,6 +438,7 @@ struct BrainReplay: AsyncParsableCommand {
             format: "replay · %d tours · %d jetons de prompt dont %d réutilisés (%.0f %%)",
             turns.count, totalPrompt, totalCached,
             totalPrompt > 0 ? Double(totalCached) * 100 / Double(totalPrompt) : 0))
+        try common.finishTrace(session)
     }
 }
 
@@ -399,7 +461,11 @@ struct BrainBench: AsyncParsableCommand {
     var cooldown: Int = 0
 
     func run() async throws {
+        let session = common.startTrace()
+        session?.beginPhase("Chargement", category: .modelLoad)
         let brain = try await common.loadBrain()
+        session?.endPhase("Chargement", category: .modelLoad)
+        let weightsGB = common.weightGigabytes()
         for (index, path) in promptFiles.split(separator: ",").map(String.init).enumerated() {
             if index > 0, cooldown > 0 { try await Task.sleep(for: .seconds(cooldown)) }
             await brain.resetConversation()
@@ -415,9 +481,15 @@ struct BrainBench: AsyncParsableCommand {
                     fields["prefill_step"] = await brain.prefillStepSize
                     fields["footprint_mb"] = BrainMeasure.physFootprintMB()
                     fields["date"] = ISO8601DateFormatter().string(from: Date())
+                    fields["model"] = URL(fileURLWithPath: common.modelPath).lastPathComponent
+                    fields["weights_gb"] = BrainMeasure.decimal(weightsGB, 2)
+                    // Every weight is read once per decoded token on a dense
+                    // model: this is the bandwidth the decode actually drew.
+                    fields["weights_bw_gbps"] = BrainMeasure.decimal(weightsGB * usage.tokensPerSecond, 0)
                     print(BrainMeasure.jsonLine(fields))
                 }
             }
         }
+        try common.finishTrace(session)
     }
 }

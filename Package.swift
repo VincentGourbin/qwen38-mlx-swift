@@ -51,6 +51,7 @@ let package = Package(
                 "Qwen38Core",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXProfiler", package: "swift-mlx-profiler"),
             ]
         ),
         .target(
