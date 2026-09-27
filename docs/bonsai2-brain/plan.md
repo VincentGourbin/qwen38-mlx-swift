@@ -129,3 +129,37 @@ Gabarits :
 ```
 
 ### Journal
+
+## K-1 — Sortie du fork — 2026-09-27 — validée
+- Fait : dépendance mlx-swift-lm upstream `main` (`ee673d6`) ; initialiseur
+  d'experts empaquetés remplacé par `quantize(model:)` ; chargement Bonsai 2
+  propre (`Qwen38Bonsai2.loadContainer`) ; continuation MTP 27B désactivée.
+- Porte observée : `Test run with 233 tests in 0 suites passed` ; B-3 greedy
+  32/32 sur 3 invites, logits maxAbsErr 3,4e-5 à 3,9e-5 ; parités Flash-Next
+  (QSA, MRoPE, langage, globaux, single-layer, couches publiques 2 et 3) « OK »
+  en Release contre le checkpoint 4 bits.
+
+## K-3 — Façade Qwen38Brain — 2026-09-27 — validée
+- Porte observée : `brain agent` sur `bench/langwatch/fixture` : list_files,
+  trois read_file, réponse « testAverageOfEmptyIsZero … division par zéro »
+  (juste). Greedy identique au jeton près entre moteur dense et runtime.
+
+## K-6 — Réutilisation de la conversation — 2026-09-27 — validée
+- Porte observée : rejeu de `transcripts/agent-scripts.json`, 4 tours :
+  jetons réutilisés 0/481/1860/5159 (tout l'historique précédent à 7 jetons
+  près) contre 0 partout sur le runtime ; réponses identiques ; préfill total
+  84 et 96 s contre 145 et 253 s (A/B/B/A). Conditions de machine
+  dégradées (voir K-7), les ratios restent valables.
+
+## K-7/K-8 — Mesures de débit — 2026-09-27 — en attente
+- Constat : la machine ralentit d'une passe à l'autre indépendamment du code
+  (fork : 102 puis 61 tok/s de préfill à 10 k en A/B/B/A). Un processus
+  WebKit (≈ 110 % CPU depuis 2,5 jours) garde le GPU vers 60 %. Mesures
+  reprises quand il sera fermé ; `campaign.sh` attend désormais 60 s de GPU
+  < 75 % sans calcul lourd.
+- Rotations Hadamard partagées : 402 → 257 par passe, greedy inchangé ;
+  gain de débit non mesuré proprement à ce jour.
+
+## K-9 — Intégration Fluxforge Studio — 2026-09-27 — validée
+- Porte observée : une seule entrée `mlx-swift-lm` (`ee673d6`) ;
+  `** BUILD SUCCEEDED **` de l'app entière ; 776 symboles Qwen38Brain liés.

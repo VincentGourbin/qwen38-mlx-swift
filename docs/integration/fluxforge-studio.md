@@ -128,6 +128,20 @@ texte d'une réponse outillée ne contient jamais le XML `<tool_call>`.
 - mlx-swift-lm est suivi sur `main` tant qu'aucune version publiée ne contient
   Qwen 3.5 : noter la révision résolue.
 
-## Preuve d'intégration
+## Preuve d'intégration (K-9, 2026-09-27)
 
-(Remplie par K-9.)
+Sur une copie jetable de Fluxforge Studio (`git archive` de `b8cf2932`, le
+dépôt de l'app n'a pas été touché), avec le paquet ajouté par chemin local, le
+produit `Qwen38Brain` lié à la cible de l'app et un fichier qui appelle
+`Qwen38Brain.load(…, profile: .lean)` puis `respond(to:)` :
+
+- `xcodebuild -resolvePackageDependencies` : **une seule** entrée
+  `mlx-swift-lm` (`main`, `ee673d6`), mlx-swift 0.31.6, swift-jinja 2.5.1,
+  swift-transformers 1.3.4 ;
+- `xcodebuild build` (Debug, arm64, sans signature) : **BUILD SUCCEEDED**,
+  LTX, Flux 2, Gemma 4, Voxtral et Qwen38Brain compilés ensemble ;
+- `Fluxforge Studio.debug.dylib` contient 776 symboles `Qwen38Brain`.
+
+À savoir : la résolution fait avancer la révision de mlx-swift-lm de l'app de
+`604fae710a` (11 septembre) à `ee673d6` (22 septembre, tête de `main`) ; toute
+l'app compile avec. Tester LTX et Gemma sur cette révision avant de livrer.
