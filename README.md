@@ -19,6 +19,8 @@ are the honest measurement journal, dead ends included.
 | Flash-Next text generation | ✅ **Working** | 48 resident layers, 3-bit checkpoint, **13.0–13.5 tok/s** greedy |
 | Flash-Next vision (images) | ✅ **Working** | Vision tower + MRoPE merge, parity-checked against Python |
 | Dense 27B (4-bit / 8-bit / bf16) | ✅ **Working** | 10.3–10.7 tok/s decode at 4-bit, text + image |
+| Bonsai 2 (ternary 27B, 2-bit + Hadamard) | ✅ **Working** | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`, parity with the Python runtime (greedy 32/32, logits ≤ 3.9e-5), text + image |
+| Embeddable brain (`Qwen38Brain`) | ✅ **Working** | `fast` / `lean` profiles, conversation reuse across agent turns, ~12 GB peak at 32k context in `lean`. See [integration guide](docs/integration/fluxforge-studio.md) |
 | Thinking mode | ✅ **Working** | `reasoning_content` separated from the answer, per-request or `--enable-thinking` |
 | OpenAI-compatible server | ✅ **Working** | `/v1/chat/completions` with SSE streaming, `/v1/models`, `/healthz`, `/metrics` |
 | Tool calling | ✅ **Working** | OpenAI `tools` / `tool_calls`, validated end to end. Flash-Next only |
@@ -29,6 +31,23 @@ are the honest measurement journal, dead ends included.
 | Parity harness | ✅ **Working** | 9 generator scripts, tensor-by-tensor, see [parity method](docs/parity-method.md) |
 | Speculative decoding (MTP) | ⚠️ **Off by default** | Measured at 0.939× greedy after the F7 fix, and crashes the QSA mask at long context. Kept, not recommended |
 | Expert offload to disk | ❌ **Not shipped** | Studied and dropped: decoding needs 13.3 GiB/s of expert weights per token, more than any local storage path measured here. See `docs/knowledge/investigations/p3-expert-offload.md` |
+
+## Embedding in an app
+
+The `Qwen38Brain` library product loads a model, takes an OpenAI-shaped
+conversation and streams typed events (reasoning, text, tool calls, usage).
+It depends on upstream `mlx-swift-lm` (`main`), so it resolves alongside other
+MLX packages such as LTX or Gemma without a dependency conflict.
+
+```swift
+import Qwen38Brain
+
+let brain = try await Qwen38Brain.load(modelDirectory: bonsaiURL, profile: .lean)
+for try await event in await brain.respond(to: messages, tools: tools) { … }
+```
+
+Measured profiles, tool loop and memory notes: [`docs/integration/fluxforge-studio.md`](docs/integration/fluxforge-studio.md).
+`qwen38 brain ask|agent|bench|replay` drives the same library from the CLI.
 
 ## Requirements
 
