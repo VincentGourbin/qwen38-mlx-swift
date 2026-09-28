@@ -132,3 +132,23 @@ Lecture :
 
 Les règles de découpage qui en découlent sont dans la compétence
 `pi-plan-decoupage` (`~/.claude/skills/`).
+
+### v2 — 2026-09-28, Qwen3.8-27B-4bit, serveur corrigé, deux runs par découpage
+
+| Découpage | Run 1 | Run 2 | Bilan avec la v1 |
+|---|---|---|---|
+| mono | 4/4 · 27,7 min · 15 tours | **0/4** ¹ · 25 min · 5 tours | 2 réussites sur 3 |
+| split2 | 4/4 · 36,9 min · 25 tours | 4/4 · 43,4 min · 21 tours | 2/2 depuis le correctif |
+| split4-continue | 4/4 · 21,5 min · 27 tours | 4/4 · 25,0 min · 29 tours | **3/3**, le plus rapide |
+
+1. Le modèle a rédigé toute l'implémentation des quatre tâches dans sa
+   réflexion, soit 40 000 caractères. Il a atteint `maxTokens` (12 288) avant
+   d'émettre un seul appel. Aucun appel ne se trouvait dans la réflexion,
+   donc le correctif n'avait rien à récupérer.
+
+Le décodage a ralenti au fil de l'après-midi : 13-14 tok/s le matin,
+6,5-9 tok/s en v2. Les durées v2 sont donc pessimistes.
+
+Conclusion pour le 27B local :
+- une tâche par fiche, dans une session pi poursuivie ;
+- la fiche unique est plus exposée à une réflexion qui déborde.

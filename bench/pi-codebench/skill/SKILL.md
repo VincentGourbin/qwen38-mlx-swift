@@ -6,24 +6,30 @@ description: Découper un plan d'implémentation en fiches que pi.dev exécutera
 # Découper un plan pour pi.dev
 
 Règles mesurées, pas intuitives : banc `bench/pi-codebench/` du dépôt
-`qwen38-mlx-swift` (campagne v1 du 2026-09-28, un run par combinaison ;
-v2 en cours). Même fonctionnalité Swift (≈ 300 lignes, 4 tâches, 5 fichiers),
-même harnais pi 0.87.1, notation par tests d'acceptation cachés.
+`qwen38-mlx-swift` (campagnes v1 et v2 du 2026-09-28 ; cloud : un run par
+combinaison ; Qwen3.8-27B local : trois runs par découpage). Même
+fonctionnalité Swift (≈ 300 lignes, 4 tâches, 5 fichiers), même harnais
+pi 0.87.1, notation par tests d'acceptation cachés.
 
 | Modèle | 1 fiche pour tout | 1 tâche par fiche | Profil |
 |---|---|---|---|
 | glm-5.3-flash (cloud) | 4/4 · 2,4 min · 14 tours | 4/4 · 2,9 min · 35 tours | solide |
 | gemma4 (cloud) | 4/4 · 2,3 min · 37 tours | 4/4 · 2,5 min · 46 tours | solide |
-| Qwen3.8-27B 4 bits (local) | 4/4 · 32 min · 15 tours | 4/4 · 52 min (sessions neuves) · 29 min (session poursuivie) | solide, lent |
+| Qwen3.8-27B 4 bits (local) | **2 réussites / 3** · 26-32 min | **3/3** · 21-29 min (session poursuivie) ; 52 min en sessions neuves | fiable en fiches courtes |
 | gpt-oss:120b (cloud) | 0/4 | 4/4 · 100 tours | a besoin de découpage |
 | gpt-oss:20b (cloud) | 0/4, paquet cassé | 3/4 (rate la tâche multi-fichiers) | à la limite |
 
 ## 1. Choisir la granularité selon le modèle
 
-- **Modèle solide** (glm-5.3-flash, gemma4, Qwen3.8-27B) : une fiche = une
+- **Modèle cloud solide** (glm-5.3-flash, gemma4) : une fiche = une
   fonctionnalité cohérente (jusqu'à ~4 tâches liées, ~5 fichiers, ~300 lignes).
-  Découper plus fin n'augmente pas la réussite et coûte des tours ; en local,
-  chaque session neuve relit le code et perd le cache (+60 % de temps mesuré).
+  Découper plus fin n'augmente pas la réussite et coûte des tours.
+- **Qwen3.8-27B local** : **une tâche par fiche, dans la même session**.
+  C'est à la fois le plus fiable (3/3) et le plus rapide (21-29 min). La
+  fiche unique échoue une fois sur trois : le modèle rédige toute
+  l'implémentation dans sa réflexion et dépasse `maxTokens` (12 288) avant
+  d'avoir émis un seul appel ; pi s'arrête, rien n'est modifié. Deux tâches
+  par fiche passent (2/2 après correctif serveur) mais coûtent ~40 min.
 - **Modèle faible ou inconnu** (famille gpt-oss, petits modèles) : **une tâche
   par fiche**, une session neuve par fiche. C'est ce qui fait passer gpt-oss de
   0/4 à 4/4 (120b) ou 3/4 (20b).
@@ -63,6 +69,9 @@ dire explicitement quel test existant va changer et pourquoi.
 - Une règle dans AGENTS.md : « si un test existant contredit le comportement
   demandé, mets-le à jour ; ne supprime ni ne désactive aucun test ».
 - Pas de hors-sujet : ce que la fiche ne demande pas va dans `ASK.md`.
+- Pour un modèle local qui réfléchit (Qwen3.8) : dans AGENTS.md, « modifie un
+  fichier à la fois ; ne rédige pas tout le code dans ta réflexion avant
+  d'agir ». Augmenter `maxTokens` ne ferait que repousser la coupure.
 
 ## 5. Signaux d'alerte à lire dans la session pi
 
@@ -76,7 +85,8 @@ capacité pour cette granularité : redécouper ou changer de modèle.
 - plus de ~40 tours pour une seule tâche ;
 - une fin de fiche sans aucun `swift test` ;
 - côté local : une réponse coupée à `maxTokens` (`stopReason: length`) = boucle
-  de réflexion ; un tour « texte seul » sans modification alors que la fiche
+  de réflexion ou implémentation entière rédigée en réflexion (fiche trop
+  grosse pour ce modèle) ; un tour « texte seul » sans modification alors que la fiche
   n'est pas faite = appel d'outil resté dans la réflexion (corrigé dans
   qwen38 serve le 2026-09-28, vérifier que le binaire est à jour).
 
