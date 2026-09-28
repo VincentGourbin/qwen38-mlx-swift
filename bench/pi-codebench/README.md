@@ -197,3 +197,43 @@ Lecture :
 - **L'ordre de grandeur** : une fonctionnalité d'environ 300 lignes coûte
   quelques centimes. Le forfait Pro d'Ollama (20 $/mois pour 60 $ de crédits)
   couvre plus de 2 000 fonctionnalités de cette taille.
+
+### Coût local (MacBook Pro M3 Max) comparé au cloud
+
+Méthode :
+- **Durée par run réussi** : durée totale des runs, échecs compris, divisée
+  par le nombre de réussites. Pour le 27B en `split4-continue`, trois runs
+  réussis sur trois font 25,2 min par fonctionnalité livrée.
+- **Électricité** : Tarif Bleu EDF, 0,2001 €/kWh au 1er août 2026.
+  - Au repos, le Mac consomme 22 W, mesurés (`ioreg`, `SystemLoad`), modèle
+    chargé.
+  - La puissance en pleine inférence n'a pas pu être mesurée proprement : le
+    GPU était pris par une autre tâche. On prend donc une fourchette de 60 à
+    100 W. Le résultat en dépend peu, puisque l'électricité pèse moins de
+    1 centime.
+- **Amortissement** : MacBook Pro 16" M3 Max 96 Go à 5 169 € (dernier prix
+  LDLC), sur 4 ans, soit 44 c€ de l'heure à 8 h par jour et 15 c€ de l'heure
+  à 24 h par jour.
+- **Change** : 1 € ≈ 1,10 $. Toutes les hypothèses sont dans `mac_costs.json`.
+
+| Option | Réussite | Durée par fonctionnalité | Coût par fonctionnalité livrée |
+|---|---|---:|---:|
+| gemma4, Ollama Cloud, une tâche par fiche | 2/2 | 2,1 min | **2,5 ¢** |
+| glm-5.3-flash, Ollama Cloud, fiche unique | 2/2 | 2,5 min | **2,6 ¢** |
+| 27B local, électricité seule (Mac déjà acheté) | 3/3 | 25 min | **0,6 à 0,9 ¢** |
+| 27B local, amorti 24 h/24 sur 4 ans | 3/3 | 25 min | ≈ 7 à 7,5 ¢ |
+| 27B local, amorti 8 h/jour sur 4 ans | 3/3 | 25 min | ≈ 21 ¢ |
+| 27B local en fiche unique, amorti 8 h/jour | 2/3 | 42 min | ≈ 35 ¢ |
+
+Lecture :
+- **Si le Mac est déjà là**, le local est le moins cher : moins d'un centime
+  d'électricité par fonctionnalité. Mais il est dix fois plus lent que le
+  cloud, qui livre en 2 à 3 min.
+- **Si le Mac est acheté pour ça**, l'amortissement domine tout. Selon le
+  taux d'usage, le local coûte 3 à 8 fois plus cher que glm-5.3-flash ou
+  gemma4 dans le cloud.
+- **Le local rattrape le cloud** quand il sert de toute façon : données qui
+  ne doivent pas sortir, travail hors ligne, Mac déjà rentabilisé par
+  d'autres usages.
+- **Le découpage compte aussi en euros.** En local, la fiche unique échoue une
+  fois sur trois, ce qui fait passer le coût par fonctionnalité de 21 à 35 c€.

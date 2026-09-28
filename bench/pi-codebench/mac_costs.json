@@ -1,0 +1,11 @@
+{
+  "_note": "Hypothèses du coût local, à adapter. L'énergie, elle, est mesurée (télémétrie ioreg SystemLoad, tout le Mac).",
+  "electricity_eur_per_kwh": 0.2001,
+  "_electricity_source": "Tarif Bleu EDF, option Base 6 kVA, au 1er août 2026",
+  "mac_price_eur": 5169,
+  "_mac_source": "MacBook Pro 16 M3 Max 96 Go / 1 To, dernier prix LDLC (produit retiré de la vente)",
+  "amortization_years": 4,
+  "amortization_hours_per_day": 8,
+  "usd_per_eur": 1.10,
+  "_usd_per_eur_note": "hypothèse de change pour comparer aux tarifs Ollama en dollars"
+}

@@ -37,6 +37,26 @@ def cost(run) -> float | None:
             + run["output_tokens"] * p["output"]) / 1e6
 
 
+MAC = json.loads((HERE / "mac_costs.json").read_text())
+
+
+def mac_cost(run) -> dict | None:
+    """Coût local d'un run mesuré (`--measure-power`), en euros : électricité
+    totale, électricité au-dessus du repos (marginale), amortissement du Mac
+    au prorata de la durée."""
+    if "energy_wh" not in run:
+        return None
+    hours = run["wall_s"] / 3600
+    idle_wh = run.get("idle", {}).get("mean_w", 0) * hours
+    kwh_price = MAC["electricity_eur_per_kwh"]
+    per_hour = MAC["mac_price_eur"] / (MAC["amortization_years"] * 365 * MAC["amortization_hours_per_day"])
+    return {"energy_wh": run["energy_wh"], "mean_w": run["mean_w"],
+            "idle_w": run.get("idle", {}).get("mean_w", 0),
+            "electricity": run["energy_wh"] / 1000 * kwh_price,
+            "marginal": max(run["energy_wh"] - idle_wh, 0) / 1000 * kwh_price,
+            "amortization": hours * per_hour}
+
+
 def med(xs):
     return statistics.median(xs) if xs else 0
 
@@ -88,6 +108,27 @@ def main() -> None:
         per_success = f"{sum(costs) / ok * 100:.2f} ¢" if ok else "—"
         print(f"| {model} | {plan} | {len(rs)} | {ok}/{len(rs)} | {med(costs) * 100:.2f} ¢ "
               f"| {sum(costs) * 100:.2f} ¢ | {per_success} | {med([r['output_tokens'] for r in rs]):.0f} |")
+
+    measured = [r for r in runs if "energy_wh" in r]
+    if measured:
+        print(f"\nCoût local mesuré ({MAC['electricity_eur_per_kwh']} €/kWh ; Mac {MAC['mac_price_eur']} € "
+              f"amorti sur {MAC['amortization_years']} ans à {MAC['amortization_hours_per_day']} h/jour) :\n")
+        print("| Modèle | Découpage | Runs | Succès | Durée méd. | Puissance moy. | Repos | Énergie méd. "
+              "| Électricité | dont au-dessus du repos | Amortissement | Total par run réussi |")
+        print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        mgroups = defaultdict(list)
+        for r in measured:
+            mgroups[(r["model"], r["plan"])].append(r)
+        for (model, plan), rs in sorted(mgroups.items()):
+            cs = [mac_cost(r) for r in rs]
+            ok = sum(1 for r in rs if r["success"])
+            total = sum(c["electricity"] + c["amortization"] for c in cs)
+            print(f"| {model} | {plan} | {len(rs)} | {ok}/{len(rs)} | {med([r['wall_s'] for r in rs]) / 60:.1f} min "
+                  f"| {med([c['mean_w'] for c in cs]):.0f} W | {med([c['idle_w'] for c in cs]):.0f} W "
+                  f"| {med([c['energy_wh'] for c in cs]):.1f} Wh "
+                  f"| {med([c['electricity'] for c in cs]) * 100:.2f} c€ | {med([c['marginal'] for c in cs]) * 100:.2f} c€ "
+                  f"| {med([c['amortization'] for c in cs]) * 100:.1f} c€ "
+                  f"| {total / ok * 100:.1f} c€ ≈ {total / ok * MAC['usd_per_eur'] * 100:.1f} ¢ |" if ok else "| — |")
 
     print("\nPar fiche (médianes) :\n")
     print("| Modèle | Découpage | Fiche | Tâches | Durée | Tours | Contexte max | Réussite |")

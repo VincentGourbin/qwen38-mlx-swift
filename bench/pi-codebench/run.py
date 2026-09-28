@@ -85,6 +85,47 @@ def health(base: str) -> dict:
         return json.loads(r.read())
 
 
+# ---------------------------------------------------------------- énergie
+
+def system_load_watts() -> float | None:
+    """Puissance consommée par tout le Mac (`SystemLoad` de la télémétrie de
+    la batterie, en mW, lisible sans sudo), ou `None` si indisponible."""
+    out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery"], capture_output=True, text=True).stdout
+    m = re.search(r'"SystemLoad"=(\d+)', out)
+    return int(m.group(1)) / 1000 if m else None
+
+
+class PowerSampler:
+    """Échantillonne la puissance du Mac toutes les `period` secondes dans un
+    fil à part ; `stop()` rend l'énergie (Wh) et la puissance moyenne (W)."""
+
+    def __init__(self, period: float = 2.0):
+        import threading
+        self.period, self.samples = period, []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            w = system_load_watts()
+            if w is not None:
+                self.samples.append((now(), w))
+            self._stop.wait(self.period)
+
+    def start(self) -> "PowerSampler":
+        self._thread.start()
+        return self
+
+    def stop(self) -> dict:
+        self._stop.set()
+        self._thread.join()
+        if len(self.samples) < 2:
+            return {}
+        energy = sum((t1 - t0) * w0 for (t0, w0), (t1, _) in zip(self.samples, self.samples[1:])) / 3600
+        span = self.samples[-1][0] - self.samples[0][0]
+        return {"energy_wh": round(energy, 3), "mean_w": round(energy * 3600 / span, 1) if span else 0}
+
+
 # ---------------------------------------------------------------- pi
 
 def write_pi_config(agent_dir: Path, provider: str, model: str, base_url: str,
@@ -262,13 +303,23 @@ def one_run(args, model: str, rep: int) -> dict:
               "started": dt.datetime.now().isoformat(timespec="seconds"), "fiches": []}
     print(f"== {run_id}", flush=True)
     continued = args.plan.endswith("-continue")
+    if args.measure_power:
+        # Puissance au repos, modèle chargé et serveur inactif : ce que le Mac
+        # consomme de toute façon, retranché pour le coût marginal.
+        idle = PowerSampler().start()
+        time.sleep(args.idle_seconds)
+        result["idle"] = idle.stop()
+        print(f"   repos : {result['idle'].get('mean_w', '?')} W", flush=True)
     done: list[str] = []
     seen_entries = 0
     for i, group in enumerate(fiches, 1):
         fiche = f"plan/F{i}.md"
+        sampler = PowerSampler().start() if args.measure_power else None
         pi = run_pi(ws, agent_dir, session_dir, args.provider, model, args.thinking, fiche,
                     cont=continued and i > 1, timeout=args.fiche_timeout,
                     log=run_dir / f"F{i}.events.jsonl")
+        if sampler:
+            pi.update(sampler.stop())
         sessions = sorted(session_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         metrics = {}
         if sessions:
@@ -291,6 +342,9 @@ def one_run(args, model: str, rep: int) -> dict:
     for k in ("turns", "tool_calls", "tool_errors", "input_tokens", "cached_tokens",
               "output_tokens", "compactions", "test_runs"):
         result[k] = sum(f.get(k, 0) for f in result["fiches"])
+    if args.measure_power:
+        result["energy_wh"] = round(sum(f.get("energy_wh", 0) for f in result["fiches"]), 2)
+        result["mean_w"] = round(result["energy_wh"] * 3600 / result["wall_s"], 1)
     result["max_context"] = max(f.get("max_context", 0) for f in result["fiches"])
     result["diff"] = diff_stats(ws)
     (run_dir / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False))
@@ -329,6 +383,9 @@ def main() -> None:
     ap.add_argument("--context-window", type=int, default=65536)
     ap.add_argument("--max-tokens", type=int, default=12288)
     ap.add_argument("--label", default="")
+    ap.add_argument("--measure-power", action="store_true",
+                    help="mesurer l'énergie du Mac pendant chaque fiche (télémétrie ioreg)")
+    ap.add_argument("--idle-seconds", type=int, default=60)
     ap.add_argument("--dry-check", action="store_true")
     args = ap.parse_args()
 
