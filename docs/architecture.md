@@ -1,13 +1,14 @@
 # Architecture
 
-Five modules, declared in `Package.swift`. The split is not cosmetic: it is
+Six modules, declared in `Package.swift`. The split is not cosmetic: it is
 what lets the agent loop and the server be unit-tested without a 100 GB
 checkpoint, a GPU, or a network.
 
 ```
 Qwen38Core ──┬── Qwen38Server ──┬── Qwen38CLI        (qwen38)
              │                  └── Qwen38BenchUI    (qwen38-bench-ui)
-             └── Qwen38Agent ───────┘
+             ├── Qwen38Agent ───────┘
+             └── Qwen38Brain  ──────── Qwen38CLI (qwen38 brain …), any app
 ```
 
 ## `Qwen38Core` — the model
@@ -51,6 +52,22 @@ else `~/models`, else `~/Library/Caches/models`); `Qwen38Download` fetches a
 Hugging Face repo over plain HTTPS; `Qwen38ToolCalling` translates between the
 checkpoint's XML-ish `<tool_call>` grammar and OpenAI's `tools` / `tool_calls`
 JSON; `Qwen38VisibleText` separates reasoning from answer.
+
+`Dense/Qwen38DenseConversationEngine.swift` is the reusable-conversation
+engine of the dense family (Qwen 3.5, Bonsai 2), reached through
+`Qwen38Runtime.generateDenseConversation`: it snapshots the GatedDeltaNet state
+at the end of the last message, trims the attention KV on the next request,
+and prefills only the new suffix through the model's own `prepare` (so only new
+images run through the vision tower). Both the server and `Qwen38Brain` use it.
+
+## `Qwen38Brain` — the embeddable assistant
+
+The library an app links: `Qwen38Brain.load(modelDirectory:profile:)`, then
+`respond(to:tools:options:)` streaming `.reasoning`, `.text`, `.toolCall` and
+`.done(usage)`. `Qwen38BrainProfile.fast` / `.lean` bundle measured settings
+(KV quantization, prefill chunk, MLX cache and memory limits). It depends only
+on `Qwen38Core` — no HTTP server. Guide:
+[`integration/fluxforge-studio.md`](integration/fluxforge-studio.md).
 
 ## `Qwen38Server` — the OpenAI-compatible API
 
@@ -122,7 +139,6 @@ A single-window SwiftUI app with three tabs.
 
 ## Vendored and pinned dependencies
 
-`Vendor/mlx-swift-lm` is a pinned local checkout of an upstream PR carrying
-Qwen MTP support, and is treated as read-only: the P7 and P10 investigations
-stop at its boundary. `mlx-swift` is pinned to an **exact** version because
+`mlx-swift-lm` is upstream `main` (no fork since 2026-09-27; the former local
+checkout of PR #545 is described for history in `Vendor/README.md`). `mlx-swift` is pinned to an **exact** version because
 patch releases have changed APIs before.

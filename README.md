@@ -442,7 +442,7 @@ Kept visible on purpose.
   — embedding `Qwen38Brain` in an app: profiles, tool loop, images, memory
 - [`docs/integration/evaluation-fluxforge.md`](docs/integration/evaluation-fluxforge.md)
   — evaluating an app's own use cases on the agent bench
-- [`docs/architecture.md`](docs/architecture.md) — the five modules and what
+- [`docs/architecture.md`](docs/architecture.md) — the six modules and what
   each one owns
 - [`docs/parity-method.md`](docs/parity-method.md) — how the port is proven
   equivalent to the Python reference, and how to regenerate the fixtures
