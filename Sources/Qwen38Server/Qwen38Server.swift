@@ -1241,9 +1241,10 @@ public actor Qwen38InferenceServer {
         var toolCallsOut: [ChatCompletionToolCallOut]? = nil
         var rememberedToolCalls: [Qwen38ToolCall] = []
         if !options.tools.isEmpty {
-            let parsed = Qwen38ToolCallParser.parse(text)
+            let parsed = Qwen38ToolCallParser.parse(content: text, reasoning: reasoning)
             if !parsed.calls.isEmpty {
                 text = parsed.content
+                reasoning = parsed.reasoning
                 let built = parsed.calls.map { call -> (out: ChatCompletionToolCallOut, remembered: Qwen38ToolCall) in
                     let schema = options.tools.first(where: { $0.name == call.name })?.parameters
                     let argumentsJSON = Qwen38ToolArgumentTyper.typedArguments(call.parameters, schema: schema).toJSONString()
@@ -1296,6 +1297,10 @@ public actor Qwen38InferenceServer {
 
             var parser = Qwen38ThinkingStreamParser(primedInside: primedInside)
             var responseContent = ""
+            // Gardé pour retrouver un appel écrit dans une réflexion jamais
+            // fermée (voir `Qwen38ToolCallParser.parse(content:reasoning:)`) ;
+            // la réflexion, elle, est déjà partie au fil de l'eau.
+            var responseReasoning = ""
             do {
                 for try await item in Self.mergingHeartbeat(stream) {
                     switch item {
@@ -1305,12 +1310,14 @@ public actor Qwen38InferenceServer {
                         await self.updateSessionAsync(sessionID, chunk: chunk)
                         let output = parser.append(chunk)
                         responseContent += output.content
+                        if hasTools { responseReasoning += output.reasoning }
                         if !output.reasoning.isEmpty { try await writeDelta(reasoning: output.reasoning) }
                         if !hasTools, !output.content.isEmpty { try await writeDelta(content: output.content) }
                     case .event(.metrics(let metrics)):
                         await self.completeSessionAsync(sessionID, metrics: metrics)
                         let tail = parser.finish()
                         responseContent += tail.content
+                        if hasTools { responseReasoning += tail.reasoning }
                         if !tail.reasoning.isEmpty { try await writeDelta(reasoning: tail.reasoning) }
                         if !hasTools, !tail.content.isEmpty { try await writeDelta(content: tail.content) }
 
@@ -1320,7 +1327,7 @@ public actor Qwen38InferenceServer {
                         // les `tool_calls` structurés plutôt que le XML brut.
                         var rememberedToolCalls: [Qwen38ToolCall] = []
                         if hasTools {
-                            let parsed = Qwen38ToolCallParser.parse(responseContent)
+                            let parsed = Qwen38ToolCallParser.parse(content: responseContent, reasoning: responseReasoning)
                             if !parsed.content.isEmpty { try await writeDelta(content: parsed.content) }
                             if !parsed.calls.isEmpty {
                                 let built = parsed.calls.enumerated().map { index, call -> (out: ChatCompletionToolCallOut, remembered: Qwen38ToolCall) in

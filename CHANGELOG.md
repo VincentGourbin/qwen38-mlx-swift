@@ -16,6 +16,20 @@
   answers as sequential runs.
 - API key compared in constant time; oversized bodies return 413 instead of 500.
 
+### Tool calls written inside an unclosed reasoning block
+- Qwen3.8-27B sometimes writes its `<tool_call>` blocks without ever closing
+  `</think>`: the whole turn landed in `reasoning_content`, the client saw a
+  text-only answer and stopped with nothing edited (pi-codebench, `split2`).
+  The server (JSON and streaming) and `Qwen38Brain` now recover complete calls
+  from the reasoning when the answer itself has neither a call nor visible
+  text. A call merely drafted while thinking, followed by a real answer, is
+  left alone; a truncated call is never guessed.
+
+### pi-codebench
+- `bench/pi-codebench/`: a short, graded code-creation bench run by pi.dev
+  (four tasks on a standalone Swift package, hidden acceptance tests), to
+  compare models and plan granularities. See its README for results.
+
 ## v0.1.1 — 2026-09-27
 
 ### Images in the reusable-conversation engine

@@ -5781,3 +5781,28 @@ func serverFallsBackToStatelessReplayWhenContinuationSuffixUnavailable() async t
     let after = await server.snapshot()
     #expect(after.prefixHits - baseline.prefixHits == 1)
 }
+
+// pi-codebench (2026-09-28) : un appel écrit dans une réflexion jamais fermée
+// doit rester un appel, pas un tour « texte seul » qui fait abandonner l'agent.
+@Test("Appel d'outil dans une réflexion non fermée : récupéré seulement si la réponse est vide")
+func toolCallRecoveredFromUnclosedReasoning() {
+    let call = "<tool_call>\n<function=read>\n<parameter=path>\nSources/A.swift\n</parameter>\n</function>\n</tool_call>"
+
+    let recovered = Qwen38ToolCallParser.parse(content: "\n", reasoning: "Je lis le fichier.\n" + call)
+    #expect(recovered.calls.map(\.name) == ["read"])
+    #expect(recovered.reasoning == "Je lis le fichier.\n")
+
+    // Une vraie réponse texte après un appel esquissé en réflexion : on ne touche à rien.
+    let answered = Qwen38ToolCallParser.parse(content: "Voici la réponse.", reasoning: call)
+    #expect(answered.calls.isEmpty)
+    #expect(answered.reasoning == call)
+
+    // Un appel dans la réponse l'emporte, la réflexion reste intacte.
+    let normal = Qwen38ToolCallParser.parse(content: call, reasoning: "brouillon " + call)
+    #expect(normal.calls.count == 1)
+    #expect(normal.reasoning == "brouillon " + call)
+
+    // Appel tronqué dans la réflexion (coupure max_tokens) : jamais deviné.
+    let truncated = Qwen38ToolCallParser.parse(content: "", reasoning: "<tool_call>\n<function=read>")
+    #expect(truncated.calls.isEmpty)
+}

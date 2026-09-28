@@ -1,0 +1,138 @@
+diff -ru fixture/Sources/AgentKit/AgentLoopEngine.swift reference/Sources/AgentKit/AgentLoopEngine.swift
+--- fixture/Sources/AgentKit/AgentLoopEngine.swift	2026-09-28 12:06:44
++++ reference/Sources/AgentKit/AgentLoopEngine.swift	2026-09-28 12:08:03
+@@ -18,8 +18,20 @@
+     /// Appel « valide » : bien formé, outil connu, et tous les paramètres
+     /// requis par son schéma sont présents.
+     public var valid = 0
++    public var promptTokens = 0
++    public var completionTokens = 0
++    public var cachedTokens = 0
+ 
+     public init() {}
++
++    public var cacheHitRate: Double {
++        promptTokens == 0 ? 0 : Double(cachedTokens) / Double(promptTokens)
++    }
++
++    public var summary: String {
++        let percent = String(format: "%.1f", cacheHitRate * 100).replacingOccurrences(of: ".", with: ",")
++        return "\(steps) pas · \(calls) appels (\(valid) valides) · \(promptTokens) jetons d'entrée dont \(cachedTokens) en cache (\(percent) %) · \(completionTokens) jetons de sortie"
++    }
+ }
+ 
+ /// Un appel d'outil exécuté à un pas donné — ce que le journal pas à pas
+@@ -157,6 +169,11 @@
+     @discardableResult
+     public mutating func apply(_ turn: AgentModelTurn) -> (record: AgentStepRecord, outcome: AgentStepOutcome) {
+         stats.steps += 1
++        if let usage = turn.usage {
++            stats.promptTokens += usage.promptTokens
++            stats.completionTokens += usage.completionTokens
++            stats.cachedTokens += usage.cachedTokens
++        }
+ 
+         guard !turn.toolCalls.isEmpty else {
+             stats.textOnlyTurns += 1
+diff -ru fixture/Sources/AgentKit/AgentToolCatalog.swift reference/Sources/AgentKit/AgentToolCatalog.swift
+--- fixture/Sources/AgentKit/AgentToolCatalog.swift	2026-09-28 12:06:44
++++ reference/Sources/AgentKit/AgentToolCatalog.swift	2026-09-28 12:08:03
+@@ -12,6 +12,7 @@
+         "list_files": ["path"],
+         "read_file": ["path"],
+         "grep": ["pattern"],
++        "count_lines": ["path"],
+         "final_answer": ["answer"],
+     ]
+ 
+@@ -63,6 +64,18 @@
+                             "path": ["type": "string"],
+                         ],
+                         "required": ["pattern"],
++                    ],
++                ],
++            ],
++            [
++                "type": "function",
++                "function": [
++                    "name": "count_lines",
++                    "description": "Compte les lignes d'un fichier sous la racine choisie.",
++                    "parameters": [
++                        "type": "object",
++                        "properties": ["path": ["type": "string"]],
++                        "required": ["path"],
+                     ],
+                 ],
+             ],
+diff -ru fixture/Sources/AgentKit/AgentToolExecutor.swift reference/Sources/AgentKit/AgentToolExecutor.swift
+--- fixture/Sources/AgentKit/AgentToolExecutor.swift	2026-09-28 12:06:44
++++ reference/Sources/AgentKit/AgentToolExecutor.swift	2026-09-28 12:08:03
+@@ -43,6 +43,14 @@
+                     throw AgentToolInputError(message: "paramètre requis manquant : pattern")
+                 }
+                 return try grep(pattern: pattern, path: arguments["path"] as? String)
++            case "count_lines":
++                guard let path = arguments["path"] as? String else {
++                    throw AgentToolInputError(message: "paramètre requis manquant : path")
++                }
++                let text = try String(contentsOf: try sandbox.resolve(path), encoding: .utf8)
++                var lines = text.components(separatedBy: "\n")
++                if lines.last == "" { lines.removeLast() }
++                return "\(lines.count) lignes"
+             default:
+                 return "outil inconnu : \(name)"
+             }
+diff -ru fixture/Sources/AgentKit/AgentWireFormat.swift reference/Sources/AgentKit/AgentWireFormat.swift
+--- fixture/Sources/AgentKit/AgentWireFormat.swift	2026-09-28 12:06:44
++++ reference/Sources/AgentKit/AgentWireFormat.swift	2026-09-28 12:08:03
+@@ -45,16 +45,30 @@
+ /// Le tour renvoyé par le serveur pour un pas de la boucle — extrait d'une
+ /// réponse `/v1/chat/completions` non diffusée (la même forme que
+ /// `d["choices"][0]["message"]` côté Python).
++public struct AgentTokenUsage: Equatable, Sendable {
++    public var promptTokens: Int
++    public var completionTokens: Int
++    public var cachedTokens: Int
++
++    public init(promptTokens: Int, completionTokens: Int, cachedTokens: Int = 0) {
++        self.promptTokens = promptTokens
++        self.completionTokens = completionTokens
++        self.cachedTokens = cachedTokens
++    }
++}
++
+ public struct AgentModelTurn: Equatable, Sendable {
+     public var content: String
+     public var reasoning: String
+     public var toolCalls: [AgentToolCallRecord]
+     public var finishReason: String?
++    public var usage: AgentTokenUsage?
+ 
+     public init(
+         content: String = "", reasoning: String = "", toolCalls: [AgentToolCallRecord] = [],
+-        finishReason: String? = nil
++        finishReason: String? = nil, usage: AgentTokenUsage? = nil
+     ) {
++        self.usage = usage
+         self.content = content
+         self.reasoning = reasoning
+         self.toolCalls = toolCalls
+@@ -134,8 +148,17 @@
+                 toolCalls.append(AgentToolCallRecord(id: id, name: name, argumentsJSON: arguments))
+             }
+         }
++        var usage: AgentTokenUsage?
++        if let raw = object["usage"] as? [String: Any] {
++            let details = raw["prompt_tokens_details"] as? [String: Any]
++            usage = AgentTokenUsage(
++                promptTokens: (raw["prompt_tokens"] as? Int) ?? 0,
++                completionTokens: (raw["completion_tokens"] as? Int) ?? 0,
++                cachedTokens: (details?["cached_tokens"] as? Int) ?? 0)
++        }
+         return AgentModelTurn(
+-            content: content, reasoning: reasoning, toolCalls: toolCalls, finishReason: finishReason)
++            content: content, reasoning: reasoning, toolCalls: toolCalls, finishReason: finishReason,
++            usage: usage)
+     }
+ 
+     /// Lit `/healthz` et en extrait le nom du modèle chargé — `nil` si le

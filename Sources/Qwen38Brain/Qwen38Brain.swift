@@ -183,25 +183,29 @@ public actor Qwen38Brain {
                     var parser = Qwen38ThinkingStreamParser(primedInside: options.enableThinking)
                     var splitter = Qwen38ToolCallTextSplitter(enabled: !tools.isEmpty)
                     var fullContent = ""
+                    var fullReasoning = ""
                     for try await event in stream {
                         try Task.checkCancellation()
                         switch event {
                         case .chunk(let chunk):
                             let output = parser.append(chunk)
                             if !output.reasoning.isEmpty { continuation.yield(.reasoning(output.reasoning)) }
+                            fullReasoning += output.reasoning
                             fullContent += output.content
                             let visible = splitter.append(output.content)
                             if !visible.isEmpty { continuation.yield(.text(visible)) }
                         case .metrics(let metrics):
                             let tail = parser.finish()
                             if !tail.reasoning.isEmpty { continuation.yield(.reasoning(tail.reasoning)) }
+                            fullReasoning += tail.reasoning
                             fullContent += tail.content
                             let visibleTail = splitter.append(tail.content) + splitter.finish()
                             if !visibleTail.isEmpty { continuation.yield(.text(visibleTail)) }
                             var finish: Qwen38BrainUsage.FinishReason =
                                 metrics.stopReason == .length ? .length : .stop
                             if !tools.isEmpty {
-                                let parsed = Qwen38ToolCallParser.parse(fullContent)
+                                let parsed = Qwen38ToolCallParser.parse(
+                                    content: fullContent, reasoning: fullReasoning)
                                 for call in parsed.calls {
                                     let schema = tools.first(where: { $0.name == call.name })?.parameters
                                     let arguments = Qwen38ToolArgumentTyper.typedArguments(

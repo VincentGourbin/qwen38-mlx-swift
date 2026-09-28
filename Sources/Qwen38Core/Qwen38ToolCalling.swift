@@ -305,6 +305,25 @@ public enum Qwen38ToolCallParser {
         return (content, calls)
     }
 
+    /// Like `parse(_:)`, but also recovers calls the model wrote **inside its
+    /// reasoning** without ever closing `</think>` — seen on Qwen3.8-27B under
+    /// pi (pi-codebench, 2026-09-28): the whole turn lands in
+    /// `reasoning_content`, the client sees a text-only answer with no call
+    /// and ends the task with nothing edited. Recovery happens only when the
+    /// answer itself has no call **and** no visible text, so a call merely
+    /// drafted while thinking, followed by a real text answer, stays reasoning.
+    public static func parse(content: String, reasoning: String)
+        -> (content: String, reasoning: String, calls: [Qwen38ParsedToolCall])
+    {
+        let answer = parse(content)
+        guard answer.calls.isEmpty,
+              answer.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return (answer.content, reasoning, answer.calls) }
+        let thought = parse(reasoning)
+        guard !thought.calls.isEmpty else { return (answer.content, reasoning, []) }
+        return (answer.content, thought.content, thought.calls)
+    }
+
     private static func parseCall(_ body: Substring) -> Qwen38ParsedToolCall? {
         guard let openRange = body.range(of: functionOpenPrefix) else { return nil }
         guard let nameEnd = body[openRange.upperBound...].firstIndex(of: ">") else { return nil }
