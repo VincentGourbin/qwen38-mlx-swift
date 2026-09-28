@@ -1,9 +1,18 @@
 # Qwen3.8 MLX Swift
 
+[![Website](https://img.shields.io/badge/vinceforge.com-portfolio-blue)](https://vinceforge.com) [![Release](https://img.shields.io/github/v/release/VincentGourbin/qwen38-mlx-swift)](https://github.com/VincentGourbin/qwen38-mlx-swift/releases) [![License: MIT](https://img.shields.io/badge/code-MIT-green)](LICENSE) [![Buy Me a Coffee](https://img.shields.io/badge/Buy_me_a_coffee-fluxforgestudio-FFDD00?logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/fluxforgestudio)
+
 Native Qwen3.8 inference on Apple Silicon via [MLX Swift](https://github.com/ml-explore/mlx-swift) —
-the dense **27B** and the **Flash-Next** (`qwen4_exp`) sparse MoE — 512 experts
-per layer, 10 routed per token across 48 layers — with a CLI, an
-OpenAI-compatible server (tool calling included) and a SwiftUI bench app.
+the dense **27B**, **Bonsai 2** (Prism ML's ternary 2-bit 27B, 8.6 GB) and the
+**Flash-Next** (`qwen4_exp`) sparse MoE — 512 experts per layer, 10 routed per
+token across 48 layers — with an embeddable **`Qwen38Brain`** library, a CLI,
+an OpenAI-compatible server (tool calling included) and a SwiftUI bench app.
+
+`Qwen38Brain` is built to be the local assistant of an app: it depends on
+upstream `mlx-swift-lm` only, so it resolves next to other MLX packages
+(verified: Fluxforge Studio resolves a single `mlx-swift-lm` and builds with it
+alongside LTX, Flux 2 and Gemma 4). More of my work on
+[vinceforge.com](https://vinceforge.com).
 
 Flash-Next is not a small model politely quantized. It is Gated DeltaNet,
 four-stream hyper-connections, sparse QSA attention, an n-gram per-layer
@@ -18,13 +27,14 @@ are the honest measurement journal, dead ends included.
 |---|---|---|
 | Flash-Next text generation | ✅ **Working** | 48 resident layers, 3-bit checkpoint, **13.0–13.5 tok/s** greedy |
 | Flash-Next vision (images) | ✅ **Working** | Vision tower + MRoPE merge, parity-checked against Python |
-| Dense 27B (4-bit / 8-bit / bf16) | ✅ **Working** | 10.3–10.7 tok/s decode at 4-bit, text + image |
+| Dense 27B (4-bit / 8-bit / bf16) | ✅ **Working** | 17.8 tok/s decode at 4-bit (1 k context), text + image, tool calling |
 | Bonsai 2 (ternary 27B, 2-bit + Hadamard) | ✅ **Working** | `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`, parity with the Python runtime (greedy 32/32, logits ≤ 3.9e-5), text + image |
 | Embeddable brain (`Qwen38Brain`) | ✅ **Working** | `fast` / `lean` profiles, conversation reuse across agent turns, ~12 GB peak at 32k context in `lean`. See [integration guide](docs/integration/fluxforge-studio.md) |
 | Thinking mode | ✅ **Working** | `reasoning_content` separated from the answer, per-request or `--enable-thinking` |
 | OpenAI-compatible server | ✅ **Working** | `/v1/chat/completions` with SSE streaming, `/v1/models`, `/healthz`, `/metrics` |
-| Tool calling | ✅ **Working** | OpenAI `tools` / `tool_calls`, validated end to end. Flash-Next only |
-| Conversation & prefix caching | ✅ **Working** | Median TTFT **2.34 s** over 58 turns, with or without `conversation_id` |
+| Tool calling | ✅ **Working** | OpenAI `tools` / `tool_calls`, validated end to end on the 27B, Bonsai 2 and Flash-Next |
+| Conversation & prefix caching | ✅ **Working** | Dense family: the whole history is reused across agent turns, tool results and images included (4-turn agent: 78 s of prefill instead of 145 s). Flash-Next: median TTFT **2.34 s** over 58 turns |
+| Agent quality (LangWatch) | ✅ **Measured** | 8 coding-agent scenarios × 3, independent judge: 27B 4-bit **67 %**, Bonsai 2 **54 %**, cloud references 62–77 % |
 | Continuous-ish batching | ✅ **Working** | `--batch-size`: **×2.16** aggregate throughput at 8 clients, no solo regression |
 | Agent loop (GUI panel) | ✅ **Working** | 4 sandboxed read-only tools, no shell. Loop ×5.6 faster since suffix-by-diff |
 | Bench GUI | ✅ **Working** | 3 tabs: Chat, Server, Agent |
@@ -201,8 +211,10 @@ Non-standard request fields, accepted at the top level or inside `extra`:
 `mtp_engine`, `mtp_draft_tokens`, `conversation_id`, `routed_experts`,
 `repetition_penalty`, `penalty_context_tokens`.
 
-Responses add `reasoning_content` next to `content`. Note there is **no
-`usage` object** — token counts live in `/metrics`, not in the reply.
+Responses add `reasoning_content` next to `content`, and a standard `usage`
+object whose `prompt_tokens_details.cached_tokens` says how much of the prompt
+came from the conversation cache. The server also writes one usage line per
+request on stderr.
 
 ### Tool calling
 
@@ -214,8 +226,9 @@ and retypes each argument against the declared JSON Schema.
 
 Known boundaries, all deliberate:
 
-- **Flash-Next only.** `tools` against the 27B family returns HTTP 400: that
-  chat template only exists in this checkpoint.
+- The dense family (27B, Bonsai 2) and Flash-Next both render the tools with
+  their own chat template, members in the client's order (`tojson` matches
+  Python's `json.dumps`).
 - `tool_choice: "none"` is honoured; forcing a specific function is accepted
   but has no effect — the template has no notion of it.
 - `tool_call_id` is accepted and ignored: the template pairs tool results **by
@@ -314,12 +327,48 @@ from a dedicated `maxTokens=1` probe per variant, not an RSS estimate.
 The three-turn runs put an image on turn 1, thinking on low, 2048 max tokens.
 Full conditions and the MTP variants are in `BENCHMARKS.md`.
 
+### Dense family and Bonsai 2 (2026-09-27, profiled)
+
+`qwen38 brain bench --trace`, warm weights, 128 tokens generated. "Weights
+read" is weight size × decode rate: the bandwidth the decode actually draws
+(the chip's ceiling is 400 GB/s).
+
+| Model | Weights | Prefill 1 k · 10 k | Decode 1 k · 10 k | Weights read | Peak MLX at 10 k |
+|---|---:|---:|---:|---:|---:|
+| Bonsai 2 (2-bit + Hadamard) | 8.6 GB | 141 · 113 tok/s | 22.0 · 16.3 tok/s | 189 GB/s | 12.5 GB |
+| 27B 4-bit | 16.1 GB | 158 · 139 tok/s | 17.8 · 16.5 tok/s | 286 GB/s | 17.4 GB |
+| 27B 8-bit | 29.5 GB | 144 · 138 tok/s | 9.6 · 9.4 tok/s | 284 GB/s | 30.0 GB |
+| 27B bf16 | 54.7 GB | 146 · 151 tok/s | 5.3 · 5.1 tok/s | 291 GB/s | 53.9 GB |
+
+The GPU is busy 97–100 % in every phase: the time is in the kernels, not the
+host. `Qwen38Brain`'s `lean` profile (8-bit KV, 256-token prefill chunks,
+memory limits sized from available memory) keeps Bonsai 2 at **10.0 / 10.4 /
+12.2 GB** peak at 1 k / 10 k / 32 k tokens, vision included.
+
 ### Agent loop
 
 Rendering only the *new* suffix of a conversation instead of replaying it took
 the same ten-step task from **683.7 s to 122.0 s (×5.6)**; cumulative prefill
-from 593 s to 74 s. From the third step on, only a few dozen tokens are
-prefilled when a tool result is short.
+from 593 s to 74 s. On the dense family the engine snapshots the recurrent
+state at the end of the last message and trims the attention KV, so a turn
+that ends with tool results — or adds an image — only prefills what is new.
+
+Quality, on the LangWatch "coding agent" suite (8 scenarios × 3 passes, a
+simulated user and an independent judge from Ollama Cloud, the same agent and
+tools for every target):
+
+| Target | Success | Median run |
+|---|---:|---:|
+| Qwen3.8-27B 4-bit, local | 67 % | 154 s |
+| Bonsai 2, local | 54 % | 216 s |
+| glm-5.3-flash, cloud | ≈ 77 % | 44 s |
+| kimi-k2.7-code, cloud | ≈ 77 % | 46 s |
+| gpt-oss:120b, cloud | ≈ 62 % | 40 s |
+
+The suite, the harness and the per-scenario grid are in
+[`docs/langwatch-bench/plan.md`](docs/langwatch-bench/plan.md); any app can
+bring its own scenarios and simulated tools
+([evaluation guide](docs/integration/evaluation-fluxforge.md)).
 
 ## Known limitations
 
@@ -342,7 +391,6 @@ Kept visible on purpose.
   agent panel) are fine.
 - **One model resident per process**, requests serialised outside the batch
   path. This is not vLLM.
-- **No `usage` object** in chat completions; counts are in `/metrics`.
 - Vision and conversation caching do not combine with batching: a request
   carrying an image, declaring tools, or hitting a cache always takes the
   single-sequence path.
@@ -390,6 +438,10 @@ Kept visible on purpose.
 
 ## Documentation
 
+- [`docs/integration/fluxforge-studio.md`](docs/integration/fluxforge-studio.md)
+  — embedding `Qwen38Brain` in an app: profiles, tool loop, images, memory
+- [`docs/integration/evaluation-fluxforge.md`](docs/integration/evaluation-fluxforge.md)
+  — evaluating an app's own use cases on the agent bench
 - [`docs/architecture.md`](docs/architecture.md) — the five modules and what
   each one owns
 - [`docs/parity-method.md`](docs/parity-method.md) — how the port is proven
@@ -407,6 +459,8 @@ are a working journal, not a rewritten narrative.
 ## Acknowledgments
 
 - [Qwen](https://github.com/QwenLM) — the model architecture
+- [Prism ML](https://huggingface.co/prism-ml) — Bonsai 2, the ternary 2-bit 27B
+- [LangWatch](https://langwatch.ai) — the agent testing platform behind the quality bench
 - [mlx-swift](https://github.com/ml-explore/mlx-swift) and
   [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm) — Apple's MLX for Swift
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) — the Python reference
@@ -414,6 +468,12 @@ are a working journal, not a rewritten narrative.
 - [swift-transformers](https://github.com/huggingface/swift-transformers) — tokenizers
 - [hummingbird](https://github.com/hummingbird-project/hummingbird) — the HTTP server
 - [swift-mlx-profiler](https://github.com/VincentGourbin/swift-mlx-profiler) — Chrome-trace profiling
+
+## Support
+
+If this project is useful to you, you can
+[buy me a coffee](https://www.buymeacoffee.com/fluxforgestudio). More projects
+on [vinceforge.com](https://vinceforge.com).
 
 ## License
 
