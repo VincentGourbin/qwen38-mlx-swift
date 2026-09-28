@@ -3117,8 +3117,14 @@ struct Serve: AsyncParsableCommand {
     @Option(name: .long, help: "Port HTTP (défaut : 8848)")
     var port: Int = Qwen38InferenceServer.defaultPort
 
-    @Option(name: .long, help: "Clé Bearer optionnelle")
+    @Option(name: .long, help: "Clé Bearer ; obligatoire si --host n'est pas une adresse de boucle locale")
     var apiKey: String?
+
+    @Option(name: .long, help: "Adresse d'écoute (défaut : 127.0.0.1 ; 0.0.0.0 pour le réseau local, avec --api-key)")
+    var host: String = "127.0.0.1"
+
+    @Flag(name: .long, help: "Accepter les images en file:// (le serveur lit alors des fichiers locaux à la demande des clients)")
+    var allowFileImages = false
 
     @Option(
         name: .long,
@@ -3233,6 +3239,7 @@ struct Serve: AsyncParsableCommand {
         let server = Qwen38InferenceServer(runtime: runtime)
         try await server.start(
             port: port,
+            host: host,
             apiKey: apiKey,
             modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
                 .deletingLastPathComponent(),
@@ -3241,8 +3248,10 @@ struct Serve: AsyncParsableCommand {
             allowAblation: allowAblation,
             batchSize: batchSize, enableThinking: enableThinking,
             batchMaxPromptTokens: batchMaxPromptTokens,
-            batchWindowMs: batchWindowMs)
-        print("Qwen3.8 écoute sur http://0.0.0.0:\(port)")
+            batchWindowMs: batchWindowMs,
+            allowFileImages: allowFileImages)
+        print("Qwen3.8 écoute sur http://\(host):\(port)"
+            + (Qwen38InferenceServer.isLoopback(host) ? " (boucle locale seulement)" : " (réseau, clé d'API exigée)"))
         print("POST /v1/chat/completions · GET /v1/models · GET /metrics")
         if batchSize > 1 {
             print("P12.3 : regroupement actif, taille de lot \(batchSize) (voir /healthz · batch_size_configured)")

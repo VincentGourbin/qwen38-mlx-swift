@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Hummingbird
 import NIOCore
 import Qwen38Core
@@ -115,8 +116,12 @@ public enum Qwen38ServerError: LocalizedError, Equatable {
     case invalidPort, alreadyRunning, unauthorized, unsupportedImageURL, modelNotLoaded, noModelsAvailable
     case modelNotFound(String)
     case invalidRequest(String)
+    /// Issue #2 : écouter hors de la boucle locale sans clé d'API est refusé.
+    case remoteAccessNeedsAPIKey(String)
+    /// Issue #2 : trop d'images, image trop lourde ou trop grande.
+    case mediaLimitExceeded(String)
     public var errorDescription: String? {
-        switch self { case .invalidPort: return "Le port du serveur doit être compris entre 1 et 65535."; case .alreadyRunning: return "Le serveur Qwen3.8 est déjà démarré."; case .unauthorized: return "Clé API absente ou invalide."; case .unsupportedImageURL: return "Les images doivent être envoyées en data URL base64 ou en file:// local."; case .modelNotLoaded: return "Chargez un modèle avant de démarrer le serveur ou configurez un catalogue de modèles."; case .noModelsAvailable: return "Aucun modèle Qwen3.8 valide n'a été trouvé dans le catalogue."; case .modelNotFound(let model): return "Modèle indisponible dans le catalogue local : \(model)."; case .invalidRequest(let message): return message }
+        switch self { case .invalidPort: return "Le port du serveur doit être compris entre 1 et 65535."; case .alreadyRunning: return "Le serveur Qwen3.8 est déjà démarré."; case .unauthorized: return "Clé API absente ou invalide."; case .unsupportedImageURL: return "Les images doivent être envoyées en data URL base64 (file:// seulement si le serveur a été démarré avec --allow-file-images)."; case .modelNotLoaded: return "Chargez un modèle avant de démarrer le serveur ou configurez un catalogue de modèles."; case .noModelsAvailable: return "Aucun modèle Qwen3.8 valide n'a été trouvé dans le catalogue."; case .modelNotFound(let model): return "Modèle indisponible dans le catalogue local : \(model)."; case .invalidRequest(let message): return message; case .remoteAccessNeedsAPIKey(let host): return "Écouter sur \(host) expose le modèle au réseau : fournissez une clé d'API (--api-key) ou écoutez sur 127.0.0.1."; case .mediaLimitExceeded(let message): return message }
     }
 }
 
@@ -321,6 +326,7 @@ private struct ChatCompletionUsage: Codable, Sendable {
 private struct ModelListResponse: Codable, Sendable { let object: String; let data: [ModelDescription] }
 private struct ModelDescription: Codable, Sendable { let id: String; let object: String; let ownedBy: String; let loaded: Bool; let family: String?; enum CodingKeys: String, CodingKey { case id, object, ownedBy = "owned_by", loaded, family } }
 private struct HealthResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; let model: String?; let queue: String; let defaultEnableThinking: Bool; let routedExpertCount: Int?; let ablation: String; let batchSizeConfigured: Int; let batchMaxPromptTokensConfigured: Int; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded", model, queue, routedExpertCount = "routed_expert_count", defaultEnableThinking = "default_enable_thinking", ablation, batchSizeConfigured = "batch_size_configured", batchMaxPromptTokensConfigured = "batch_max_prompt_tokens_configured" } }
+private struct LivenessResponse: Codable, Sendable { let status: String; let modelLoaded: Bool; enum CodingKeys: String, CodingKey { case status, modelLoaded = "model_loaded" } }
 private struct ErrorResponse: Codable, Sendable { let error: ErrorPayload }
 private struct ErrorPayload: Codable, Sendable { let message: String; let type: String; let code: String? }
 
@@ -472,7 +478,26 @@ public actor Qwen38InferenceServer {
     // call sites and tests are unaffected.
     public init(runtime: Qwen38Runtime) { self.runtime = runtime }
 
-    public func start(port: Int = 8848, apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1, enableThinking: Bool = false, batchMaxPromptTokens: Int = 256, batchWindowMs: Int = 30) async throws {
+    /// Issue #2 : limites d'une requête chat. Corps JSON (images base64
+    /// comprises), nombre d'images, taille décodée et définition d'une image.
+    public static let maxRequestBodyBytes = 32 * 1024 * 1024
+    public static let maxImagesPerRequest = 4
+    public static let maxImageBytes = 20 * 1024 * 1024
+    public static let maxImagePixels = 20_000_000
+    private var listenHost = "127.0.0.1"
+    private var allowFileImages = false
+
+    /// `127.0.0.1`, `::1` et `localhost` ; tout le reste expose le serveur.
+    public static func isLoopback(_ host: String) -> Bool {
+        ["127.0.0.1", "::1", "localhost"].contains(host.lowercased())
+    }
+
+    public func start(port: Int = 8848, host: String = "127.0.0.1", apiKey: String? = nil, modelsDirectory: URL? = nil, conversationCacheGB: Double = 12, routedExpertCount: Int? = nil, allowAblation: Bool = false, batchSize: Int = 1, enableThinking: Bool = false, batchMaxPromptTokens: Int = 256, batchWindowMs: Int = 30, allowFileImages: Bool = false) async throws {
+        // Issue #2 : hors boucle locale, une clé d'API est obligatoire.
+        let normalizedKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        guard Self.isLoopback(host) || normalizedKey != nil else {
+            throw Qwen38ServerError.remoteAccessNeedsAPIKey(host)
+        }
         guard (1 ... 65_535).contains(port) else { throw Qwen38ServerError.invalidPort }
         // P12.3 : mémorisé pour toute la durée de vie du serveur — voir
         // `batchSize`'s doc comment. `<= 1` désactive le regroupement,
@@ -545,11 +570,12 @@ public actor Qwen38InferenceServer {
         guard !modelDirectories.isEmpty else { throw Qwen38ServerError.noModelsAvailable }
         if let currentDirectory, let id = modelDirectories.first(where: { sameDirectory($0.value, currentDirectory) })?.key { loadedModel = id }
         guard serverStatus == .stopped || serverStatus == .failed else { throw Qwen38ServerError.alreadyRunning }
-        serverPort = port; self.apiKey = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty; lastError = nil; serverStatus = .starting
+        serverPort = port; self.apiKey = normalizedKey; lastError = nil; serverStatus = .starting
+        listenHost = host; self.allowFileImages = allowFileImages
         let router = Router()
-        router.get("healthz") { [self] _, _ in await self.healthResponse() }
+        router.get("healthz") { [self] request, _ in await self.healthResponse(request: request) }
         router.get("v1/models") { [self] request, _ in await self.catchingHTTPErrors { try await self.modelsResponse(request: request) } }
-        router.get("metrics") { [self] _, _ in await self.metricsResponse() }
+        router.get("metrics") { [self] request, _ in await self.catchingHTTPErrors { try await self.metricsResponse(request: request) } }
         // P12.3 : à `batchSize == 1` (le défaut), `/v1/chat/completions`
         // reste très exactement `chatCompletionsResponse` — pas une variante
         // qui passerait par le nouveau code avec un lot de taille 1, la
@@ -561,7 +587,7 @@ public actor Qwen38InferenceServer {
         } else {
             router.post("v1/chat/completions") { [self] request, _ in await self.catchingHTTPErrors { try await self.chatCompletionsResponse(request: request) } }
         }
-        let application = Application(router: router, configuration: .init(address: .hostname("0.0.0.0", port: port), serverName: "Qwen38Inference"))
+        let application = Application(router: router, configuration: .init(address: .hostname(host, port: port), serverName: "Qwen38Inference"))
         serverTask = Task { [weak self, application] in
             do { try await application.run(); await self?.serverDidStop() }
             catch is CancellationError { await self?.serverDidStop() }
@@ -581,7 +607,8 @@ public actor Qwen38InferenceServer {
         let current = sessionOrder.compactMap { sessions[$0] }
         let cache = await runtime.flashConversationCacheSnapshot()
         return .init(
-            status: serverStatus, port: serverPort, url: "http://127.0.0.1:\(serverPort)",
+            status: serverStatus, port: serverPort,
+            url: "http://\(Self.isLoopback(listenHost) || listenHost == "0.0.0.0" ? "127.0.0.1" : listenHost):\(serverPort)",
             activeSessions: current.filter { $0.status == .queued || $0.status == .running }.count,
             queuedSessions: await queue.queuedCount, sessions: current,
             availableModels: modelDirectories.keys.sorted(), loadedModel: loadedModel,
@@ -601,15 +628,44 @@ public actor Qwen38InferenceServer {
     // P11.2 : `ablation` publié systématiquement, `"none"` quand il n'y en a
     // pas (aucun engin Flash-Next chargé, ou aucune ablation demandée) —
     // même garde de publication que `routed_expert_count`, PLAN.md P11.2.
-    private func healthResponse() async -> Response { Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), defaultEnableThinking: defaultEnableThinking, routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize, batchMaxPromptTokensConfigured: batchMaxPromptTokens)) }
+    /// Issue #2 : sans clé valide (quand une clé est configurée), `/healthz`
+    /// ne dit que « vivant » et « modèle chargé » ; les réglages restent
+    /// derrière la clé.
+    private func healthResponse(request: Request) async -> Response {
+        if apiKey != nil, (try? authorize(request)) == nil {
+            return Self.jsonResponse(LivenessResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded))
+        }
+        return Self.jsonResponse(HealthResponse(status: serverStatus.rawValue, modelLoaded: await runtime.isLoaded, model: loadedModel, queue: String(sessions.values.filter { $0.status == .queued }.count), defaultEnableThinking: defaultEnableThinking, routedExpertCount: await runtime.flashRoutedExpertCount, ablation: await runtime.flashAblation?.rawValue ?? "none", batchSizeConfigured: batchSize, batchMaxPromptTokensConfigured: batchMaxPromptTokens))
+    }
     private func modelsResponse(request: Request) async throws -> Response { try authorize(request); refreshModelCatalog(); let current = loadedModel; let models = modelDirectories.keys.sorted().map { id -> ModelDescription in let family = modelDirectories[id].flatMap { try? Qwen38ModelValidator.readInfo(from: $0) }?.family; return ModelDescription(id: id, object: "model", ownedBy: "local", loaded: id == current, family: family?.rawValue) }; return Self.jsonResponse(ModelListResponse(object: "list", data: models)) }
-    private func metricsResponse() async -> Response { let current = await snapshot(); return Self.jsonResponse(current) }
+    /// Issue #2 : `/metrics` passe par la clé et ne publie plus de texte
+    /// généré (`lastToken`) ni de message d'erreur — seulement des compteurs.
+    /// L'app de banc garde la vue complète, en mémoire, via `snapshot()`.
+    private func metricsResponse(request: Request) async throws -> Response {
+        try authorize(request)
+        let current = await snapshot()
+        let sessions = current.sessions.map { session in
+            var redacted = session; redacted.lastToken = ""; redacted.error = redacted.error == nil ? nil : "erreur"
+            return redacted
+        }
+        return Self.jsonResponse(Qwen38ServerSnapshot(
+            status: current.status, port: current.port, url: current.url,
+            activeSessions: current.activeSessions, queuedSessions: current.queuedSessions,
+            sessions: sessions, availableModels: current.availableModels,
+            loadedModel: current.loadedModel, lastError: current.lastError == nil ? nil : "erreur",
+            cacheMisses: current.cacheMisses, cachedConversations: current.cachedConversations,
+            cacheBytes: current.cacheBytes, cacheBudgetBytes: current.cacheBudgetBytes,
+            prefixHits: current.prefixHits, prefixMisses: current.prefixMisses,
+            batchSizeConfigured: current.batchSizeConfigured,
+            batchMaxPromptTokensConfigured: current.batchMaxPromptTokensConfigured))
+    }
 
     private func chatCompletionsResponse(request: Request) async throws -> Response {
-        try authorize(request); var request = request; let buffer = try await request.collectBody(upTo: 64 * 1024 * 1024)
+        try authorize(request); var request = request; let buffer = try await request.collectBody(upTo: Self.maxRequestBodyBytes)
         guard let data = buffer.getData(at: buffer.readerIndex, length: buffer.readableBytes) else { throw Qwen38ServerError.invalidRequest("Le corps JSON est vide.") }
         let input: ChatCompletionRequest
         do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
+        try validateMedia(input.messages)
         guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
         // P13.1 : un tour "tool" (le résultat d'un appel, renvoyé au serveur
         // pour que le modèle produise sa réponse finale) est désormais un
@@ -641,7 +697,13 @@ public actor Qwen38InferenceServer {
         let requestedTools = Self.orderedToolSpecs(input.effectiveTools.map { $0.toSpec() }, body: data)
         guard requestedTools.allSatisfy({ !$0.name.isEmpty }) else { throw Qwen38ServerError.invalidRequest("Chaque outil déclaré dans tools doit avoir un nom (function.name).") }
         let requestedModel = input.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); await queue.acquire(); updateSession(id) { $0.status = .running }; defer { Task { await queue.release() } }
+        let id = UUID(); sessions[id] = .init(id: id, client: "LAN", path: "/v1/chat/completions", model: requestedModel ?? loadedModel ?? "default", conversationID: input.effectiveConversationID); sessionOrder.append(id); trimSessions(); await queue.acquire(); updateSession(id) { $0.status = .running }
+        // Issue #2 : la file n'est libérée qu'à la vraie fin de la génération
+        // (flux épuisé, erreur ou client déconnecté), pas au retour du
+        // handler — sinon, en streaming, la requête suivante démarrait sur le
+        // modèle pendant que celle-ci décodait encore.
+        let queueRelease = Qwen38ReleaseOnce { [queue] in await queue.release() }
+        defer { if !queueRelease.handedOff { Task { await queueRelease.fire() } } }
         do {
             let selectedModel = try await ensureModelLoaded(requestedModel)
             updateSession(id) { $0.model = selectedModel }
@@ -705,8 +767,9 @@ public actor Qwen38InferenceServer {
             // reconstruisant le tour à la main (voir le rapport PLAN.md
             // P13.3) et retombe elle-même sur un rejeu complet si le
             // suffixe ne peut pas être calculé sûrement.
-            let (stream, dispatchedViaPersistentCache) = try await dispatchConversationTurn(
+            let (rawStream, dispatchedViaPersistentCache) = try await dispatchConversationTurn(
                 usePersistentCache: usePersistentCache, messages: prepared.messages, options: options)
+            let stream = qwen38ReleasingWhenFinished(rawStream, release: queueRelease)
             // Ground truth for the GUI's "Cache" tri-state (P5.2): a request
             // that named a conversation with prior turns but still fell back
             // to a full stateless replay. Computed here, not from engine
@@ -775,10 +838,11 @@ public actor Qwen38InferenceServer {
     ///    — `trackingID` reste `nil` (voir PLAN.md P12.3, « le lot et le
     ///    cache de conversations sont incompatibles »).
     private func chatCompletionsResponseBatched(request: Request) async throws -> Response {
-        try authorize(request); var request = request; let buffer = try await request.collectBody(upTo: 64 * 1024 * 1024)
+        try authorize(request); var request = request; let buffer = try await request.collectBody(upTo: Self.maxRequestBodyBytes)
         guard let data = buffer.getData(at: buffer.readerIndex, length: buffer.readableBytes) else { throw Qwen38ServerError.invalidRequest("Le corps JSON est vide.") }
         let input: ChatCompletionRequest
         do { input = try JSONDecoder().decode(ChatCompletionRequest.self, from: data) } catch { throw Qwen38ServerError.invalidRequest("Requête chat invalide : \(error.localizedDescription)") }
+        try validateMedia(input.messages)
         guard !input.messages.isEmpty else { throw Qwen38ServerError.invalidRequest("La requête doit contenir au moins un message.") }
         // P13.1 / défaut du 2026-09-15 : voir le même commentaire dans
         // `chatCompletionsResponse`.
@@ -1066,6 +1130,7 @@ public actor Qwen38InferenceServer {
 
     private struct PreparedMessages: Sendable { let messages: [Qwen38ChatMessage]; let temporaryFiles: [URL] }
     private func prepare(_ messages: [ChatCompletionMessage]) throws -> PreparedMessages {
+        try Self.checkImageCount(messages)
         var result = [Qwen38ChatMessage](), temporaryFiles = [URL]()
         for message in messages {
             var text = "", images = [URL]()
@@ -1082,12 +1147,61 @@ public actor Qwen38InferenceServer {
         }
         return .init(messages: result, temporaryFiles: temporaryFiles)
     }
+    /// Issue #2 : refuse avant tout décodage une requête qui porte trop
+    /// d'images.
+    private static func checkImageCount(_ messages: [ChatCompletionMessage]) throws {
+        let count = messages.reduce(0) { total, message in
+            guard case .parts(let parts) = message.content else { return total }
+            return total + parts.filter { $0.type == "image_url" }.count
+        }
+        guard count <= maxImagesPerRequest else {
+            throw Qwen38ServerError.mediaLimitExceeded("\(count) images dans la requête, \(maxImagesPerRequest) au plus.")
+        }
+    }
+    /// Issue #2 : contrôles bon marché faits dès la lecture du JSON, avant
+    /// la file d'attente et avant tout chargement de modèle.
+    private func validateMedia(_ messages: [ChatCompletionMessage]) throws {
+        try Self.checkImageCount(messages)
+        for message in messages {
+            guard case .parts(let parts) = message.content else { continue }
+            for part in parts where part.type == "image_url" {
+                let value = part.imageURL?.url ?? ""
+                if value.hasPrefix("file://") ? !allowFileImages : !value.hasPrefix("data:") {
+                    throw Qwen38ServerError.unsupportedImageURL
+                }
+            }
+        }
+    }
+    /// Issue #2 : `data:` base64 seulement (sauf `--allow-file-images`),
+    /// taille décodée et définition bornées, extension nettoyée.
     private func materializeImage(_ value: String) throws -> (url: URL, isTemporary: Bool) {
-        if value.hasPrefix("file://"), let url = URL(string: value) { return (url, false) }
+        if value.hasPrefix("file://") {
+            guard allowFileImages, let url = URL(string: value) else { throw Qwen38ServerError.unsupportedImageURL }
+            return (url, false)
+        }
         guard value.hasPrefix("data:"), let comma = value.firstIndex(of: ",") else { throw Qwen38ServerError.unsupportedImageURL }
         let metadata = String(value[..<comma]); guard metadata.contains(";base64") else { throw Qwen38ServerError.unsupportedImageURL }
         guard let data = Data(base64Encoded: String(value[value.index(after: comma)...])) else { throw Qwen38ServerError.invalidRequest("Image base64 invalide.") }
-        let ext = metadata.split(separator: "/").last.map(String.init)?.split(separator: ";").first.map(String.init) ?? "bin"; let url = FileManager.default.temporaryDirectory.appendingPathComponent("qwen38-server-\(UUID().uuidString).\(ext)" ); try data.write(to: url, options: .atomic); return (url, true)
+        guard data.count <= Self.maxImageBytes else {
+            throw Qwen38ServerError.mediaLimitExceeded("Image trop lourde : \(data.count / 1_048_576) Mo décodés, \(Self.maxImageBytes / 1_048_576) Mo au plus.")
+        }
+        if let pixels = Self.pixelCount(of: data), pixels > Self.maxImagePixels {
+            throw Qwen38ServerError.mediaLimitExceeded("Image trop grande : \(pixels / 1_000_000) Mpx, \(Self.maxImagePixels / 1_000_000) Mpx au plus.")
+        }
+        let rawExtension = metadata.split(separator: "/").last.map(String.init)?.split(separator: ";").first.map(String.init) ?? "bin"
+        let ext = rawExtension.filter { $0.isLetter || $0.isNumber }.prefix(8)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("qwen38-server-\(UUID().uuidString).\(ext.isEmpty ? "bin" : String(ext))")
+        try data.write(to: url, options: .atomic); return (url, true)
+    }
+
+    /// Largeur × hauteur lues dans l'en-tête, sans décoder l'image.
+    static func pixelCount(of data: Data) -> Int? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int
+        else { return nil }
+        return width * height
     }
 
     private func makeJSONResponse(stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, sessionID: UUID, model: String, primedInside: Bool, trackingID: String?, requestMessages: [Qwen38ChatMessage], options: Qwen38GenerationOptions) async throws -> Response {
@@ -1246,7 +1360,20 @@ public actor Qwen38InferenceServer {
         }
         var headers = HTTPFields(); headers[.contentType] = "text/event-stream; charset=utf-8"; headers[.cacheControl] = "no-cache"; headers[.connection] = "keep-alive"; return .init(status: .ok, headers: headers, body: body)
     }
-    private func authorize(_ request: Request) throws { guard let apiKey, !apiKey.isEmpty else { return }; guard request.headers[.authorization] == "Bearer \(apiKey)" else { throw Qwen38ServerError.unauthorized } }
+    private func authorize(_ request: Request) throws {
+        guard let apiKey, !apiKey.isEmpty else { return }
+        guard Self.constantTimeEquals(request.headers[.authorization] ?? "", "Bearer \(apiKey)") else {
+            throw Qwen38ServerError.unauthorized
+        }
+    }
+    /// Issue #2 : comparaison dont la durée ne dépend pas du premier octet
+    /// différent (seulement de la longueur de la valeur attendue).
+    static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let a = Array(lhs.utf8), b = Array(rhs.utf8)
+        var difference = UInt8(a.count == b.count ? 0 : 1)
+        for index in 0 ..< b.count { difference |= (index < a.count ? a[index] : 0) ^ b[index] }
+        return difference == 0
+    }
     private func updateSession(_ id: UUID, _ body: (inout Qwen38ServerSession) -> Void) { guard var session = sessions[id] else { return }; body(&session); sessions[id] = session }
     private func updateSessionAsync(_ id: UUID, chunk: String) { updateSession(id) { $0.generatedTokens += 1; $0.lastToken = String(chunk.suffix(48)) } }
     private func completeSession(_ id: UUID, metrics: Qwen38RunMetrics) {
@@ -1353,11 +1480,15 @@ public actor Qwen38InferenceServer {
         // `Qwen4ExpLayerBenchAblation` ni "none") est une erreur de requête,
         // pas une panne serveur.
         if error is Qwen4ExpAblationResolutionError { return .badRequest }
+        // Issue #2 : un corps trop gros (`collectBody(upTo:)`) est un 413,
+        // pas une panne ; toute erreur HTTP de Hummingbird garde son statut.
+        if let httpError = error as? any HTTPResponseError { return httpError.status }
         guard let serverError = error as? Qwen38ServerError else { return .internalServerError }
         switch serverError {
         case .modelNotFound: return .notFound
         case .unauthorized: return .unauthorized
-        case .invalidRequest, .unsupportedImageURL, .invalidPort: return .badRequest
+        case .invalidRequest, .unsupportedImageURL, .invalidPort, .remoteAccessNeedsAPIKey: return .badRequest
+        case .mediaLimitExceeded: return .contentTooLarge
         case .modelNotLoaded, .noModelsAvailable: return .serviceUnavailable
         case .alreadyRunning: return .conflict
         }
@@ -1365,3 +1496,44 @@ public actor Qwen38InferenceServer {
 }
 
 private extension String { var nilIfEmpty: String? { isEmpty ? nil : self } }
+
+/// Issue #2 : une action exécutée une seule fois, par le premier qui la
+/// déclenche ; `handedOff` dit qu'un flux en a pris la responsabilité.
+final class Qwen38ReleaseOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private var owned = false
+    private let action: @Sendable () async -> Void
+    init(_ action: @escaping @Sendable () async -> Void) { self.action = action }
+    var handedOff: Bool { lock.withLock { owned } }
+    func handOff() { lock.withLock { owned = true } }
+    private func claim() -> Bool { lock.withLock { defer { fired = true }; return !fired } }
+    func fire() async {
+        if claim() { await action() }
+    }
+}
+
+/// Le même flux, qui déclenche `release` à sa vraie fin : dernier événement
+/// consommé, erreur, ou abandon par le consommateur (client déconnecté ;
+/// l'annulation remonte alors jusqu'à la génération).
+func qwen38ReleasingWhenFinished(
+    _ stream: AsyncThrowingStream<Qwen38GenerationEvent, Error>, release: Qwen38ReleaseOnce
+) -> AsyncThrowingStream<Qwen38GenerationEvent, Error> {
+    release.handOff()
+    return AsyncThrowingStream { continuation in
+        let task = Task {
+            do {
+                for try await event in stream { continuation.yield(event) }
+                await release.fire()
+                continuation.finish()
+            } catch {
+                await release.fire()
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in
+            task.cancel()
+            Task { await release.fire() }
+        }
+    }
+}

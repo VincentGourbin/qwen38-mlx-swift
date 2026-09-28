@@ -527,8 +527,11 @@ final class BenchViewModel: ObservableObject {
         let key = serverAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         Task { @MainActor in
             do {
+                // Issue #2 : le réseau local seulement avec une clé ; sans
+                // clé, le serveur reste sur la boucle locale de ce Mac.
                 try await inferenceServer.start(
                     port: port,
+                    host: key.isEmpty ? "127.0.0.1" : "0.0.0.0",
                     apiKey: key.isEmpty ? nil : key,
                     modelsDirectory: URL(fileURLWithPath: modelPath, isDirectory: true)
                         .deletingLastPathComponent(),
@@ -537,7 +540,9 @@ final class BenchViewModel: ObservableObject {
                     // change ensuite de modèle (`ensureModelLoaded`).
                     routedExpertCount: routedExpertsOverride)
                 await refreshServer()
-                status = "Serveur LAN actif sur le port \(port)"
+                status = key.isEmpty
+                    ? "Serveur local actif sur le port \(port) (saisir une clé pour l'ouvrir au réseau)"
+                    : "Serveur LAN actif sur le port \(port)"
             } catch {
                 status = "Erreur serveur : \(error.localizedDescription)"
                 await refreshServer()
@@ -848,9 +853,11 @@ private struct ServerView: View {
                             SecureField("optionnelle", text: $model.serverAPIKey)
                                 .textFieldStyle(.roundedBorder)
                         }
-                        Text(model.serverSnapshot.status == .running
-                            ? "LAN : http://\(Qwen38LocalNetwork.primaryIPv4() ?? "<adresse-du-Mac>"):\(String(model.serverSnapshot.port))/v1"
-                            : "Le catalogue sera chargé à la demande sur le premier appel.")
+                        Text(model.serverSnapshot.status != .running
+                            ? "Le catalogue sera chargé à la demande sur le premier appel. Sans clé, le serveur n'écoute que ce Mac."
+                            : model.serverAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? "Local : http://127.0.0.1:\(String(model.serverSnapshot.port))/v1"
+                                : "LAN : http://\(Qwen38LocalNetwork.primaryIPv4() ?? "<adresse-du-Mac>"):\(String(model.serverSnapshot.port))/v1")
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                         HStack {

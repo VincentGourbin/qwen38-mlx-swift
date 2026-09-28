@@ -704,7 +704,7 @@ func validatesNestedQwen35Config() throws {
 /// Fixture réutilisée par les tests de configuration et de validateur
 /// Flash-Next : un `config.json` `qwen4_exp` minimal mais complet (tous les
 /// invariants de `Qwen4ExpConfiguration.validate()` satisfaits).
-private func qwen4ExpFixtureConfig() -> [String: Any] {
+func qwen4ExpFixtureConfig() -> [String: Any] {
     let layerTypes = Array(repeating: "linear_attention", count: 3)
         + ["full_attention"]
         + Array(repeating: "linear_attention", count: 3)

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Server hardening (issue #2)
+- Listens on `127.0.0.1` by default; `--host` to change it, and a non-loopback
+  address is refused without `--api-key`. The bench app opens the LAN only
+  when a key is entered.
+- `/metrics` requires the key and no longer returns generated text or error
+  messages; `/healthz` answers only `status` and `model_loaded` without it.
+- `file://` image URLs are refused unless `--allow-file-images`; body limit
+  32 MiB, at most 4 images of 20 MiB and 20 Mpx each (HTTP 413).
+- The request queue is released at the real end of a streamed answer (or when
+  the client disconnects, which cancels generation), no longer when the
+  handler returns. Verified: two concurrent streaming clients get the same
+  answers as sequential runs.
+- API key compared in constant time; oversized bodies return 413 instead of 500.
+
 ## v0.1.1 — 2026-09-27
 
 ### Images in the reusable-conversation engine

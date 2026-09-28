@@ -186,14 +186,16 @@ qwen38 info "$QWEN38_MODELS_DIR/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP"
 qwen38 serve --model-path "$QWEN38_MODELS_DIR/local/Qwen3.8-Flash-Next-MLX-e3bit-MTP"
 ```
 
-Binds `0.0.0.0:8848`. Four routes:
+Listens on `127.0.0.1:8848` by default. To serve other machines on your
+network, pass `--host 0.0.0.0` **and** `--api-key` — the server refuses to
+listen beyond the loopback without a key. Four routes:
 
 | Route | What it returns |
 |---|---|
 | `POST /v1/chat/completions` | Chat, JSON or SSE stream |
 | `GET /v1/models` | The catalogue discovered under the model root |
-| `GET /healthz` | Liveness plus the server's effective settings |
-| `GET /metrics` | A JSON snapshot (sessions, cache hits, MTP counters) — not Prometheus format |
+| `GET /healthz` | Liveness; the server's effective settings too when the key is supplied (or none is configured) |
+| `GET /metrics` | Counters as JSON (sessions, cache hits, MTP) — behind the key, no generated text; not Prometheus format |
 
 ```bash
 curl http://127.0.0.1:8848/v1/chat/completions \
@@ -213,9 +215,16 @@ curl http://127.0.0.1:8848/v1/chat/completions \
 | `--batch-window-ms` | Grouping window, default 30 ms |
 | `--routed-experts N` | Override the checkpoint's `num_experts_per_tok`. Absent = checkpoint value |
 | `--conversation-cache-gb` | Per-client conversation LRU budget, default 12 GB |
-| `--api-key` | Optional `Authorization: Bearer` |
+| `--host` | Listening address, default `127.0.0.1`. Anything else requires `--api-key` |
+| `--api-key` | `Authorization: Bearer` key, compared in constant time; required off the loopback |
+| `--allow-file-images` | Accept `file://` image URLs. Off by default: a client could otherwise make the server open local files. `data:` base64 images always work |
 | `--allow-ablation` | Unlocks the `ablation` request field. Refused by default — ablation produces numerically wrong output by construction and must never be reachable by an ordinary client |
 | `--trace <path>` | Profile the whole serving session and write a Chrome trace on Ctrl-C |
+
+Request limits: 32 MiB body, at most 4 images, each at most 20 MiB decoded
+and 20 megapixels (HTTP 413 beyond). One request runs on the model at a time;
+the next one waits until the previous answer has really finished streaming,
+and a client that disconnects cancels its generation within one step.
 
 Non-standard request fields, accepted at the top level or inside `extra`:
 `enable_thinking`, `reasoning_effort`, `mtp` (default `false`),
