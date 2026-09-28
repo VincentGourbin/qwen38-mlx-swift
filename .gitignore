@@ -35,3 +35,5 @@ bench/langwatch/.env
 bench/langwatch/workspaces/
 bench/langwatch/fixture/.build/
 bench/langwatch/runs.jsonl
+
+.codex/
