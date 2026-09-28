@@ -16,6 +16,27 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
+PRICES = {k: v for k, v in json.loads((HERE / "prices.json").read_text()).items()
+          if not k.startswith("_")}
+
+
+def price_of(model: str):
+    """Tarif Ollama Cloud du modèle (`gemma4:cloud`, `gpt-oss:20b-cloud`…),
+    `None` pour un modèle local."""
+    for suffix in (":cloud", "-cloud"):
+        if model.endswith(suffix):
+            model = model[: -len(suffix)]
+    return PRICES.get(model)
+
+
+def cost(run) -> float | None:
+    p = price_of(run["model"])
+    if p is None:
+        return None
+    return (run["input_tokens"] * p["input"] + run["cached_tokens"] * p["cached"]
+            + run["output_tokens"] * p["output"]) / 1e6
+
+
 def med(xs):
     return statistics.median(xs) if xs else 0
 
@@ -54,6 +75,19 @@ def main() -> None:
               f"| {max(r['max_context'] for r in rs)} | {prompt:.0f} "
               f"| {100 * cached / prompt if prompt else 0:.0f} % "
               f"| {sum(r['compactions'] for r in rs)} | {', '.join(fails) or '—'} |")
+
+    print("\nCoût Ollama Cloud (tarif standard, heures creuses -50 %) :\n")
+    print("| Modèle | Découpage | Runs | Succès | Coût médian par run | Coût total | Coût par run réussi "
+          "| Jetons sortie méd. |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|")
+    for (model, plan), rs in sorted(groups.items()):
+        costs = [cost(r) for r in rs]
+        if None in costs:
+            continue
+        ok = sum(1 for r in rs if r["success"])
+        per_success = f"{sum(costs) / ok * 100:.2f} ¢" if ok else "—"
+        print(f"| {model} | {plan} | {len(rs)} | {ok}/{len(rs)} | {med(costs) * 100:.2f} ¢ "
+              f"| {sum(costs) * 100:.2f} ¢ | {per_success} | {med([r['output_tokens'] for r in rs]):.0f} |")
 
     print("\nPar fiche (médianes) :\n")
     print("| Modèle | Découpage | Fiche | Tâches | Durée | Tours | Contexte max | Réussite |")

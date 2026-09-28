@@ -1,0 +1,13 @@
+{
+  "_source": "https://ollama.com/pricing (tableau par modèle), relevé le 2026-09-28",
+  "_unit": "dollars US par million de jetons ; tarif standard. Heures creuses (hors 12:00-18:00 UTC en semaine, et tout le week-end) : -50 %",
+  "_note": "Entrée = jetons non servis par le cache ; cache = entrée servie par le cache ; sortie = réflexion comprise",
+  "glm-5.3-flash": {"input": 0.15, "cached": 0.03, "output": 0.50},
+  "gemma4": {"input": 0.14, "cached": 0.05, "output": 0.40},
+  "gpt-oss:120b": {"input": 0.15, "cached": 0.014, "output": 0.60},
+  "gpt-oss:20b": {"input": 0.07, "cached": 0.035, "output": 0.30},
+  "glm-5.3": {"input": 1.40, "cached": 0.26, "output": 4.40},
+  "kimi-k2.7-code": {"input": 0.95, "cached": 0.19, "output": 4.00},
+  "deepseek-v4.1-flash": {"input": 0.30, "cached": 0.006, "output": 1.20},
+  "minimax-m3": {"input": 0.60, "cached": 0.12, "output": 2.40}
+}

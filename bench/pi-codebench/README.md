@@ -166,3 +166,34 @@ Réussite = runs où les quatre tâches passent. Durée = médiane.
 | Qwen3.8-27B-4bit (local) | ⚠️ 2/3 · 26-32 min | ✅ 3/3 · 21-29 min, même session ; ✅ 1/1 · 52 min, sessions neuves | une tâche par fiche, même session |
 
 1. L'échec vient d'un flux Ollama coupé en cours de réponse.
+
+### Coût des modèles cloud
+
+Tarifs Ollama Cloud du 2026-09-28 (`prices.json`, source
+<https://ollama.com/pricing>), appliqués aux jetons réellement consommés par
+run : entrée non servie par le cache, entrée servie par le cache, sortie
+(réflexion comprise). Tarif standard ; les heures creuses divisent le coût
+par deux.
+
+| Modèle | $/M entrée · cache · sortie | Fiche unique : coût par run réussi | Une tâche par fiche : coût par run réussi |
+|---|---|---:|---:|
+| gemma4 | 0,14 · 0,05 · 0,40 | 4,5 ¢ | **2,5 ¢** |
+| glm-5.3-flash | 0,15 · 0,03 · 0,50 | **2,6 ¢** | 4,9 ¢ |
+| gpt-oss:120b | 0,15 · 0,014 · 0,60 | 7,6 ¢ (1 run réussi sur 2) | 3,7 ¢ |
+| gpt-oss:20b | 0,07 · 0,035 · 0,30 | — (aucun run réussi) | 30 ¢ (1 run réussi sur 2) |
+
+Le coût par run réussi divise tout ce qui a été dépensé, échecs compris, par
+le nombre de runs réussis.
+
+Lecture :
+- **Le modèle le moins cher au jeton n'est pas le moins cher à la tâche.**
+  gpt-oss:20b a le tarif le plus bas, mais il consomme 1,9 à 2,5 millions de
+  jetons d'entrée par run, avec un cache peu efficace (≈ 44 %), et il échoue.
+  C'est de loin le plus cher par tâche réussie.
+- glm-5.3-flash en fiche unique et gemma4 en une tâche par fiche livrent la
+  fonctionnalité pour **2,5 à 2,6 ¢**.
+- Pour glm, découper double le coût : plus de tours, et un cache moins bien
+  servi (32 % contre 62 %).
+- **L'ordre de grandeur** : une fonctionnalité d'environ 300 lignes coûte
+  quelques centimes. Le forfait Pro d'Ollama (20 $/mois pour 60 $ de crédits)
+  couvre plus de 2 000 fonctionnalités de cette taille.
