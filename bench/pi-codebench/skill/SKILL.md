@@ -6,18 +6,18 @@ description: Découper un plan d'implémentation en fiches que pi.dev exécutera
 # Découper un plan pour pi.dev
 
 Règles mesurées, pas intuitives : banc `bench/pi-codebench/` du dépôt
-`qwen38-mlx-swift` (campagnes v1 et v2 du 2026-09-28 ; cloud : un run par
-combinaison ; Qwen3.8-27B local : trois runs par découpage). Même
-fonctionnalité Swift (≈ 300 lignes, 4 tâches, 5 fichiers), même harnais
-pi 0.87.1, notation par tests d'acceptation cachés.
+`qwen38-mlx-swift` (2026-09-28 ; cloud : deux runs par combinaison ;
+Qwen3.8-27B local : trois runs par découpage). Même fonctionnalité Swift
+(≈ 300 lignes, 4 tâches, 5 fichiers), même harnais pi 0.87.1, notation par
+tests d'acceptation cachés. Réussite = runs où les 4 tâches passent.
 
 | Modèle | 1 fiche pour tout | 1 tâche par fiche | Profil |
 |---|---|---|---|
-| glm-5.3-flash (cloud) | 4/4 · 2,4 min · 14 tours | 4/4 · 2,9 min · 35 tours | solide |
-| gemma4 (cloud) | 4/4 · 2,3 min · 37 tours | 4/4 · 2,5 min · 46 tours | solide |
-| Qwen3.8-27B 4 bits (local) | **2 réussites / 3** · 26-32 min | **3/3** · 21-29 min (session poursuivie) ; 52 min en sessions neuves | fiable en fiches courtes |
-| gpt-oss:120b (cloud) | 0/4 | 4/4 · 100 tours | a besoin de découpage |
-| gpt-oss:20b (cloud) | 0/4, paquet cassé | 3/4 (rate la tâche multi-fichiers) | à la limite |
+| glm-5.3-flash (cloud) | 2/2 · 2,5 min · 12 tours | 2/2 · 3,3 min · 40 tours | solide, économe |
+| gemma4 (cloud) | 2/2 · 2,0 min · 34 tours | 2/2 · 2,1 min · 47 tours | solide |
+| Qwen3.8-27B 4 bits (local) | 2/3 · 26-32 min | **3/3** · 21-29 min (session poursuivie) ; 52 min en sessions neuves | fiable en fiches courtes |
+| gpt-oss:120b (cloud) | 1/2 (un flux coupé) · 1,6 min · 70 tours | 2/2 · 2,6 min · 90 tours | correct mais bavard |
+| gpt-oss:20b (cloud) | 0/2, paquet cassé | 1/2 · 13 min · 156-177 tours | trop faible |
 
 ## 1. Choisir la granularité selon le modèle
 
@@ -30,9 +30,10 @@ pi 0.87.1, notation par tests d'acceptation cachés.
   l'implémentation dans sa réflexion et dépasse `maxTokens` (12 288) avant
   d'avoir émis un seul appel ; pi s'arrête, rien n'est modifié. Deux tâches
   par fiche passent (2/2 après correctif serveur) mais coûtent ~40 min.
-- **Modèle faible ou inconnu** (famille gpt-oss, petits modèles) : **une tâche
-  par fiche**, une session neuve par fiche. C'est ce qui fait passer gpt-oss de
-  0/4 à 4/4 (120b) ou 3/4 (20b).
+- **Modèle moyen ou inconnu** (famille gpt-oss, petits modèles) : **une tâche
+  par fiche**, une session neuve par fiche. gpt-oss:120b passe alors 2/2 ;
+  gpt-oss:20b ne passe qu'une fois sur deux même ainsi (0/2 en fiche unique,
+  build cassé) : ne pas lui confier un plan.
 - **Modèle jamais mesuré** : ne pas deviner, le passer au banc
   (`./run.py --provider ollama --model <id> --plan mono` puis `--plan split4`,
   ~5 min en cloud). Une réussite en `mono` ⇒ profil solide.

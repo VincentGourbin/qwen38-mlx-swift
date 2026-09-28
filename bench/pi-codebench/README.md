@@ -152,3 +152,17 @@ Le décodage a ralenti au fil de l'après-midi : 13-14 tok/s le matin,
 Conclusion pour le 27B local :
 - une tâche par fiche, dans une session pi poursuivie ;
 - la fiche unique est plus exposée à une réflexion qui déborde.
+
+### Synthèse — deux runs par modèle cloud, trois par découpage pour le 27B local
+
+Réussite = runs où les quatre tâches passent. Durée = médiane.
+
+| Modèle | Fiche unique | Une tâche par fiche | Découpage conseillé |
+|---|---|---|---|
+| glm-5.3-flash (cloud) | ✅ 2/2 · 2,5 min · 12 tours | ✅ 2/2 · 3,3 min · 40 tours | fiche unique |
+| gemma4 (cloud) | ✅ 2/2 · 2,0 min · 34 tours | ✅ 2/2 · 2,1 min · 47 tours | fiche unique |
+| gpt-oss:120b (cloud) | ⚠️ 1/2 ¹ · 1,6 min · 70 tours | ✅ 2/2 · 2,6 min · 90 tours | une tâche par fiche |
+| gpt-oss:20b (cloud) | ❌ 0/2 · 7,2 min · 84 tours | ⚠️ 1/2 · 13 min · 156 tours | à éviter |
+| Qwen3.8-27B-4bit (local) | ⚠️ 2/3 · 26-32 min | ✅ 3/3 · 21-29 min, même session ; ✅ 1/1 · 52 min, sessions neuves | une tâche par fiche, même session |
+
+1. L'échec vient d'un flux Ollama coupé en cours de réponse.
