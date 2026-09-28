@@ -126,21 +126,32 @@ export QWEN38_MODELS_DIR=/Volumes/YourSSD/models   # default: ~/models
 ### Download a model
 
 ```bash
-# Dense 27B, a good first run
-.xcodebuild/Build/Products/Release/qwen38 download mlx-community/Qwen3.8-27B-4bit
+Q=.xcodebuild/Build/Products/Release/qwen38
 
-# Flash-Next (large — prefer the resumable script for a multi-hour transfer)
-Scripts/download-hf-resumable.sh Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP
+# Qwen3.8-27B 4-bit — the best local agent on the bench (16 GB)
+$Q download mlx-community/Qwen3.8-27B-4bit
+
+# Bonsai 2 — ternary 2-bit 27B, the one for 16 GB Macs (8.6 GB)
+$Q download prism-ml/Ternary-Bonsai-2-27B-mlx-2bit
+
+# Flash-Next, experts in 3-bit — the reference MoE checkpoint (84 GB, 96 GB Mac)
+Scripts/download-hf-resumable.sh VincentGOURBIN/Qwen3.8-Flash-Next-MLX-e3bit-MTP
 ```
+
+`VincentGOURBIN/Qwen3.8-Flash-Next-MLX-e3bit-MTP` is published by this project
+so you do not have to rebuild it: it is
+[`Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)
+(113 GB) with the routed experts re-quantized from 4-bit g32 to 3-bit g64 —
+the difference between a checkpoint that barely fits in 96 GB and one that runs
+resident comfortably, with identical greedy output on the regression guard.
+Same Qwen Community License 1.0 as the source.
 
 `Scripts/download-hf-resumable.sh` exists because a dropped connection on a
 multi-gigabyte LFS shard must not discard the partial file. It resumes
 per-file, reuses your local `hf auth` session without ever putting the token
 on a command line, and verifies sizes against the Hub manifest.
 
-Optionally re-quantize the experts from 4-bit g32 to 3-bit g64 — this is what
-turns a 113 GB checkpoint that barely fits into an 84 GB one that runs
-comfortably, with identical greedy output:
+To rebuild the 3-bit pack yourself from the Vontra source:
 
 ```bash
 python3 -m venv venv617 && venv617/bin/pip install "mlx-vlm==0.6.17"
