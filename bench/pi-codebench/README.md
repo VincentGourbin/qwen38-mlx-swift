@@ -221,7 +221,7 @@ Méthode :
 | gemma4, Ollama Cloud, une tâche par fiche | 2/2 | 2,1 min | **2,5 ¢** |
 | glm-5.3-flash, Ollama Cloud, fiche unique | 2/2 | 2,5 min | **2,6 ¢** |
 | 27B local, électricité seule (Mac déjà acheté) | 3/3 | 25 min | **0,6 à 0,9 ¢** |
-| 27B local, amorti 24 h/24 sur 4 ans | 3/3 | 25 min | ≈ 7 à 7,5 ¢ |
+| 27B local, amorti 24 h/24 sur 4 ans | 3/3 | 25 min | ≈ 7,4 à 7,7 ¢ |
 | 27B local, amorti 8 h/jour sur 4 ans | 3/3 | 25 min | ≈ 21 ¢ |
 | 27B local en fiche unique, amorti 8 h/jour | 2/3 | 42 min | ≈ 35 ¢ |
 
@@ -236,4 +236,4 @@ Lecture :
   ne doivent pas sortir, travail hors ligne, Mac déjà rentabilisé par
   d'autres usages.
 - **Le découpage compte aussi en euros.** En local, la fiche unique échoue une
-  fois sur trois, ce qui fait passer le coût par fonctionnalité de 21 à 35 c€.
+  fois sur trois, ce qui fait passer le coût par fonctionnalité de 21 à 35 ¢.
